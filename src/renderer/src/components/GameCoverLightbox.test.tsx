@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { cleanup, render } from '@testing-library/react'
+import { fireEvent, screen, within } from '@testing-library/dom'
 import { afterEach, describe, expect, it } from 'vitest'
 import GameCoverLightbox from './GameCoverLightbox'
 
