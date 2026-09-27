@@ -96,6 +96,10 @@ export function parseSizeToBytes(sizeString: string): number {
   }
 
   const trimmed = sizeString.trim().toLowerCase()
+  if (trimmed === '0') {
+    return 0
+  }
+
   const match = trimmed.match(/^([\d.]+)\s*(mb|gb|kb|b)$/)
 
   if (!match) {
