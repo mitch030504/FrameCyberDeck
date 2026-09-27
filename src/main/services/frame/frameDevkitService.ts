@@ -2,6 +2,7 @@ import { app } from 'electron'
 import { promises as fs } from 'fs'
 import { basename, dirname, join, resolve } from 'path'
 import { execa } from 'execa'
+import type { PackageInfo } from '@shared/types'
 
 export interface FrameDevkitStatus {
   ok: boolean
@@ -20,6 +21,14 @@ export interface FrameDeployResult {
   runtime: 'Android'
   compatTool: 'fauxdroid'
   started: boolean
+}
+
+export interface FrameInstalledGame {
+  gameid: string
+  packageName: string
+  versionCode: number
+  versionName?: string
+  title?: string
 }
 
 type ProgressReporter = (step: string, percent?: number) => void
@@ -158,7 +167,9 @@ class FrameDevkitService {
     return files
   }
 
-  private async resolveAndroidPayload(sourcePath: string): Promise<{ apk: string; obbs: string[] }> {
+  private async resolveAndroidPayload(
+    sourcePath: string
+  ): Promise<{ apk: string; obbs: string[]; root: string }> {
     const source = resolve(sourcePath)
     const stat = await fs.stat(source)
     let searchRoot: string
@@ -193,7 +204,37 @@ class FrameDevkitService {
     const apk = preferred ?? apkCandidates[0]
     const allFiles = await this.walkFiles(searchRoot, 4)
     const obbs = allFiles.filter((file) => file.toLowerCase().endsWith('.obb'))
-    return { apk, obbs }
+    return { apk, obbs, root: searchRoot }
+  }
+
+  private async readConversionMetadata(root: string): Promise<{
+    packageName?: string
+    versionCode?: number
+    versionName?: string
+  }> {
+    const path = join(root, 'frame-conversion.json')
+    try {
+      const parsed = JSON.parse(await fs.readFile(path, 'utf-8')) as {
+        package?: unknown
+        packageName?: unknown
+        versionCode?: unknown
+        versionName?: unknown
+      }
+      const packageName =
+        typeof parsed.packageName === 'string'
+          ? parsed.packageName
+          : typeof parsed.package === 'string'
+            ? parsed.package
+            : undefined
+      const versionCode =
+        typeof parsed.versionCode === 'number' && Number.isFinite(parsed.versionCode)
+          ? Math.trunc(parsed.versionCode)
+          : undefined
+      const versionName = typeof parsed.versionName === 'string' ? parsed.versionName : undefined
+      return { packageName, versionCode, versionName }
+    } catch {
+      return {}
+    }
   }
 
   private safeDevkitName(title: string): string {
@@ -202,7 +243,7 @@ class FrameDevkitService {
       .replace(/[^A-Za-z0-9._]+/g, '_')
       .replace(/^_+|_+$/g, '')
       .slice(0, 80)
-    return safe || `frame-game-${Date.now()}`
+    return safe || `frame_game_${Date.now()}`
   }
 
   private async createStagingDirectory(
@@ -219,6 +260,24 @@ class FrameDevkitService {
 
     onProgress?.('Preparing Frame title…', 15)
     await fs.copyFile(payload.apk, join(directory, 'game.apk'))
+
+    const conversion = await this.readConversionMetadata(payload.root)
+    await fs.writeFile(
+      join(directory, 'frame-cyberdeck.json'),
+      JSON.stringify(
+        {
+          schemaVersion: 1,
+          gameId: devkitName,
+          title,
+          packageName: conversion.packageName ?? devkitName,
+          versionCode: conversion.versionCode ?? 0,
+          versionName: conversion.versionName ?? ''
+        },
+        null,
+        2
+      ),
+      'utf-8'
+    )
 
     if (payload.obbs.length > 0) {
       const obbDir = join(directory, 'obb')
@@ -241,6 +300,39 @@ class FrameDevkitService {
     }
 
     return { directory, devkitName }
+  }
+
+  async listGames(host?: string): Promise<FrameInstalledGame[]> {
+    const result = await this.bridge<{
+      ok: boolean
+      error?: string
+      games: FrameInstalledGame[]
+    }>('list', [], host)
+    return result.games
+  }
+
+  async getInstalledPackages(host?: string): Promise<PackageInfo[]> {
+    const games = await this.listGames(host)
+    return games.map((game) => ({
+      packageName: game.packageName || game.gameid,
+      versionCode: Number.isFinite(game.versionCode) ? game.versionCode : 0
+    }))
+  }
+
+  async uninstallPackage(packageName: string, host?: string): Promise<boolean> {
+    const games = await this.listGames(host)
+    const game = games.find((entry) => entry.packageName === packageName || entry.gameid === packageName)
+    if (!game) {
+      console.warn(`[Frame Devkit] No installed title found for ${packageName}`)
+      return false
+    }
+    await this.bridge<{ ok: boolean; error?: string }>('delete', ['--name', game.gameid], host)
+    return true
+  }
+
+  async runGame(gameId: string, host?: string): Promise<boolean> {
+    await this.bridge<{ ok: boolean; error?: string }>('run', ['--name', gameId], host)
+    return true
   }
 
   async deploy(
