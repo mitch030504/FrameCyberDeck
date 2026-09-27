@@ -1,5 +1,5 @@
-appId: com.vrcyberdeck
-productName: VR CyberDeck
+appId: io.github.mitch030504.framecyberdeck
+productName: Frame CyberDeck
 directories:
   buildResources: build
 icon: build/icon
@@ -32,6 +32,8 @@ extraResources:
     to: ServerInfo.json
   - from: resources/custom-notes.json
     to: custom-notes.json
+  - from: resources/frame-devkit-bridge.py
+    to: frame-devkit-bridge.py
   - from: resources/sounds
     to: sounds
     filter:
@@ -48,7 +50,7 @@ win:
       arch:
         - x64
         - ia32
-  executableName: vr-cyberdeck
+  executableName: frame-cyberdeck
 nsis:
   artifactName: ${name}-${version}-setup-${arch}.${ext}
   shortcutName: ${productName}
@@ -89,6 +91,6 @@ deb:
 npmRebuild: false
 publish:
   provider: github
-  owner: DeliciousMeatPop
-  repo: VRCD
+  owner: mitch030504
+  repo: FrameCyberDeck
 electronDownload: {}
