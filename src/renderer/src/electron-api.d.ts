@@ -11,7 +11,8 @@ import {
   LogsAPIRenderer,
   MirrorAPIRenderer,
   WiFiBookmark,
-  BackupAPIRenderer
+  BackupAPIRenderer,
+  FrameAPIRenderer
 } from '@shared/types'
 
 declare global {
@@ -31,6 +32,7 @@ declare global {
       }
       dependency: DependencyAPIRenderer
       adb: AdbAPIRenderer
+      frame: FrameAPIRenderer
       games: GameAPIRenderer
       downloads: DownloadAPIRenderer
       settings: SettingsAPIRenderer
