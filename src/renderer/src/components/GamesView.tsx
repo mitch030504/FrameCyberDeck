@@ -702,6 +702,10 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
     const unsubscribe = window.api.adb.onInstallationCompleted((deviceId) => {
       console.log(`[GamesView] Received installation-completed event for device: ${deviceId}`)
       if (selectedDevice && deviceId === selectedDevice) {
+        if (selectedDeviceDetails?.isSteamFrame) {
+          console.log('[GamesView] Frame Devkit installation completed; skipping Android package refresh.')
+          return
+        }
         console.log(`[GamesView] Refreshing packages for current device ${selectedDevice}...`)
         loadPackages()
           .then(() => console.log('[GamesView] Package refresh triggered successfully.'))
@@ -717,7 +721,7 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
       unsubscribe()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedDevice, loadPackages])
+  }, [selectedDevice, selectedDeviceDetails?.isSteamFrame, loadPackages])
 
   const downloadStatusMap = useMemo(() => {
     const map = new Map<
