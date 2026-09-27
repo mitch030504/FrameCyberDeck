@@ -6,6 +6,7 @@ import SevenZip from 'node-7z'
 import { awaitSevenZipStream } from './sevenZipUtils'
 import adbService from './adbService'
 import frameDevkitService from './frame/frameDevkitService'
+import frameConversionService from './frame/frameConversionService'
 import dependencyService from './dependencyService'
 import gameService from './gameService'
 import { EventEmitter } from 'events'
@@ -752,10 +753,18 @@ class DownloadService extends EventEmitter implements DownloadAPI {
       }
     }
 
+    let conversionCleanup: (() => Promise<void>) | null = null
     try {
-      report('Preparing Steam Frame deployment…', 0)
-      const success = await frameDevkitService.deploy(
+      report('Preparing Steam Frame conversion…', 0)
+      const converted = await frameConversionService.convert(
         item.downloadPath,
+        item.gameName || item.releaseName,
+        report
+      )
+      conversionCleanup = converted.cleanup
+
+      const success = await frameDevkitService.deploy(
+        converted.directory,
         item.gameName || item.releaseName,
         report
       )
@@ -785,6 +794,8 @@ class DownloadService extends EventEmitter implements DownloadAPI {
         )
       }
       throw error
+    } finally {
+      if (conversionCleanup) await conversionCleanup()
     }
   }
 
@@ -1475,9 +1486,29 @@ class DownloadService extends EventEmitter implements DownloadAPI {
         // picked/dropped the APK from inside an extracted game folder) it gets
         // pushed too, instead of installing a data-less app.
         console.log(`[Service installManualFile] Installing single APK: ${filePath}`)
-        const success = (await this.isSteamFrameDevice(deviceId))
-          ? await frameDevkitService.deploy(filePath, basename(filePath, '.apk'), onProgress)
-          : await this.installationProcessor.installSingleApk(filePath, deviceId, onProgress)
+        let success: boolean
+        if (await this.isSteamFrameDevice(deviceId)) {
+          const converted = await frameConversionService.convert(
+            filePath,
+            basename(filePath, '.apk'),
+            onProgress
+          )
+          try {
+            success = await frameDevkitService.deploy(
+              converted.directory,
+              basename(filePath, '.apk'),
+              onProgress
+            )
+          } finally {
+            await converted.cleanup()
+          }
+        } else {
+          success = await this.installationProcessor.installSingleApk(
+            filePath,
+            deviceId,
+            onProgress
+          )
+        }
         if (success) {
           console.log(`[Service installManualFile] Successfully installed APK: ${filePath}`)
           this.emit('installation:success', deviceId)
