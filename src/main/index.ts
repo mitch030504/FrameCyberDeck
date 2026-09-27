@@ -120,7 +120,7 @@ function createWindow(): void {
     maxHeight: workH,
     show: false,
     autoHideMenuBar: true,
-    title: 'VR CyberDeck',
+    title: 'Frame CyberDeck',
     icon: icon,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
