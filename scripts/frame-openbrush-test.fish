@@ -48,7 +48,7 @@ python3 "$root/resources/frame-devkit-bridge.py"     --host "$host"     status; 
 
 echo
 echo "=== DEPLOY ==="
-python3 "$root/resources/frame-devkit-bridge.py"     --host "$host"     deploy     --name OpenBrush-2.32.0     --directory "$converted"     --start-command game.apk; or exit 1
+python3 "$root/resources/frame-devkit-bridge.py"     --host "$host"     deploy     --name OpenBrush_2.32.0     --directory "$converted"     --start-command game.apk; or exit 1
 
 echo
-echo "Open Brush was converted and uploaded. Launch OpenBrush-2.32.0 from the Frame Steam library."
+echo "Open Brush was converted and uploaded. Launch OpenBrush_2.32.0 from the Frame Steam library."
