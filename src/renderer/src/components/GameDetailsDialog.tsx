@@ -23,7 +23,8 @@ import {
   CheckmarkCircleRegular,
   StarFilled,
   StarRegular,
-  BroomRegular as UninstallIcon
+  BroomRegular as UninstallIcon,
+  PlayRegular
 } from '@fluentui/react-icons'
 import placeholderImage from '../assets/images/game-placeholder.png'
 import { useGames } from '@renderer/hooks/useGames'
@@ -71,6 +72,7 @@ interface GameDetailsDialogProps {
   onInstallFromCompleted: (game: GameInfo) => void
   onUninstallAndUpdate: (game: GameInfo) => Promise<void>
   onDismissUpdateError: (game: GameInfo) => void
+  onLaunchFrame: (game: GameInfo) => Promise<void>
   getNote: (releaseName: string) => Promise<string | null>
   isConnected: boolean
   isBusy: boolean
@@ -93,6 +95,7 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
   onInstallFromCompleted,
   onUninstallAndUpdate,
   onDismissUpdateError,
+  onLaunchFrame,
   getNote,
   isConnected,
   isBusy,
@@ -100,7 +103,7 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
   onToggleStarred
 }) => {
   const { getTrailerUrl, getDescription, descriptionSnapshot } = useGames()
-  const { selectedDevice } = useAdb()
+  const { selectedDevice, selectedDeviceDetails } = useAdb()
   const [currentGameNote, setCurrentGameNote] = useState<string | null>(null)
   const [loadingNote, setLoadingNote] = useState(false)
   const [trailerUrl, setTrailerUrl] = useState<string | null>(null)
@@ -358,7 +361,17 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
     if (g.isInstalled) {
       if (g.hasUpdate)
         return (
-          <div style={{ display: 'flex', gap: 8 }}>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            {selectedDeviceDetails?.isSteamFrame && (
+              <Button
+                appearance="primary"
+                icon={<PlayRegular />}
+                onClick={() => onLaunchFrame(g)}
+                disabled={!isConnected || isBusy}
+              >
+                Launch on Frame
+              </Button>
+            )}
             {!noSideload && (
               <Button
                 appearance="primary"
@@ -391,7 +404,17 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
           </div>
         )
       return (
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          {selectedDeviceDetails?.isSteamFrame && (
+            <Button
+              appearance="primary"
+              icon={<PlayRegular />}
+              onClick={() => onLaunchFrame(g)}
+              disabled={!isConnected || isBusy}
+            >
+              Launch on Frame
+            </Button>
+          )}
           {!noSideload && (
             <Button
               appearance="secondary"
