@@ -1251,6 +1251,20 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
       })
   }
 
+  const handleLaunchFrame = async (game: GameInfo): Promise<void> => {
+    if (!selectedDeviceDetails?.isSteamFrame || !game?.packageName) return
+
+    try {
+      const success = await window.api.frame.runPackage(game.packageName)
+      if (!success) {
+        window.alert(`Could not find an installed Steam Frame title for ${game.name}.`)
+      }
+    } catch (error) {
+      console.error(`Frame launch failed for ${game.name}:`, error)
+      window.alert(`Failed to launch ${game.name} on Steam Frame. Please check logs.`)
+    }
+  }
+
   const performUninstall = async (game: GameInfo, deleteFiles = false): Promise<void> => {
     if (!game || !game.packageName || !selectedDevice) {
       console.error(
@@ -3665,6 +3679,16 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
             >
               ▶ Details
             </ContextMenuItem>
+            {selectedDeviceDetails?.isSteamFrame && contextMenu.game.isInstalled && (
+              <ContextMenuItem
+                onClick={() => {
+                  void handleLaunchFrame(contextMenu.game)
+                  setContextMenu(null)
+                }}
+              >
+                ▶ Launch on Frame
+              </ContextMenuItem>
+            )}
             {!getSideloadingDisabled() && (
               <>
                 {contextMenu.game.hasUpdate ? (
