@@ -217,8 +217,18 @@ export class DownloadProcessor {
       }
     }
 
-    // Use public endpoint via rclone copy (no FUSE/macFUSE required)
-    console.log(`[DownProc] Using rclone copy for public endpoint: ${item.releaseName}`)
+    // Use public endpoint via rclone copy (no FUSE/macFUSE required).
+    // Fail immediately and clearly when no authorized credential is available,
+    // rather than letting rclone retry a protected endpoint several times.
+    if (!getApiKey()) {
+      const errorMsg =
+        'Catalog API key is not configured. Set FRAME_CYBERDECK_API_KEY for an authorized source, or configure an authenticated mirror.'
+      console.warn(`[DownProc] ${errorMsg}`)
+      this.updateItemStatus(item.releaseName, 'Error', 0, errorMsg)
+      return { success: false, startExtraction: false }
+    }
+
+    console.log(`[DownProc] Using authenticated public endpoint: ${item.releaseName}`)
     return await this.startRcloneCopyDownload(item, routing, undefined, false)
   }
 
