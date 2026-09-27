@@ -289,13 +289,18 @@ export const AdbProvider: React.FC<AdbProviderProps> = ({ children }) => {
   // Load packages when device is connected
   useEffect(() => {
     if (isConnected && selectedDevice) {
+      if (selectedDeviceDetails?.isSteamFrame) {
+        setPackages([])
+        setUserNameState('steamos')
+        return
+      }
       loadPackages()
       getUserName()
     } else {
       setPackages([])
       setUserNameState('')
     }
-  }, [isConnected, selectedDevice, loadPackages, getUserName])
+  }, [isConnected, selectedDevice, selectedDeviceDetails?.isSteamFrame, loadPackages, getUserName])
 
   // Periodically refresh device info (battery + storage) while a device is connected,
   // so the storage indicator reflects installs/uninstalls without requiring a reconnect.
