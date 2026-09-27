@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/2ace873a-2aef-4959-af2a-beec4b6d2ff5" width="500">
+  <img src="build/icon.png" width="160" alt="Frame CyberDeck">
 </p>
 
 # VR CyberDeck
@@ -24,7 +24,7 @@ VR CyberDeck is a cross-platform desktop deck for sideloading content to Android
 
 ## `// FORK_NOTE`
 
-VR CyberDeck started as a fork of [**ApprenticeVR**](https://github.com/jimzrt/apprenticeVr) by **jimzrt**. The core engine — ADB control, the download/upload pipeline, rclone integration, library connection — is theirs. Everything below the surface is a heavy rewrite of the _experience_:
+VR CyberDeck started as a fork of **ApprenticeVR** by **jimzrt**. The core engine — ADB control, the download/upload pipeline, rclone integration, library connection — is theirs. Everything below the surface is a heavy rewrite of the _experience_:
 
 |                  | ApprenticeVR                                              | VR CyberDeck                                                                      |
 | ---------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------- |
@@ -147,7 +147,7 @@ Then unplug and replug the Quest. After that it connects as soon as it's plugged
 
 That's it — no account, no server, no JSON to edit.
 
-> Want a browsable library instead? Add your own server — a server config or your own rclone config — under **Manage Remotes**. Other advanced flows live in **Other Settings**. [Tutorial Video for Server Setup](https://streamable.com/v0ljxx)
+> Want a browsable library instead? Add an authorized server config or rclone config under **Manage Remotes**. Other advanced flows live in **Other Settings**.
 
 > Power user? Open the **ADB Shell** right from the deck — the shortcut panel above the terminal covers most Quest tweaks in one click, and you can save your own commands as `MY MACROS` pills.
 
@@ -157,11 +157,7 @@ That's it — no account, no server, no JSON to edit.
 
 Found a bug? Got an idea? Want to swap notes with other CyberDeck users?
 
-- 🐛 **[Open an issue](https://github.com/DeliciousMeatPop/VRCD/issues/new)** for crashes, broken downloads, ADB weirdness, or anything that looks wrong. Include a log file from **Settings → Log Upload** and I can usually figure it out fast.
-
-~~- 💬 **[Start or join a Discussion](https://github.com/DeliciousMeatPop/VRCD/discussions)** for feature ideas, questions, "is this normal?", custom shortcut macros worth sharing, sound-effect recommendations, or anything that isn't strictly a bug.~~
-
-I REMOVED DISCUSSIONS SINCE PEOPLE WERE ONLY USING IT AS A WAY TO AVOID ADDING LOGS TO AN ISSUE IT SEEMS, EVEN IF THAT WAS NOT THE INTENTION, IN ACTUALITY THAT WAS THE RESULT
+- **[Open an issue](https://github.com/mitch030504/FrameCyberDeck/issues/new)** for crashes, broken downloads, Steam Frame deployment issues, or anything that looks wrong. Include a log file when possible.
 
 If you've got a sound clip you think would suit the UI (terminal click, mechanical keyboard tap, matrix-style hum), open an issue — happy to bundle community favourites in a later build.
 
@@ -183,29 +179,8 @@ npm install --legacy-peer-deps
 
 ## `// CREDITS`
 
-Built on top of [ApprenticeVR](https://github.com/jimzrt/apprenticeVr) by **jimzrt**. Without that foundation this project doesn't exist.
+Built on top of ApprenticeVR by **jimzrt**. Without that foundation this project doesn't exist.
 
 ## `// LICENSE`
 
 GNU Affero GPL v3
-
----
-
-![Visitors](https://api.visitorbadge.io/api/visitors?path=DeliciousMeatPop%2FVRCD&label=People%20Who%20Forgot%20To%20Star%20This%20Repo&countColor=%23ba68c8&style=plastic)<br>
-![Last Commit](https://img.shields.io/github/last-commit/DeliciousMeatPop/VRCD?label=Last%20Updated)<br>
-![Created](https://img.shields.io/github/created-at/DeliciousMeatPop/VRCD?label=Created)<br>
-![Monthly Commits](https://img.shields.io/github/commit-activity/m/DeliciousMeatPop/VRCD?label=Monthly%20Commits)<br>
-
-## ⭐ Do the thing
-
-You’re already here. You’ve already scrolled.
-
-Just hit the ⭐ and we both win.
-
-⭐ Star this repo please
-
----
-
-[![GitHub stars for this repo](https://img.shields.io/github/stars/DeliciousMeatPop/VRCD?style=social)](https://github.com/DeliciousMeatPop/VRCD) = **GitHub stars for this repo**
-
-[![GitHub stars in total (all repos)](https://img.shields.io/github/stars/DeliciousMeatPop?style=social)](https://github.com/DeliciousMeatPop) = **GitHub stars in total (all repos)**
