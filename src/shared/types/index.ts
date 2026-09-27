@@ -341,6 +341,10 @@ export interface DependencyAPI {
 
 export interface DependencyAPIRenderer extends DependencyAPI {}
 
+export interface FrameAPIRenderer {
+  runPackage: (packageName: string) => Promise<boolean>
+}
+
 export interface AdbAPIRenderer extends AdbAPI {
   // Linux only: installs the Quest udev rule via pkexec (see linuxUsbAccess.ts)
   fixLinuxUsbAccess: () => Promise<{ success: boolean; message: string }>
