@@ -65,10 +65,53 @@ class FrameDevkitService {
   ): Promise<T> {
     const python = await this.resolvePython()
     const helper = this.getHelperPath()
-    const { stdout, stderr } = await execa(
-      python,
-      [helper, '--host', host, command, ...args]
-    )
+
+    let stdout = ''
+    let stderr = ''
+    try {
+      const result = await execa(python, [helper, '--host', host, command, ...args])
+      stdout = result.stdout
+      stderr = result.stderr
+    } catch (error) {
+      const candidate = error as {
+        stdout?: string
+        stderr?: string
+        shortMessage?: string
+        message?: string
+      }
+      stdout = candidate.stdout ?? ''
+      stderr = candidate.stderr ?? ''
+
+      const failedLine = stdout
+        .trim()
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .at(-1)
+
+      if (failedLine) {
+        try {
+          const parsed = JSON.parse(failedLine) as T
+          if (!parsed.ok) {
+            throw new Error(parsed.error || 'SteamOS Devkit operation failed')
+          }
+        } catch (parseError) {
+          if (
+            parseError instanceof Error &&
+            parseError.message !== 'SteamOS Devkit operation failed' &&
+            !parseError.message.startsWith('Unexpected token')
+          ) {
+            throw parseError
+          }
+        }
+      }
+
+      throw new Error(
+        stderr.trim() ||
+          candidate.shortMessage ||
+          candidate.message ||
+          'SteamOS Devkit bridge command failed'
+      )
+    }
 
     if (stderr.trim()) console.log(`[Frame Devkit] ${stderr.trim()}`)
     const line = stdout
