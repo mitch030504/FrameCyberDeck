@@ -348,12 +348,32 @@ class FrameDevkitService {
 
   async uninstallPackage(packageName: string, host?: string): Promise<boolean> {
     const games = await this.listGames(host)
-    const game = this.selectGame(games, packageName)
-    if (!game) {
+
+    const exactGameId = games.find((entry) => entry.gameid === packageName)
+    const matches = exactGameId
+      ? [exactGameId]
+      : games.filter((entry) => entry.packageName === packageName)
+
+    if (matches.length === 0) {
       console.warn(`[Frame Devkit] No installed title found for ${packageName}`)
       return false
     }
-    await this.bridge<{ ok: boolean; error?: string }>('delete', ['--name', game.gameid], host)
+
+    // Multiple Devkit shortcuts can point at the same Android package (for
+    // example an old smoke-test title plus a newer CyberDeck-managed title).
+    // Removing the Android package should clear every shortcut representing it,
+    // otherwise the UI immediately rediscovers the same package as installed.
+    const ordered = [...matches].sort((a, b) => {
+      if (Boolean(a.managed) !== Boolean(b.managed)) return a.managed ? -1 : 1
+      return (b.versionCode || 0) - (a.versionCode || 0)
+    })
+
+    for (const game of ordered) {
+      console.log(
+        `[Frame Devkit] Removing ${game.gameid} for package ${packageName}${game.managed ? ' (managed)' : ''}`
+      )
+      await this.bridge<{ ok: boolean; error?: string }>('delete', ['--name', game.gameid], host)
+    }
     return true
   }
 
