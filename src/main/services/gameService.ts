@@ -118,9 +118,13 @@ class GameService extends EventEmitter implements GamesAPI {
       // is a pure sideloader and must never reach out to (or block on) a remote.
       const hasServer = !!(this.vrpConfig?.baseUri && this.vrpConfig?.password)
       const syncNeeded = hasServer && (await this.needsSync())
-      if (syncNeeded) {
+      if (syncNeeded && getApiKey()) {
         console.log('[GameService] Stale or missing meta data - starting background sync.')
         void this.backgroundSync()
+      } else if (syncNeeded) {
+        console.log(
+          '[GameService] Catalog sync skipped: no authorized catalog API key is configured. Local sideloading remains available.'
+        )
       }
     } catch (error) {
       console.error('Error initializing game service:', error)
@@ -470,8 +474,17 @@ class GameService extends EventEmitter implements GamesAPI {
         }
       }
 
-      // Fall back to public endpoint if no mirror or mirror failed
-      console.log('Using public endpoint for meta.7z download')
+      // Fall back to public endpoint if no mirror or mirror failed.
+      // Do not invoke rclone against a protected endpoint without a credential:
+      // that only produces repeated 403 retries and obscures the real problem.
+      const publicApiKey = getApiKey()
+      if (!publicApiKey) {
+        throw new Error(
+          'Catalog API key is not configured. Set FRAME_CYBERDECK_API_KEY for an authorized source, or configure an authenticated mirror.'
+        )
+      }
+
+      console.log('Using authenticated public endpoint for meta.7z download')
 
       // Get the appropriate null config path based on platform
       const nullConfigPath = process.platform === 'win32' ? 'NUL' : '/dev/null'
@@ -496,8 +509,7 @@ class GameService extends EventEmitter implements GamesAPI {
         '--progress'
       ]
 
-      const publicApiKey = getApiKey()
-      console.log('[GameService] public endpoint: api key present:', !!publicApiKey)
+      console.log('[GameService] public endpoint: authenticated')
 
       const rcloneProcess = execa(rclonePath, publicArgs, {
         stdio: ['ignore', 'pipe', 'pipe'],
