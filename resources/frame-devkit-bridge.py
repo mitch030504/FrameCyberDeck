@@ -290,6 +290,7 @@ def list_games_data(host: str, port: int) -> tuple[dict, list[dict]]:
             except json.JSONDecodeError:
                 pass
 
+        managed = metadata.get("schemaVersion") == 1
         package_name = metadata.get("packageName") or metadata.get("package") or gameid
         version_code = metadata.get("versionCode", 0)
         try:
@@ -302,6 +303,7 @@ def list_games_data(host: str, port: int) -> tuple[dict, list[dict]]:
                 "gameid": gameid,
                 "packageName": str(package_name),
                 "versionCode": version_code,
+                "managed": managed,
                 "versionName": str(metadata.get("versionName") or ""),
                 "title": str(metadata.get("title") or gameid),
             }
