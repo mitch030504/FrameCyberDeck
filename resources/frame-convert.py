@@ -164,6 +164,8 @@ def ndk_candidates(sdk: pathlib.Path) -> list[pathlib.Path]:
         value = os.environ.get(name)
         if value:
             values.append(pathlib.Path(value).expanduser())
+
+    # Android Studio / sdkmanager side-by-side layout.
     ndk_root = sdk / "ndk"
     if ndk_root.is_dir():
         values += sorted(
@@ -171,7 +173,23 @@ def ndk_candidates(sdk: pathlib.Path) -> list[pathlib.Path]:
             key=version_key,
             reverse=True,
         )
-    return [p.resolve() for p in values]
+
+    # Common Arch/CachyOS AUR package layouts.
+    values += [
+        pathlib.Path("/opt/android-ndk"),
+        pathlib.Path("/usr/lib/android-ndk"),
+        sdk / "ndk-bundle",
+    ]
+
+    unique: list[pathlib.Path] = []
+    seen: set[str] = set()
+    for value in values:
+        resolved = value.expanduser().resolve()
+        key = str(resolved)
+        if key not in seen and resolved.is_dir():
+            unique.append(resolved)
+            seen.add(key)
+    return unique
 
 
 def find_ndk_toolchain(sdk: pathlib.Path) -> pathlib.Path:
