@@ -3,18 +3,13 @@ import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 import react from '@vitejs/plugin-react'
 import { encodeApiKey } from './src/shared/keyObfuscation'
 
-export default defineConfig(({ command }) => {
-  const apiKey = process.env.VRSRC_API_KEY ?? ''
-  if (command === 'build' && !apiKey) {
-    throw new Error(
-      'VRSRC_API_KEY is not set. Production builds require this env var ' +
-        '(set it as a GitHub Actions secret in CI, or in .env locally). ' +
-        'Without it, every request to the bundled server will return 403.'
-    )
-  }
+export default defineConfig(() => {
+  const apiKey =
+    process.env.FRAME_CYBERDECK_API_KEY?.trim() || process.env.VRSRC_API_KEY?.trim() || ''
+
   if (!apiKey) {
-    console.warn(
-      '[electron.vite.config] VRSRC_API_KEY is unset — server requests will 403 at runtime.'
+    console.log(
+      '[electron.vite.config] No catalog API key configured; protected catalog sync will stay disabled. Local sideloading and Steam Frame management remain available.'
     )
   }
 
