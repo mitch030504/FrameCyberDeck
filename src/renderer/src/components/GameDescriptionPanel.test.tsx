@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, render } from '@testing-library/react'
+import { screen } from '@testing-library/dom'
 import { afterEach, describe, expect, it } from 'vitest'
 import GameDescriptionPanel from './GameDescriptionPanel'
 
