@@ -34,6 +34,8 @@ extraResources:
     to: custom-notes.json
   - from: resources/frame-devkit-bridge.py
     to: frame-devkit-bridge.py
+  - from: resources/frame-convert.py
+    to: frame-convert.py
   - from: resources/sounds
     to: sounds
     filter:
