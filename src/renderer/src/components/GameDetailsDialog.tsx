@@ -517,9 +517,15 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
             : 'Not Installed'
 
   return (
-    <Dialog open={open} onOpenChange={(_e, d) => !d.open && onClose()} modalType="modal">
+    <Dialog
+      open={open}
+      onOpenChange={(_e, d) => !d.open && onClose()}
+      modalType="modal"
+      surfaceMotion={null}
+    >
       <DialogSurface
         mountNode={document.getElementById('portal')}
+        backdropMotion={null}
         style={{
           ...SURFACE_VARS,
           background: BG,
