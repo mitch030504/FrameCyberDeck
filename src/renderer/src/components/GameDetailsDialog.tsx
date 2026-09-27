@@ -80,6 +80,8 @@ interface GameDetailsDialogProps {
   onToggleStarred: () => void
 }
 
+const ALLOW_THIRD_PARTY_TRAILERS = false
+
 const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
   game,
   open,
@@ -196,7 +198,7 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
 
   useEffect(() => {
     let alive = true
-    if (open && game?.name) {
+    if (ALLOW_THIRD_PARTY_TRAILERS && open && game?.name) {
       setLoadingVideo(true)
       setTrailerUrl(null)
       setTrailerOpen(false)
@@ -771,7 +773,9 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
             />
           )}
 
-          {/* ── Collapsible Trailer ── */}
+          {ALLOW_THIRD_PARTY_TRAILERS && (
+            <>
+              {/* ── Collapsible Trailer ── */}
           <div style={{ borderTop: '1px solid rgba(var(--vrcd-neon-raw),0.12)', paddingTop: 12 }}>
             <button
               onClick={() => setTrailerOpen(!trailerOpen)}
@@ -869,6 +873,9 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
               </p>
             )}
           </div>
+
+            </>
+          )}
 
           {/* ── Note section (bottom) ── */}
           <div style={{ borderTop: '1px solid rgba(var(--vrcd-neon-raw),0.12)', paddingTop: 12 }}>
