@@ -1337,48 +1337,53 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
     setIsLoading(true)
 
     try {
-      // Step 1: Uninstall the package
-      console.log(`Reinstall: Attempting to uninstall ${game.packageName}...`)
+      const downloadInfo = downloadStatusMap.get(game.releaseName)
+
+      // Never remove a working installation before replacement media exists.
+      // A failed/unauthorized download must not turn "Reinstall" into an uninstall.
+      if (downloadInfo?.status !== 'Completed') {
+        console.log(
+          `Reinstall: Replacement files for ${game.releaseName} are not ready (status: ${downloadInfo?.status}). Keeping the installed copy and acquiring replacement files first.`
+        )
+
+        const addToQueueSuccess = await addDownloadToQueue(game)
+        if (addToQueueSuccess) {
+          console.log(
+            `Reinstall: Queued replacement files for ${game.releaseName}; existing installation remains intact until the new install succeeds.`
+          )
+        } else {
+          console.warn(
+            `Reinstall: Could not queue replacement files for ${game.releaseName}. Existing installation was left untouched.`
+          )
+          window.alert(
+            `Reinstall for ${game.name} could not acquire replacement files. The currently installed copy was left untouched.`
+          )
+        }
+        return
+      }
+
+      // Replacement media is already local, so a clean uninstall + install is safe.
+      console.log(
+        `Reinstall: Replacement files for ${game.releaseName} are ready. Attempting clean uninstall of ${game.packageName}...`
+      )
       const uninstallSuccess = await window.api.adb.uninstallPackage(
         selectedDevice,
         game.packageName
       )
 
-      if (uninstallSuccess) {
-        console.log(`Reinstall: Successfully uninstalled ${game.packageName}.`)
-        // The game is now uninstalled from the device.
-        // Downloaded files (if any) should still be present.
-
-        const downloadInfo = downloadStatusMap.get(game.releaseName)
-
-        if (downloadInfo?.status === 'Completed') {
-          console.log(
-            `Reinstall: Files for ${game.releaseName} are 'Completed'. Initiating install from completed.`
-          )
-          await window.api.downloads.installFromCompleted(game.releaseName, selectedDevice)
-          console.log(`Reinstall: 'installFromCompleted' called for ${game.releaseName}.`)
-        } else {
-          console.log(
-            `Reinstall: Files for ${game.releaseName} not 'Completed' (status: ${downloadInfo?.status}). Adding to download queue.`
-          )
-          const addToQueueSuccess = await addDownloadToQueue(game)
-          if (addToQueueSuccess) {
-            console.log(`Reinstall: Successfully added ${game.releaseName} to download queue.`)
-          } else {
-            console.warn(
-              `Reinstall: Failed to add ${game.releaseName} to queue. Current status: ${downloadInfo?.status}.`
-            )
-            window.alert(
-              `Reinstall for ${game.name} failed: Could not add to download queue. Please check logs.`
-            )
-          }
-        }
-      } else {
+      if (!uninstallSuccess) {
         console.error(
-          `Reinstall: Failed to uninstall ${game.packageName}. Installation step will be skipped.`
+          `Reinstall: Failed to uninstall ${game.packageName}. Replacement installation will not be started.`
         )
         window.alert(`Failed to uninstall ${game.name}. Reinstall aborted.`)
+        return
       }
+
+      console.log(
+        `Reinstall: Successfully uninstalled ${game.packageName}; installing from completed replacement files.`
+      )
+      await window.api.downloads.installFromCompleted(game.releaseName, selectedDevice)
+      console.log(`Reinstall: 'installFromCompleted' called for ${game.releaseName}.`)
     } catch (error) {
       console.error(`Reinstall: Error during process for ${game.name}:`, error)
       window.alert(
@@ -1386,8 +1391,6 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
       )
     } finally {
       setIsLoading(false)
-      // Refresh packages to update UI. The 'installation-completed' event should also trigger this,
-      // but it's good to have a fallback or an immediate refresh after the uninstall part.
       console.log(`Reinstall: Process finished for ${game.name}. Triggering package refresh.`)
       loadPackages().catch((err) =>
         console.error('Reinstall: Error refreshing packages post-operation:', err)
