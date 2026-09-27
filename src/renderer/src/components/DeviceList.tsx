@@ -521,8 +521,12 @@ const TargetCard: React.FC<TargetCardProps> = ({
               </span>
             )}
 
+            {isConnectable && device.isSteamFrame && !isWifi && (
+              <span style={{ ...S, fontSize: '10px', color: '#66d9ef' }}>STEAM FRAME</span>
+            )}
+
             {/* Non-Quest warning */}
-            {isConnectable && !device.isQuestDevice && !isWifi && (
+            {isConnectable && !device.isQuestDevice && !device.isSteamFrame && !isWifi && (
               <span style={{ ...S, fontSize: '10px', color: '#f5a623' }}>⚠ UNKNOWN DEVICE</span>
             )}
           </div>
@@ -872,10 +876,12 @@ const DeviceList: React.FC<DeviceListProps> = ({ onSkip, onConnected }) => {
   const hasAutoConnected = React.useRef(false)
   useEffect(() => {
     if (isConnected || isLoading || hasAutoConnected.current) return
-    const q = devices.find((d) => d.isQuestDevice && (d.type === 'device' || d.type === 'emulator'))
-    if (!q) return
+    const preferred =
+      devices.find((d) => d.isSteamFrame && d.type === 'device') ??
+      devices.find((d) => d.isQuestDevice && (d.type === 'device' || d.type === 'emulator'))
+    if (!preferred) return
     hasAutoConnected.current = true
-    handleConnect(q.id)
+    handleConnect(preferred.id)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [devices, isConnected, isLoading])
 
