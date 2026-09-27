@@ -2071,12 +2071,8 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
               )}
             </DialogContent>
             <DialogActions>
-              <Button
-                appearance="primary"
-                onClick={closeInstallDialog}
-                disabled={isManualInstalling}
-              >
-                {isManualInstalling ? 'Processing...' : 'Close'}
+              <Button appearance="primary" onClick={closeInstallDialog}>
+                {isManualInstalling ? 'Hide' : 'Close'}
               </Button>
             </DialogActions>
           </DialogBody>
