@@ -98,17 +98,9 @@ function renderTextWithLinks(text: string): React.ReactNode[] {
       parts.push(text.slice(lastIndex, match.index))
     }
     const url = match[0]
-    parts.push(
-      <a
-        key={`${match.index}-${url}`}
-        href={url}
-        target="_blank"
-        rel="noopener noreferrer"
-        style={{ color: 'var(--vrcd-neon)', textDecoration: 'underline' }}
-      >
-        {url}
-      </a>
-    )
+    // Server-supplied notes may contain arbitrary URLs. Keep them visible as
+    // plain text, but do not turn third-party destinations into clickable links.
+    parts.push(url)
     lastIndex = match.index + url.length
   }
   if (lastIndex < text.length) parts.push(text.slice(lastIndex))
