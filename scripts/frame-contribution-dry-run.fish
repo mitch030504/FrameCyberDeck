@@ -22,7 +22,7 @@ if not test -f "$registry"
     exit 1
 end
 
-set -l fields (python3 - "$registry" "$package_name" <<'PY'
+set -l fields (python3 -c '
 import json
 import sys
 
@@ -43,8 +43,7 @@ if not source or version is None or not game_id:
 print(source)
 print(version)
 print(game_id)
-PY
-)
+' "$registry" "$package_name")
 or exit $status
 
 set -l source_path $fields[1]
@@ -122,7 +121,7 @@ mkdir -p "$output_root"
 set -l staging (mktemp -d "$output_root/staging.XXXXXX")
 or exit 1
 
-function cleanup --on-event fish_exit
+function cleanup --on-event fish_exit --inherit-variable staging
     if test -n "$staging" -a -d "$staging"
         rm -rf "$staging"
     end
