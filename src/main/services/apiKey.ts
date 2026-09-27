@@ -5,7 +5,12 @@ let cached: string | null = null
 /** Decodes the build-time-obfuscated vrSrc API key (see keyObfuscation.ts). */
 export function getApiKey(): string {
   if (cached === null) {
-    cached = decodeApiKey(process.env.VRSRC_API_KEY_ENC ?? '')
+    // Allow an authorized runtime credential in development/custom deployments.
+    // Packaged official builds can still use the build-time obfuscated value.
+    cached =
+      process.env.FRAME_CYBERDECK_API_KEY?.trim() ||
+      process.env.VRSRC_API_KEY?.trim() ||
+      decodeApiKey(process.env.VRSRC_API_KEY_ENC ?? '')
   }
   return cached
 }
