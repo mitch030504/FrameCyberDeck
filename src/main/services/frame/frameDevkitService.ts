@@ -33,9 +33,55 @@ export interface FrameInstalledGame {
   managed?: boolean
 }
 
+export interface FrameSourceRecord {
+  packageName: string
+  versionCode: number
+  gameId: string
+  originalSourcePath: string
+  recordedAt: number
+}
+
 type ProgressReporter = (step: string, percent?: number) => void
 
 class FrameDevkitService {
+  private getSourceRegistryPath(): string {
+    return join(app.getPath('userData'), 'frame-source-registry.json')
+  }
+
+  private async readSourceRegistry(): Promise<Record<string, FrameSourceRecord>> {
+    try {
+      const parsed = JSON.parse(await fs.readFile(this.getSourceRegistryPath(), 'utf-8')) as unknown
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+      return parsed as Record<string, FrameSourceRecord>
+    } catch {
+      return {}
+    }
+  }
+
+  private async saveSourceRecord(record: FrameSourceRecord): Promise<void> {
+    const registry = await this.readSourceRegistry()
+    registry[record.packageName] = record
+    await fs.writeFile(this.getSourceRegistryPath(), JSON.stringify(registry, null, 2), 'utf-8')
+    console.log(
+      `[Frame Devkit] Recorded original source for ${record.packageName}: ${record.originalSourcePath}`
+    )
+  }
+
+  async getOriginalSource(packageName: string): Promise<FrameSourceRecord | null> {
+    const registry = await this.readSourceRegistry()
+    const record = registry[packageName]
+    if (!record?.originalSourcePath) return null
+    try {
+      await fs.access(record.originalSourcePath)
+      return record
+    } catch {
+      console.warn(
+        `[Frame Devkit] Original source for ${packageName} is no longer available: ${record.originalSourcePath}`
+      )
+      return null
+    }
+  }
+
   private getHelperPath(): string {
     return app.isPackaged
       ? join(process.resourcesPath, 'frame-devkit-bridge.py')
@@ -256,7 +302,12 @@ class FrameDevkitService {
     sourcePath: string,
     title: string,
     onProgress?: ProgressReporter
-  ): Promise<{ directory: string; devkitName: string }> {
+  ): Promise<{
+    directory: string
+    devkitName: string
+    packageName: string
+    versionCode: number
+  }> {
     onProgress?.('Analyzing Android package…', 5)
     const payload = await this.resolveAndroidPayload(sourcePath)
     const devkitName = this.safeDevkitName(title)
@@ -268,6 +319,8 @@ class FrameDevkitService {
     await fs.copyFile(payload.apk, join(directory, 'game.apk'))
 
     const conversion = await this.readConversionMetadata(payload.root)
+    const packageName = conversion.packageName ?? devkitName
+    const versionCode = conversion.versionCode ?? 0
     await fs.writeFile(
       join(directory, 'frame-cyberdeck.json'),
       JSON.stringify(
@@ -275,8 +328,8 @@ class FrameDevkitService {
           schemaVersion: 1,
           gameId: devkitName,
           title: conversion.applicationLabel ?? title,
-          packageName: conversion.packageName ?? devkitName,
-          versionCode: conversion.versionCode ?? 0,
+          packageName,
+          versionCode,
           versionName: conversion.versionName ?? '',
           applicationLabel: conversion.applicationLabel ?? title
         },
@@ -306,7 +359,7 @@ class FrameDevkitService {
       }
     }
 
-    return { directory, devkitName }
+    return { directory, devkitName, packageName, versionCode }
   }
 
   async listGames(host?: string): Promise<FrameInstalledGame[]> {
@@ -408,7 +461,8 @@ class FrameDevkitService {
     sourcePath: string,
     title: string,
     onProgress?: ProgressReporter,
-    host?: string
+    host?: string,
+    originalSourcePath?: string
   ): Promise<boolean> {
     let staging: string | null = null
     try {
@@ -439,6 +493,17 @@ class FrameDevkitService {
       console.log(
         `[Frame Devkit] Deployed ${result.name}: ${result.startCommand}, runtime=${result.runtime}, compat=${result.compatTool}`
       )
+
+      if (originalSourcePath) {
+        await this.saveSourceRecord({
+          packageName: prepared.packageName,
+          versionCode: prepared.versionCode,
+          gameId: prepared.devkitName,
+          originalSourcePath: resolve(originalSourcePath),
+          recordedAt: Date.now()
+        })
+      }
+
       onProgress?.('Frame title installed in Steam library.', 100)
       return true
     } finally {
