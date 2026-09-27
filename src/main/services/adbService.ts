@@ -88,6 +88,58 @@ class AdbService extends EventEmitter implements AdbAPI {
     }
     const device = this.client.getDevice(serial)
 
+    // Steam Frame's native USB ADB endpoint is SteamOS/Linux rather than Android.
+    // Probe it before using Quest-specific getprop/dumpsys commands.
+    try {
+      const frameProbeOutput = await device.shell(
+        'cat /etc/os-release 2>/dev/null; test -x "$HOME/.local/share/Steam/steamapps/common/Lepton/lepton" && echo __FRAME_LEPTON__=1'
+      )
+      const frameProbe = (await Adb.util.readAll(frameProbeOutput)).toString().trim()
+      const isSteamFrame =
+        /(^|\n)ID=["']?steamos["']?(\n|$)/m.test(frameProbe) &&
+        frameProbe.includes('__FRAME_LEPTON__=1')
+
+      if (isSteamFrame) {
+        let ipAddress: string | null = null
+        try {
+          const ipOutput = await device.shell('ip route')
+          const ipResult = (await Adb.util.readAll(ipOutput)).toString().trim()
+          ipAddress = ipResult.match(/src\s+(\d+\.\d+\.\d+\.\d+)/)?.[1] ?? null
+        } catch (ipError) {
+          console.warn(`[ADB Service] Could not fetch Frame IP address for ${serial}:`, ipError)
+        }
+
+        let storageTotal: string | null = null
+        let storageFree: string | null = null
+        try {
+          const storageOutput = await device.shell('df -h "$HOME" | tail -n 1')
+          const storageResult = (await Adb.util.readAll(storageOutput)).toString().trim()
+          const fields = storageResult.split(/\s+/)
+          if (fields.length >= 4) {
+            storageTotal = fields[1]
+            storageFree = fields[3]
+          }
+        } catch (storageError) {
+          console.warn(`[ADB Service] Could not fetch Frame storage for ${serial}:`, storageError)
+        }
+
+        return {
+          id: serial,
+          type: 'device',
+          model: 'steam-frame',
+          isQuestDevice: false,
+          isSteamFrame: true,
+          batteryLevel: null,
+          storageTotal,
+          storageFree,
+          friendlyModelName: 'Steam Frame',
+          ipAddress
+        }
+      }
+    } catch (frameProbeError) {
+      console.debug(`[ADB Service] ${serial} is not a native Steam Frame endpoint:`, frameProbeError)
+    }
+
     try {
       // Get product model
       const manufacturerOutput = await device.shell('getprop ro.product.manufacturer')
@@ -411,7 +463,11 @@ class AdbService extends EventEmitter implements AdbAPI {
       // Create a device instance
       const deviceClient = this.client.getDevice(serial)
 
-      // Test connection by getting device properties
+      // Native Frame ADB is SteamOS, so Android getProperties() is not a valid connection test.
+      const details = await this.getDeviceDetails(serial)
+      if (details?.isSteamFrame) return true
+
+      // Android / Quest connection test.
       await deviceClient.getProperties()
       return true
     } catch (error) {
