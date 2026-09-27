@@ -19,6 +19,8 @@ export interface DeviceInfo {
     | 'wifi-bookmark'
   model: string | null
   isQuestDevice: boolean
+  /** True when ADB is connected to Steam Frame's native SteamOS endpoint. */
+  isSteamFrame?: boolean
   batteryLevel: number | null
   storageTotal: string | null
   storageFree: string | null
