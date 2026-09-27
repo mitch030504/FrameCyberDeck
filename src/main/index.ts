@@ -25,6 +25,7 @@ import gameService from './services/gameService'
 import metaStoreService from './services/metaStoreService'
 import { createGameDescriptionService } from './services/gameDescription/gameDescriptionService'
 import downloadService from './services/downloadService'
+import frameDevkitService from './services/frame/frameDevkitService'
 import uploadService from './services/uploadService'
 import updateService from './services/updateService'
 import logsService from './services/logsService'
@@ -518,12 +519,21 @@ app.whenReady().then(async () => {
   typedIpcMain.handle('adb:disconnect-tcp-device', async (_event, ipAddress, port) => {
     return await adbService.disconnectTcpDevice(ipAddress, port)
   })
-  typedIpcMain.handle(
-    'adb:get-installed-packages',
-    async (_event, serial) => await adbService.getInstalledPackages(serial)
-  )
+  typedIpcMain.handle('adb:get-installed-packages', async (_event, serial) => {
+    const device = (await adbService.listDevices()).find((entry) => entry.id === serial)
+    if (device?.isSteamFrame) {
+      console.log(`[IPC] Loading Steam Frame Devkit titles for ${serial}`)
+      return await frameDevkitService.getInstalledPackages()
+    }
+    return await adbService.getInstalledPackages(serial)
+  })
   typedIpcMain.handle('adb:uninstallPackage', async (_event, serial, packageName) => {
     console.log(`IPC adb:uninstallPackage called for ${packageName} on ${serial}`)
+    const device = (await adbService.listDevices()).find((entry) => entry.id === serial)
+    if (device?.isSteamFrame) {
+      console.log(`[IPC] Removing Steam Frame Devkit title for ${packageName}`)
+      return await frameDevkitService.uninstallPackage(packageName)
+    }
     return await adbService.uninstallPackage(serial, packageName)
   })
   typedIpcMain.handle('adb:deleteGameFiles', async (_event, releaseName) => {
