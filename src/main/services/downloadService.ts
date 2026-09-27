@@ -5,6 +5,7 @@ import { execFile } from 'child_process'
 import SevenZip from 'node-7z'
 import { awaitSevenZipStream } from './sevenZipUtils'
 import adbService from './adbService'
+import frameDevkitService from './frame/frameDevkitService'
 import dependencyService from './dependencyService'
 import gameService from './gameService'
 import { EventEmitter } from 'events'
@@ -580,7 +581,7 @@ class DownloadService extends EventEmitter implements DownloadAPI {
         `[Service ProcessQueue] Extraction successful for ${itemAfterExtraction.releaseName}. Queuing installation on ${finalTargetDeviceId}...`
       )
       const installStartTime = Date.now()
-      const installationSuccess = await this.installationProcessor.startInstallation(
+      const installationSuccess = await this.installItemToTarget(
         itemAfterExtraction,
         finalTargetDeviceId
       )
@@ -685,7 +686,7 @@ class DownloadService extends EventEmitter implements DownloadAPI {
         `[Service ResumeQueue] Starting installation for ${itemAfterExtraction.releaseName} on ${finalTargetDeviceId}...`
       )
       const installStartTime = Date.now()
-      const installationSuccess = await this.installationProcessor.startInstallation(
+      const installationSuccess = await this.installItemToTarget(
         itemAfterExtraction,
         finalTargetDeviceId
       )
@@ -712,6 +713,78 @@ class DownloadService extends EventEmitter implements DownloadAPI {
         undefined,
         currentItem?.extractProgress
       )
+    }
+  }
+
+  private async isSteamFrameDevice(deviceId: string): Promise<boolean> {
+    const devices = await this.adbService.listDevices()
+    return Boolean(
+      devices.find((device) => device.id === deviceId && device.type === 'device')?.isSteamFrame
+    )
+  }
+
+  private async installItemToTarget(
+    item: DownloadItem,
+    deviceId: string,
+    onProgress?: (step: string, percent?: number) => void
+  ): Promise<boolean> {
+    if (!(await this.isSteamFrameDevice(deviceId))) {
+      return await this.installationProcessor.startInstallation(item, deviceId, onProgress)
+    }
+
+    if (!item.downloadPath) {
+      throw new Error(`No extracted path is available for ${item.releaseName}`)
+    }
+
+    const tracked = Boolean(this.queueManager.findItem(item.releaseName))
+    const report = (step: string, percent?: number): void => {
+      onProgress?.(step, percent)
+      if (tracked) {
+        this.updateItemStatus(
+          item.releaseName,
+          'Installing',
+          100,
+          undefined,
+          undefined,
+          undefined,
+          100
+        )
+      }
+    }
+
+    try {
+      report('Preparing Steam Frame deployment…', 0)
+      const success = await frameDevkitService.deploy(
+        item.downloadPath,
+        item.gameName || item.releaseName,
+        report
+      )
+      if (tracked) {
+        this.updateItemStatus(
+          item.releaseName,
+          success ? 'Completed' : 'InstallError',
+          100,
+          success ? undefined : 'Steam Frame Devkit deployment failed',
+          undefined,
+          undefined,
+          100
+        )
+      }
+      return success
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (tracked) {
+        this.updateItemStatus(
+          item.releaseName,
+          'InstallError',
+          100,
+          message.substring(0, 250),
+          undefined,
+          undefined,
+          100
+        )
+      }
+      throw error
     }
   }
 
@@ -1263,7 +1336,7 @@ class DownloadService extends EventEmitter implements DownloadAPI {
     // Directly trigger the installation processor
     // The installationProcessor will handle setting the status to 'Installing'
     try {
-      const success = await this.installationProcessor.startInstallation(item, deviceId)
+      const success = await this.installItemToTarget(item, deviceId)
       // Log based on success
       if (success) {
         console.log(
@@ -1333,7 +1406,7 @@ class DownloadService extends EventEmitter implements DownloadAPI {
       downloadPath: folderPath
     }
 
-    const success = await this.installationProcessor.startInstallation(
+    const success = await this.installItemToTarget(
       tempItem,
       deviceId,
       onProgress
@@ -1402,11 +1475,9 @@ class DownloadService extends EventEmitter implements DownloadAPI {
         // picked/dropped the APK from inside an extracted game folder) it gets
         // pushed too, instead of installing a data-less app.
         console.log(`[Service installManualFile] Installing single APK: ${filePath}`)
-        const success = await this.installationProcessor.installSingleApk(
-          filePath,
-          deviceId,
-          onProgress
-        )
+        const success = (await this.isSteamFrameDevice(deviceId))
+          ? await frameDevkitService.deploy(filePath, basename(filePath, '.apk'), onProgress)
+          : await this.installationProcessor.installSingleApk(filePath, deviceId, onProgress)
         if (success) {
           console.log(`[Service installManualFile] Successfully installed APK: ${filePath}`)
           this.emit('installation:success', deviceId)
@@ -1506,7 +1577,7 @@ class DownloadService extends EventEmitter implements DownloadAPI {
             downloadPath: tmpDir
           }
 
-          const success = await this.installationProcessor.startInstallation(
+          const success = await this.installItemToTarget(
             tempItem,
             deviceId,
             onProgress
@@ -1563,6 +1634,13 @@ class DownloadService extends EventEmitter implements DownloadAPI {
       }
     } catch (err) {
       console.error(`[Service copyObbFolder] Error verifying target device ${deviceId}:`, err)
+      return false
+    }
+
+    if (await this.isSteamFrameDevice(deviceId)) {
+      console.error(
+        '[Service copyObbFolder] On Steam Frame, install the APK and OBB together so Devkit can upload game.apk + obb/*.obb.'
+      )
       return false
     }
 
