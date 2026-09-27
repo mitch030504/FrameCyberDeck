@@ -46,31 +46,15 @@ const GameDescriptionPanel: React.FC<GameDescriptionPanelProps> = ({ loading, re
         >
           {result.text}
         </p>
-        {result.source.url ? (
-          <a
-            href={result.source.url}
-            target="_blank"
-            rel="noreferrer"
-            style={{
-              color: 'var(--vrcd-purple)',
-              fontFamily: 'monospace',
-              fontSize: 11,
-              alignSelf: 'flex-start'
-            }}
-          >
-            Source: {result.source.label}
-          </a>
-        ) : (
-          <span
-            style={{
-              color: 'rgba(var(--vrcd-neon-raw),0.45)',
-              fontFamily: 'monospace',
-              fontSize: 11
-            }}
-          >
-            Source: {result.source.label}
-          </span>
-        )}
+        <span
+          style={{
+            color: 'rgba(var(--vrcd-neon-raw),0.45)',
+            fontFamily: 'monospace',
+            fontSize: 11
+          }}
+        >
+          Source: {result.source.label}
+        </span>
       </>
     ) : (
       <span
