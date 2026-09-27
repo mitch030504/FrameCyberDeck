@@ -487,6 +487,7 @@ def convert(
         run(
             [
                 build / "apksigner",
+                "-J--enable-native-access=ALL-UNNAMED",
                 "sign",
                 "--ks",
                 key,
@@ -497,7 +498,15 @@ def convert(
                 aligned,
             ]
         )
-        run([build / "apksigner", "verify", "--verbose", game_apk])
+        run(
+            [
+                build / "apksigner",
+                "-J--enable-native-access=ALL-UNNAMED",
+                "verify",
+                "--verbose",
+                game_apk,
+            ]
+        )
 
         obb_count = copy_obbs(source_root, output_dir)
         result = {
