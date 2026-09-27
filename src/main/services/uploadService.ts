@@ -9,6 +9,7 @@ import adbService from './adbService'
 import dependencyService from './dependencyService'
 import gameService from './gameService'
 import settingsService from './settingsService'
+import frameDevkitService from './frame/frameDevkitService'
 import {
   ServiceStatus,
   UploadPreparationProgress,
@@ -210,13 +211,13 @@ class UploadService extends EventEmitter {
     }
   }
 
-  public addToQueue(
+  public async addToQueue(
     packageName: string,
     gameName: string,
     versionCode: number,
     deviceId: string
-  ): boolean {
-    // Check if item is in the blacklist with this or lower version
+  ): Promise<boolean> {
+    // Check if item is in the blacklist with this or lower version.
     if (gameService.isGameBlacklisted(packageName, versionCode)) {
       console.log(
         `[UploadService] ${packageName} v${versionCode} is in the blacklist or has a newer version already uploaded.`
@@ -224,7 +225,7 @@ class UploadService extends EventEmitter {
       return false
     }
 
-    // Check if item already exists in queue
+    // Check if item already exists in queue.
     const existingItem = this.findItem(packageName)
     if (existingItem) {
       if (existingItem.status === 'Completed') {
@@ -237,11 +238,37 @@ class UploadService extends EventEmitter {
         return false
       }
 
-      // Remove previous item if it was in error or cancelled
       this.uploadQueue = this.uploadQueue.filter((item) => item.packageName !== packageName)
     }
 
-    // Add new item to queue
+    // Steam Frame itself exposes SteamOS over ADB, not the Android runtime, so
+    // pm path / adb pull cannot recover the original Quest APK. FrameCyberDeck
+    // records the original source used for each managed install and contributes
+    // that source instead of the converted/re-signed Frame APK.
+    let frameSourcePath: string | undefined
+    try {
+      const device = (await adbService.listDevices()).find((entry) => entry.id === deviceId)
+      if (device?.isSteamFrame) {
+        const source = await frameDevkitService.getOriginalSource(packageName)
+        if (!source) {
+          console.warn(
+            `[UploadService] Cannot contribute ${packageName} from Steam Frame: original source provenance is unavailable. Reinstall the original APK/folder with this FrameCyberDeck build first.`
+          )
+          return false
+        }
+        if (source.originalSourcePath.toLowerCase().endsWith('.zip')) {
+          console.warn(
+            `[UploadService] Cannot contribute ${packageName} from a ZIP provenance yet. Reinstall from the extracted APK/folder so the original payload can be validated before upload.`
+          )
+          return false
+        }
+        frameSourcePath = source.originalSourcePath
+      }
+    } catch (error) {
+      console.error('[UploadService] Failed to resolve Steam Frame source provenance:', error)
+      return false
+    }
+
     const newItem: UploadItem = {
       packageName,
       gameName,
@@ -249,14 +276,21 @@ class UploadService extends EventEmitter {
       deviceId,
       status: 'Queued',
       progress: 0,
-      addedDate: Date.now()
+      addedDate: Date.now(),
+      ...(frameSourcePath
+        ? {
+            isLocalUpload: true,
+            sourcePath: frameSourcePath
+          }
+        : {})
     }
 
     this.uploadQueue.push(newItem)
-    console.log(`[UploadService] Added ${packageName} v${versionCode} to upload queue.`)
+    console.log(
+      `[UploadService] Added ${packageName} v${versionCode} to upload queue${frameSourcePath ? ' using original Frame source provenance' : ''}.`
+    )
     this.emitQueueUpdated()
 
-    // Start processing the queue if we're not already
     if (!this.isProcessing) {
       this.processQueue()
     }
@@ -487,16 +521,24 @@ class UploadService extends EventEmitter {
         await fs.mkdir(stagingDir, { recursive: true })
 
         try {
-          // Copy source folder contents into staging
-          const entries = await fs.readdir(item.sourcePath!, { withFileTypes: true })
-          for (const entry of entries) {
-            const src = join(item.sourcePath!, entry.name)
-            const dst = join(stagingDir, entry.name)
-            if (entry.isDirectory()) {
-              await fs.cp(src, dst, { recursive: true })
-            } else {
-              await fs.copyFile(src, dst)
+          // Copy the original source into staging. Frame provenance may be
+          // either an extracted game folder or a single original Quest APK.
+          const sourceStat = await fs.stat(item.sourcePath!)
+          if (sourceStat.isDirectory()) {
+            const entries = await fs.readdir(item.sourcePath!, { withFileTypes: true })
+            for (const entry of entries) {
+              const src = join(item.sourcePath!, entry.name)
+              const dst = join(stagingDir, entry.name)
+              if (entry.isDirectory()) {
+                await fs.cp(src, dst, { recursive: true })
+              } else {
+                await fs.copyFile(src, dst)
+              }
             }
+          } else if (sourceStat.isFile() && item.sourcePath!.toLowerCase().endsWith('.apk')) {
+            await fs.copyFile(item.sourcePath!, join(stagingDir, basename(item.sourcePath!)))
+          } else {
+            throw new Error('Original Frame contribution source must be an APK or extracted game folder')
           }
 
           // Add HWID.txt
