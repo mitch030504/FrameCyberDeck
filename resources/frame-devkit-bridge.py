@@ -187,6 +187,7 @@ def deploy(
             "gameid": name,
             "directory": remote_directory,
             "argv": [start_command],
+            "env": {},
             "settings": {
                 "steam_play": "0",
                 "compat_tool": "fauxdroid",
