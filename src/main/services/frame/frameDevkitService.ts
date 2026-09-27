@@ -385,7 +385,9 @@ class FrameDevkitService {
   }
 
   async runGame(gameId: string, host?: string): Promise<boolean> {
+    console.log(`[Frame Devkit] Launching Devkit title ${gameId}`)
     await this.bridge<{ ok: boolean; error?: string }>('run', ['--name', gameId], host)
+    console.log(`[Frame Devkit] Launch request accepted for ${gameId}`)
     return true
   }
 
@@ -396,6 +398,9 @@ class FrameDevkitService {
       console.warn(`[Frame Devkit] No installed title found for ${packageName}`)
       return false
     }
+    console.log(
+      `[Frame Devkit] Resolved package ${packageName} to ${game.gameid}${game.managed ? ' (managed)' : ''}`
+    )
     return await this.runGame(game.gameid, host)
   }
 
