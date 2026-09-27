@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import shlex
 import shutil
 import subprocess
@@ -110,6 +111,15 @@ def status(host: str, port: int) -> dict:
     }
 
 
+def validate_gameid(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9._]+", value):
+        raise RuntimeError(
+            "Steam Frame shortcut game IDs may only contain letters, digits, dots and underscores; "
+            f"got {value!r}"
+        )
+    return value
+
+
 def require_tools() -> None:
     missing = [name for name in ("ssh", "rsync") if not shutil.which(name)]
     if missing:
@@ -125,6 +135,7 @@ def deploy(
     start: bool,
 ) -> None:
     require_tools()
+    name = validate_gameid(name)
     current = status(host, port)
     if not current["paired"]:
         fail(
