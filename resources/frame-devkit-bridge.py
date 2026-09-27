@@ -269,14 +269,15 @@ def list_games_data(host: str, port: int) -> tuple[dict, list[dict]]:
         if not gameid:
             continue
 
+        quoted_gameid = shlex.quote(gameid)
         metadata_result = ssh_command(
             host,
             login,
-            "cat "
-            + shlex.quote(f"~/devkit-game/{gameid}/frame-cyberdeck.json")
-            + " 2>/dev/null || cat "
-            + shlex.quote(f"~/devkit-game/{gameid}/frame-conversion.json")
-            + " 2>/dev/null || true",
+            'cat "$HOME"/devkit-game/'
+            + quoted_gameid
+            + '/frame-cyberdeck.json 2>/dev/null || cat "$HOME"/devkit-game/'
+            + quoted_gameid
+            + '/frame-conversion.json 2>/dev/null || true',
             check=False,
         )
         metadata: dict = {}
@@ -327,13 +328,15 @@ def delete_game(host: str, port: int, name: str) -> None:
             login,
             "python3 ~/devkit-utils/steamos-delete --delete-title " + shlex.quote(name),
         )
+        quoted_name = shlex.quote(name)
         ssh_command(
             host,
             login,
-            "rm -f "
-            + shlex.quote(f"~/devkit-game/{name}-argv.json")
-            + " "
-            + shlex.quote(f"~/devkit-game/{name}-settings.json"),
+            'rm -f "$HOME"/devkit-game/'
+            + quoted_name
+            + '-argv.json "$HOME"/devkit-game/'
+            + quoted_name
+            + '-settings.json',
             check=False,
         )
     except subprocess.CalledProcessError as exc:
