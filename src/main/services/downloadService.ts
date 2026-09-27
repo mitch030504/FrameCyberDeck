@@ -727,7 +727,8 @@ class DownloadService extends EventEmitter implements DownloadAPI {
   private async installItemToTarget(
     item: DownloadItem,
     deviceId: string,
-    onProgress?: (step: string, percent?: number) => void
+    onProgress?: (step: string, percent?: number) => void,
+    frameOriginalSourcePath?: string
   ): Promise<boolean> {
     if (!(await this.isSteamFrameDevice(deviceId))) {
       return await this.installationProcessor.startInstallation(item, deviceId, onProgress)
@@ -766,7 +767,9 @@ class DownloadService extends EventEmitter implements DownloadAPI {
       const success = await frameDevkitService.deploy(
         converted.directory,
         item.gameName || item.releaseName,
-        report
+        report,
+        undefined,
+        frameOriginalSourcePath ?? item.downloadPath
       )
       if (tracked) {
         this.updateItemStatus(
@@ -1497,7 +1500,9 @@ class DownloadService extends EventEmitter implements DownloadAPI {
             success = await frameDevkitService.deploy(
               converted.directory,
               basename(filePath, '.apk'),
-              onProgress
+              onProgress,
+              undefined,
+              filePath
             )
           } finally {
             await converted.cleanup()
@@ -1611,7 +1616,8 @@ class DownloadService extends EventEmitter implements DownloadAPI {
           const success = await this.installItemToTarget(
             tempItem,
             deviceId,
-            onProgress
+            onProgress,
+            filePath
           )
           if (success) {
             console.log(`[Service installManualFile] Successfully installed from ZIP: ${filePath}`)
