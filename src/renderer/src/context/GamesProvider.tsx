@@ -139,7 +139,7 @@ export const GamesProvider: React.FC<GamesProviderProps> = ({ children }) => {
     }
 
     if (!selectedDeviceDetails?.isQuestDevice) {
-      //return
+      return
     }
 
     const candidates: UploadCandidate[] = []
