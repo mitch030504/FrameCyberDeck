@@ -138,7 +138,7 @@ export const GamesProvider: React.FC<GamesProviderProps> = ({ children }) => {
       return
     }
 
-    if (!selectedDeviceDetails?.isQuestDevice) {
+    if (!selectedDeviceDetails?.isQuestDevice && !selectedDeviceDetails?.isSteamFrame) {
       return
     }
 
@@ -168,10 +168,9 @@ export const GamesProvider: React.FC<GamesProviderProps> = ({ children }) => {
 
         // Check if this package is missing from the store
         if (!allGamePackages.has(pkg.packageName)) {
-          const applicationLabel = await window.api.adb.getApplicationLabel(
-            selectedDevice || '',
-            pkg.packageName
-          )
+          const applicationLabel = selectedDeviceDetails?.isSteamFrame
+            ? pkg.applicationLabel || pkg.packageName
+            : await window.api.adb.getApplicationLabel(selectedDevice || '', pkg.packageName)
           if (!applicationLabel) {
             console.error(`No application label found for ${pkg.packageName}, skipping...`)
             continue
