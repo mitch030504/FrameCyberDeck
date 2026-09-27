@@ -34,7 +34,7 @@ class SettingsService extends EventEmitter implements SettingsAPI {
       hideAdultContent: true,
       colorScheme: nativeTheme.shouldUseDarkColors ? 'dark' : 'light',
       serverConfig: { baseUri: '', password: '' },
-      maxConcurrentDownloads: 3,
+      maxConcurrentDownloads: 2,
       existingDownloadAction: 'ask',
       downloadProxy: { ...DEFAULT_DOWNLOAD_PROXY_SETTINGS }
     }
@@ -104,12 +104,12 @@ class SettingsService extends EventEmitter implements SettingsAPI {
   }
 
   getMaxConcurrentDownloads(): number {
-    const n = this.settings.maxConcurrentDownloads ?? 3
-    return Math.max(1, Math.min(6, n))
+    const n = this.settings.maxConcurrentDownloads ?? 2
+    return Math.max(1, Math.min(2, n))
   }
 
   setMaxConcurrentDownloads(n: number): void {
-    this.settings.maxConcurrentDownloads = Math.max(1, Math.min(6, n))
+    this.settings.maxConcurrentDownloads = Math.max(1, Math.min(2, n))
     this.saveSettings()
     this.emit('max-concurrent-downloads-changed', this.settings.maxConcurrentDownloads)
   }
