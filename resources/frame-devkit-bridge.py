@@ -3,154 +3,259 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
-import os
 import pathlib
-import sys
-from types import SimpleNamespace
+import shlex
+import shutil
+import subprocess
+import urllib.request
+
+DEFAULT_PORT = 32000
+REQUEST_TIMEOUT = 5
 
 
-def fail(message: str, code: int = 1):
-    print(json.dumps({"ok": False, "error": message}), flush=True)
+def emit(value: dict) -> None:
+    print(json.dumps(value, separators=(",", ":")), flush=True)
+
+
+def fail(message: str, code: int = 1) -> None:
+    emit({"ok": False, "error": message})
     raise SystemExit(code)
 
 
-def load_devkit():
-    pyz = os.environ.get("STEAMOS_DEVKIT_PYZ", "").strip()
-    if not pyz:
-        fail("STEAMOS_DEVKIT_PYZ was not supplied")
-    p = pathlib.Path(pyz).expanduser().resolve()
-    if not p.is_file():
-        fail(f"SteamOS Devkit Client archive was not found: {p}")
-    sys.path.insert(0, str(p))
+def private_key_path() -> pathlib.Path:
+    return pathlib.Path.home() / ".config" / "steamos-devkit" / "devkit_rsa"
+
+
+def properties(host: str, port: int) -> dict:
     try:
-        import devkit_client  # type: ignore
-        import signalslot  # type: ignore
+        with urllib.request.urlopen(
+            f"http://{host}:{port}/properties.json", timeout=REQUEST_TIMEOUT
+        ) as response:
+            value = json.load(response)
     except Exception as exc:
-        fail(f"Could not import SteamOS Devkit Client from {p}: {exc}")
-    return devkit_client, signalslot
+        fail(f"Could not query SteamOS Devkit service at {host}:{port}: {exc}")
+    if not isinstance(value, dict):
+        fail("SteamOS Devkit properties response was not a JSON object")
+    return value
 
 
-def machine_args(devkit_client, host: str, port: int):
-    return SimpleNamespace(
-        machine=host,
-        machine_name_type=devkit_client.MachineNameType.ADDRESS,
-        login=None,
-        http_port=port,
+def ssh_command(
+    host: str,
+    login: str,
+    command: str,
+    *,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    key = private_key_path()
+    if not key.is_file():
+        raise RuntimeError(
+            f"SteamOS Devkit key not found at {key}. Register the Frame once in the official SteamOS Devkit Client."
+        )
+
+    return subprocess.run(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            f"ConnectTimeout={REQUEST_TIMEOUT}",
+            "-i",
+            str(key),
+            f"{login}@{host}",
+            command,
+        ],
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
 
 
-def cmd_status(devkit_client, host: str, port: int):
-    args = machine_args(devkit_client, host, port)
-    machine = devkit_client.resolve_machine(
-        args.machine,
-        login=None,
-        need_login=True,
-        need_devkit1=False,
-        name_type=args.machine_name_type,
-        http_port=port,
-    )
-    if not machine.login:
-        fail(f"SteamOS Devkit service at {host}:{port} did not report a login user")
-
+def status(host: str, port: int) -> dict:
+    props = properties(host, port)
+    login = str(props.get("login") or "steamos")
+    key = private_key_path()
     paired = False
     pair_error = None
-    try:
-        ssh, _client, resolved = devkit_client._open_ssh_for_args_all(args)
-        try:
-            paired = True
-            address = resolved.address
-            login = resolved.login
-        finally:
-            ssh.close()
-    except Exception as exc:
-        address = machine.address
-        login = machine.login
-        pair_error = str(exc)
 
-    print(json.dumps({
+    if not key.is_file():
+        pair_error = (
+            f"SteamOS Devkit key not found at {key}. "
+            "Register the Frame once in the official SteamOS Devkit Client."
+        )
+    elif not shutil.which("ssh"):
+        pair_error = "ssh is not installed on the host"
+    else:
+        try:
+            result = ssh_command(host, login, "true", check=False)
+            paired = result.returncode == 0
+            if not paired:
+                pair_error = (result.stderr or result.stdout or "SSH authentication failed").strip()
+        except Exception as exc:
+            pair_error = str(exc)
+
+    return {
         "ok": True,
         "host": host,
-        "address": address,
+        "address": host,
         "login": login,
         "paired": paired,
         "pairError": pair_error,
-    }), flush=True)
+    }
 
 
-def cmd_register(devkit_client, host: str, port: int):
-    args = machine_args(devkit_client, host, port)
-    result = devkit_client.register(args)
-    print(json.dumps({"ok": True, "result": result}), flush=True)
+def require_tools() -> None:
+    missing = [name for name in ("ssh", "rsync") if not shutil.which(name)]
+    if missing:
+        fail("Missing required host tools: " + ", ".join(missing))
 
 
-def make_upload_args(devkit_client, signalslot, host: str, port: int, name: str, directory: str, start_command: str):
-    directory_path = pathlib.Path(directory).expanduser().resolve()
-    if not directory_path.is_dir():
-        fail(f"Upload directory does not exist: {directory_path}")
-    start_path = directory_path / start_command
-    if not start_path.is_file():
-        fail(f"Start command does not exist inside upload directory: {start_path}")
+def deploy(
+    host: str,
+    port: int,
+    name: str,
+    directory: str,
+    start_command: str,
+    start: bool,
+) -> None:
+    require_tools()
+    current = status(host, port)
+    if not current["paired"]:
+        fail(
+            "Steam Frame is reachable but not paired for Devkit SSH: "
+            + str(current.get("pairError") or "unknown SSH error")
+        )
 
-    return SimpleNamespace(
-        machine=host,
-        machine_name_type=devkit_client.MachineNameType.ADDRESS,
-        login=None,
-        http_port=port,
-        restart_steam=False,
-        name=name,
-        directory=str(directory_path),
-        argv=[start_command],
-        delete_extraneous=True,
-        skip_newer_files=False,
-        verify_checksums=True,
-        filter_args=[],
-        steam_play_debug=devkit_client.SteamPlayDebug.Disabled,
-        deps={},
-        cancel_signal=signalslot.Signal(),
-        clear_settings=False,
-        settings_file=[],
-        set_json=[],
-        set_keyval=["steam_play=0", "compat_tool=fauxdroid"],
+    login = str(current["login"])
+    source = pathlib.Path(directory).expanduser().resolve()
+    if not source.is_dir():
+        fail(f"Upload directory does not exist: {source}")
+    if not (source / start_command).is_file():
+        fail(f"Start command does not exist inside upload directory: {source / start_command}")
+
+    try:
+        prep = ssh_command(
+            host,
+            login,
+            "python3 ~/devkit-utils/steamos-prepare-upload "
+            f"--gameid {shlex.quote(name)} --restart-steam 0",
+        )
+        prepared = json.loads(prep.stdout)
+        remote_user = str(prepared["user"])
+        remote_directory = str(prepared["directory"])
+
+        key = private_key_path()
+        ssh_transport = " ".join(
+            shlex.quote(part)
+            for part in [
+                "ssh",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-i",
+                str(key),
+            ]
+        )
+
+        subprocess.run(
+            [
+                "rsync",
+                "-av",
+                "--chmod=Du=rwx,Dgo=rx,Fu=rwx,Fog=rx",
+                "--delete",
+                "--delete-excluded",
+                "--delete-delay",
+                "--checksum",
+                "-e",
+                ssh_transport,
+                f"{str(source).rstrip('/')}/",
+                f"{remote_user}@{host}:{remote_directory.rstrip('/')}/",
+            ],
+            check=True,
+        )
+
+        shortcut = {
+            "gameid": name,
+            "directory": remote_directory,
+            "argv": [start_command],
+            "settings": {
+                "steam_play": "0",
+                "compat_tool": "fauxdroid",
+            },
+        }
+        shortcut_json = shlex.quote(json.dumps(shortcut, separators=(",", ":")))
+        created = ssh_command(
+            host,
+            login,
+            "python3 ~/devkit-utils/steam-client-create-shortcut "
+            f"--parms {shortcut_json}",
+        )
+        create_result = json.loads(created.stdout)
+        if "error" in create_result:
+            raise RuntimeError(str(create_result["error"]))
+
+        if start:
+            ssh_command(
+                host,
+                login,
+                "python3 ~/devkit-utils/steam-devkit-rpc run-game "
+                f"gameid={shlex.quote(name)}",
+            )
+
+    except subprocess.CalledProcessError as exc:
+        detail = (
+            (exc.stderr.strip() if isinstance(exc.stderr, str) else "")
+            or (exc.stdout.strip() if isinstance(exc.stdout, str) else "")
+            or str(exc)
+        )
+        fail(f"SteamOS Devkit deployment command failed: {detail}")
+    except Exception as exc:
+        fail(str(exc))
+
+    emit(
+        {
+            "ok": True,
+            "name": name,
+            "directory": str(source),
+            "remoteDirectory": remote_directory,
+            "startCommand": start_command,
+            "runtime": "Android",
+            "compatTool": "fauxdroid",
+            "started": start,
+        }
     )
 
 
-def cmd_deploy(devkit_client, signalslot, host: str, port: int, name: str, directory: str, start_command: str, start: bool):
-    args = make_upload_args(devkit_client, signalslot, host, port, name, directory, start_command)
-    result = devkit_client.new_or_ensure_game(args)
-    if not result:
-        fail("SteamOS Devkit Client reported that the title upload failed")
-
-    if start:
-        fake_devkit = SimpleNamespace(
-            machine_command_args=(host, devkit_client.MachineNameType.ADDRESS),
-            http_port=port,
+def list_games(host: str, port: int) -> None:
+    current = status(host, port)
+    if not current["paired"]:
+        fail(
+            "Steam Frame is reachable but not paired for Devkit SSH: "
+            + str(current.get("pairError") or "unknown SSH error")
         )
-        devkit_client.run_game(fake_devkit, name)
-
-    print(json.dumps({
-        "ok": True,
-        "name": name,
-        "directory": str(pathlib.Path(directory).resolve()),
-        "startCommand": start_command,
-        "runtime": "Android",
-        "compatTool": "fauxdroid",
-        "started": start,
-    }), flush=True)
-
-
-def cmd_list(devkit_client, host: str, port: int):
-    games = devkit_client.list_games(machine_args(devkit_client, host, port))
-    print(json.dumps({"ok": True, "games": games}), flush=True)
+    result = ssh_command(
+        host,
+        str(current["login"]),
+        "python3 ~/devkit-utils/steamos-list-games",
+    )
+    emit({"ok": True, "games": json.loads(result.stdout)})
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Frame CyberDeck SteamOS Devkit bridge")
     p.add_argument("--host", default="frame")
-    p.add_argument("--port", type=int, default=32000)
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
-    sub.add_parser("register")
     sub.add_parser("list")
     d = sub.add_parser("deploy")
     d.add_argument("--name", required=True)
@@ -161,34 +266,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="[SteamOS Devkit] %(message)s")
     args = build_parser().parse_args()
-    devkit_client, signalslot = load_devkit()
-    try:
-        if args.command == "status":
-            cmd_status(devkit_client, args.host, args.port)
-        elif args.command == "register":
-            cmd_register(devkit_client, args.host, args.port)
-        elif args.command == "list":
-            cmd_list(devkit_client, args.host, args.port)
-        elif args.command == "deploy":
-            cmd_deploy(
-                devkit_client,
-                signalslot,
-                args.host,
-                args.port,
-                args.name,
-                args.directory,
-                args.start_command,
-                args.start,
-            )
-        else:
-            fail(f"Unknown command: {args.command}")
-    except SystemExit:
-        raise
-    except Exception as exc:
-        logging.exception("SteamOS Devkit bridge failed")
-        fail(str(exc))
+    if args.command == "status":
+        emit(status(args.host, args.port))
+    elif args.command == "list":
+        list_games(args.host, args.port)
+    elif args.command == "deploy":
+        deploy(
+            args.host,
+            args.port,
+            args.name,
+            args.directory,
+            args.start_command,
+            args.start,
+        )
+    else:
+        fail(f"Unknown command: {args.command}")
 
 
 if __name__ == "__main__":
