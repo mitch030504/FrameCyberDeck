@@ -66,6 +66,7 @@ export function isTcpDevice(device: ExtendedDeviceInfo): boolean {
 export interface PackageInfo {
   packageName: string
   versionCode: number
+  applicationLabel?: string
   // More metadata fields will be added in the future
 }
 
