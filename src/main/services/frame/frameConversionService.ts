@@ -13,6 +13,7 @@ export interface FrameConversionResult {
   package?: string
   versionCode?: number
   versionName?: string
+  applicationLabel?: string
   gameApk: string
   directory: string
   obbCount: number
