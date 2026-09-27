@@ -386,7 +386,11 @@ export class DownloadProcessor {
           '--partial-suffix',
           '.partial',
           '--transfers',
-          '4',
+          '2',
+          '--tpslimit',
+          '1',
+          '--tpslimit-burst',
+          '2',
           // Disable multi-thread transfers. NOTE: 0 disables them; 1 does NOT
           // (it just runs multi-thread with a single stream). For parts larger
           // than --multi-thread-cutoff (256M) rclone's multi-thread writer
