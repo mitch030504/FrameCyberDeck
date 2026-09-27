@@ -3585,6 +3585,7 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
           onInstallFromCompleted={handleInstallFromCompleted}
           onUninstallAndUpdate={handleUninstallAndUpdate}
           onDismissUpdateError={handleDismissUpdateError}
+          onLaunchFrame={handleLaunchFrame}
           getNote={getNote}
           isConnected={isConnected}
           isBusy={isBusy}
