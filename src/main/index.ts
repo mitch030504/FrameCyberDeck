@@ -590,6 +590,11 @@ app.whenReady().then(async () => {
   })
   typedIpcMain.handle('adb:fix-linux-usb-access', async () => installQuestUdevRule())
 
+  // --- Steam Frame Handlers ---
+  typedIpcMain.handle('frame:run-package', async (_event, packageName) => {
+    return await frameDevkitService.runPackage(packageName)
+  })
+
   // --- Game Handlers ---
   typedIpcMain.handle('games:get-games', async () => gameService.getGames())
   typedIpcMain.handle('games:get-blacklist-games', async () => gameService.getBlacklistGames())
