@@ -414,8 +414,10 @@ def convert(
 
     version_code_match = re.search(r"versionCode='(\d+)'", badging)
     version_name_match = re.search(r"versionName='([^']*)'", badging)
+    label_match = re.search(r"application-label:'([^']*)'", badging)
     version_code = int(version_code_match.group(1)) if version_code_match else 0
     version_name = version_name_match.group(1) if version_name_match else ""
+    application_label = label_match.group(1) if label_match else package
 
     with zipfile.ZipFile(source_apk) as source_zip:
         names = source_zip.namelist()
@@ -505,6 +507,7 @@ def convert(
             "package": package,
             "versionCode": version_code,
             "versionName": version_name,
+            "applicationLabel": application_label,
             "gameApk": str(game_apk),
             "directory": str(output_dir),
             "obbCount": obb_count,
