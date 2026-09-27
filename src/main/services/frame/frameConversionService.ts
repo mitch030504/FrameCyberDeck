@@ -11,6 +11,8 @@ export interface FrameConversionResult {
   converted: boolean
   alreadyConverted: boolean
   package?: string
+  versionCode?: number
+  versionName?: string
   gameApk: string
   directory: string
   obbCount: number
