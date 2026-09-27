@@ -702,14 +702,10 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
     const unsubscribe = window.api.adb.onInstallationCompleted((deviceId) => {
       console.log(`[GamesView] Received installation-completed event for device: ${deviceId}`)
       if (selectedDevice && deviceId === selectedDevice) {
-        if (selectedDeviceDetails?.isSteamFrame) {
-          console.log('[GamesView] Frame Devkit installation completed; skipping Android package refresh.')
-          return
-        }
-        console.log(`[GamesView] Refreshing packages for current device ${selectedDevice}...`)
+        console.log(`[GamesView] Refreshing installed titles for current device ${selectedDevice}...`)
         loadPackages()
-          .then(() => console.log('[GamesView] Package refresh triggered successfully.'))
-          .catch((err) => console.error('[GamesView] Error triggering package refresh:', err))
+          .then(() => console.log('[GamesView] Installed-title refresh triggered successfully.'))
+          .catch((err) => console.error('[GamesView] Error triggering installed-title refresh:', err))
       } else {
         console.log(
           `[GamesView] Installation completed event for non-selected device (${deviceId}), ignoring.`
@@ -721,7 +717,7 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
       unsubscribe()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedDevice, selectedDeviceDetails?.isSteamFrame, loadPackages])
+  }, [selectedDevice, loadPackages])
 
   const downloadStatusMap = useMemo(() => {
     const map = new Map<
@@ -1568,8 +1564,8 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
           } catch {
             /* ignore */
           }
-          // Refresh packages to update the UI
-          await loadPackages()
+          // The main process emits adb:installation-completed for manual installs too;
+          // that event performs the single installed-title refresh.
         } else {
           console.error(`${itemName} installation failed for: ${filePath}`)
           setInstallStatusMessage(`❌ Failed to install "${fileName}"`)
@@ -1588,7 +1584,7 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
         setInstallProgress(null)
       }
     },
-    [isConnected, selectedDevice, loadPackages]
+    [isConnected, selectedDevice]
   )
 
   const handleManualInstall = useCallback(
