@@ -29,6 +29,7 @@ export interface FrameInstalledGame {
   versionCode: number
   versionName?: string
   title?: string
+  managed?: boolean
 }
 
 type ProgressReporter = (step: string, percent?: number) => void
@@ -311,17 +312,43 @@ class FrameDevkitService {
     return result.games
   }
 
+  private selectGame(games: FrameInstalledGame[], packageName: string): FrameInstalledGame | undefined {
+    const exactGameId = games.find((entry) => entry.gameid === packageName)
+    if (exactGameId) return exactGameId
+
+    return games
+      .filter((entry) => entry.packageName === packageName)
+      .sort((a, b) => {
+        if (Boolean(a.managed) !== Boolean(b.managed)) return a.managed ? -1 : 1
+        return (b.versionCode || 0) - (a.versionCode || 0)
+      })[0]
+  }
+
   async getInstalledPackages(host?: string): Promise<PackageInfo[]> {
     const games = await this.listGames(host)
-    return games.map((game) => ({
-      packageName: game.packageName || game.gameid,
+    const bestByPackage = new Map<string, FrameInstalledGame>()
+
+    for (const game of games) {
+      const packageName = game.packageName || game.gameid
+      const current = bestByPackage.get(packageName)
+      if (!current) {
+        bestByPackage.set(packageName, game)
+        continue
+      }
+
+      const preferred = this.selectGame([current, game], packageName)
+      if (preferred) bestByPackage.set(packageName, preferred)
+    }
+
+    return [...bestByPackage.entries()].map(([packageName, game]) => ({
+      packageName,
       versionCode: Number.isFinite(game.versionCode) ? game.versionCode : 0
     }))
   }
 
   async uninstallPackage(packageName: string, host?: string): Promise<boolean> {
     const games = await this.listGames(host)
-    const game = games.find((entry) => entry.packageName === packageName || entry.gameid === packageName)
+    const game = this.selectGame(games, packageName)
     if (!game) {
       console.warn(`[Frame Devkit] No installed title found for ${packageName}`)
       return false
@@ -337,7 +364,7 @@ class FrameDevkitService {
 
   async runPackage(packageName: string, host?: string): Promise<boolean> {
     const games = await this.listGames(host)
-    const game = games.find((entry) => entry.packageName === packageName || entry.gameid === packageName)
+    const game = this.selectGame(games, packageName)
     if (!game) {
       console.warn(`[Frame Devkit] No installed title found for ${packageName}`)
       return false
