@@ -29,6 +29,7 @@ export interface FrameInstalledGame {
   versionCode: number
   versionName?: string
   title?: string
+  applicationLabel?: string
   managed?: boolean
 }
 
@@ -212,6 +213,7 @@ class FrameDevkitService {
     packageName?: string
     versionCode?: number
     versionName?: string
+    applicationLabel?: string
   }> {
     const path = join(root, 'frame-conversion.json')
     try {
@@ -220,6 +222,7 @@ class FrameDevkitService {
         packageName?: unknown
         versionCode?: unknown
         versionName?: unknown
+        applicationLabel?: unknown
       }
       const packageName =
         typeof parsed.packageName === 'string'
@@ -232,7 +235,9 @@ class FrameDevkitService {
           ? Math.trunc(parsed.versionCode)
           : undefined
       const versionName = typeof parsed.versionName === 'string' ? parsed.versionName : undefined
-      return { packageName, versionCode, versionName }
+      const applicationLabel =
+        typeof parsed.applicationLabel === 'string' ? parsed.applicationLabel : undefined
+      return { packageName, versionCode, versionName, applicationLabel }
     } catch {
       return {}
     }
@@ -269,10 +274,11 @@ class FrameDevkitService {
         {
           schemaVersion: 1,
           gameId: devkitName,
-          title,
+          title: conversion.applicationLabel ?? title,
           packageName: conversion.packageName ?? devkitName,
           versionCode: conversion.versionCode ?? 0,
-          versionName: conversion.versionName ?? ''
+          versionName: conversion.versionName ?? '',
+          applicationLabel: conversion.applicationLabel ?? title
         },
         null,
         2
@@ -342,7 +348,8 @@ class FrameDevkitService {
 
     return [...bestByPackage.entries()].map(([packageName, game]) => ({
       packageName,
-      versionCode: Number.isFinite(game.versionCode) ? game.versionCode : 0
+      versionCode: Number.isFinite(game.versionCode) ? game.versionCode : 0,
+      applicationLabel: game.applicationLabel || game.title || packageName
     }))
   }
 
