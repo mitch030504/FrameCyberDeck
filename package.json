@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Steam Frame-specific CyberDeck fork with SteamOS Devkit Android deployment",
   "main": "./out/main/index.js",
-  "author": "example.com",
+  "author": "mitch030504",
   "homepage": "https://github.com/mitch030504/FrameCyberDeck",
   "scripts": {
     "test:node": "node --test src/main/services/download/*.test.mjs src/main/services/backup/*.test.mjs",
