@@ -306,6 +306,9 @@ def list_games_data(host: str, port: int) -> tuple[dict, list[dict]]:
                 "managed": managed,
                 "versionName": str(metadata.get("versionName") or ""),
                 "title": str(metadata.get("title") or gameid),
+                "applicationLabel": str(
+                    metadata.get("applicationLabel") or metadata.get("title") or gameid
+                ),
             }
         )
 
