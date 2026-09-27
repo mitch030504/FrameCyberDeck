@@ -2,170 +2,160 @@
   <img src="build/icon.png" width="160" alt="Frame CyberDeck">
 </p>
 
-# VR CyberDeck
+# Frame CyberDeck
 
-**Made with <3 by DMP**
+**Steam Frame-focused fork of VR CyberDeck**
 
-> `> ACCESS GRANTED. JACK IN. SIDELOAD. UPLOAD. REPEAT.`
+Frame CyberDeck is a desktop sideloader and library client built around Valve's Steam Frame. It extends the VR CyberDeck codebase with Steam Frame detection, Quest-to-Frame conversion, SteamOS Devkit deployment, installed-title management, and Frame-aware contribution support.
+
+The project remains usable without a vrSrc API key: local APK sideloading, Quest-to-Frame conversion, Steam Frame deployment, launch, uninstall, and local device management all work independently of catalog access.
+
+> `> FRAME DETECTED. CONVERT. DEPLOY. LAUNCH.`
 
 ```
-[ STATUS ] ONLINE
-[ TARGET ] ANDROID // META QUEST // ALL MODELS
+[ TARGET ] STEAM FRAME
+[ HOST   ] WINDOWS · LINUX · macOS
 [ STACK  ] ELECTRON · REACT · TYPESCRIPT
+[ DEPLOY ] STEAMOS DEVKIT · FAUXDROID
 ```
-
-I REMOVED DISCUSSIONS SINCE PEOPLE WERE ONLY USING IT AS A WAY TO AVOID ADDING LOGS TO AN ISSUE IT SEEMS, EVEN IF THAT WAS NOT THE INTENTION, IN ACTUALITY THAT WAS THE RESULT
 
 ---
 
-VR CyberDeck is a cross-platform desktop deck for sideloading content to Android and Meta Quest devices, wrapped in a neon terminal aesthetic that doesn't feel like a 2014 sideloader. Use it as a pure sideloader out of the box, or add your own server for a browsable library.
+## `// FORK_LINEAGE`
+
+Frame CyberDeck is a fork of **VR CyberDeck** by **DeliciousMeatPop**.
+
+VR CyberDeck itself was built on **ApprenticeVR** by **jimzrt**. Frame CyberDeck keeps that foundation while replacing and extending the device/deployment path for Steam Frame.
+
+This fork is maintained independently for Steam Frame support. Upstream project names are retained here for attribution only.
 
 ---
 
-## `// FORK_NOTE`
+## `// WHAT_THIS_FORK_ADDS`
 
-VR CyberDeck started as a fork of **ApprenticeVR** by **jimzrt**. The core engine — ADB control, the download/upload pipeline, rclone integration, library connection — is theirs. Everything below the surface is a heavy rewrite of the _experience_:
+### Steam Frame detection
 
-|                  | ApprenticeVR                                              | VR CyberDeck                                                                      |
-| ---------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| **Theme**        | Stock Fluent UI                                           | Fully optional cyberpunk / neon-terminal rebrand                                  |
-| **Onboarding**   | Hardcoded (original) /Configure server before use (forks) | Easily configure an rclone config or json file                                    |
-| **Intro**        | None                                                      | `UNAUTHORIZED → AUTHORIZED` glitch boot                                           |
-| **Identity**     | None                                                      | Matrix-style random `g33ky_u$3rn4m3$` per session                                 |
-| **Console**      | None                                                      | In-header Hacker Console + ADB Shell with quick-command shortcuts and user macros |
-| **Live HUD**     | None                                                      | Header `// TRANSFER_BUS` strip with rotating progress, speed, ETA                 |
-| **Library view** | Table only                                                | Table **and** card view, sort presets, table stretches edge-to-edge               |
-| **Trailers**     | Loads full youtube.com page                               | Locked-down nocookie embed — no ads, no suggestions, no subscribe                 |
-| **Downloads**    | Sequential                                                | Up to **5 concurrent**, with NEW / UPDATED badges                                 |
-| **Quit safety**  | None                                                      | Confirmation prompt when transfers are in flight                                  |
-| **Settings**     | Flat panel                                                | Collapsible sections, accent color, font picker, tab memory                       |
-| **A11y**         | Limited                                                   | Full colorblind theming, font picker, font scale to 200%, 900x640 min size        |
-| **Sound**        | None                                                      | Optional drop-in click / type / matrix sound effects                              |
-| **Updates**      | Manual                                                    | In-app auto-updater on every platform                                             |
+- Detects a connected Steam Frame through its native SteamOS ADB interface
+- Distinguishes Steam Frame from Android/Quest devices
+- Reads Frame storage and network information without treating SteamOS as Android
+- Auto-selects the Frame when available
+
+### Quest-to-Frame conversion
+
+Frame CyberDeck can convert a compatible Quest APK before deployment:
+
+1. Inspect the original APK and preserve package/version metadata
+2. Patch it with OVR Port
+3. Inject the Steam Frame OpenXR bridge/runtime components
+4. Align and sign the converted APK
+5. Verify the resulting APK
+6. Stage it for SteamOS Devkit deployment
+
+The original source APK is never overwritten.
+
+### SteamOS Devkit deployment
+
+Frame CyberDeck deploys converted titles through Valve's SteamOS Devkit infrastructure rather than trying to install them directly through SteamOS ADB.
+
+Supported operations include:
+
+- Install/deploy
+- Refresh installed titles
+- Launch from Frame CyberDeck
+- Uninstall
+- Preserve package/version/title metadata
+- Resolve duplicate managed titles by package
+
+The Devkit connection is paired externally using Valve's normal SteamOS Devkit flow. Frame CyberDeck then reuses the existing Devkit SSH key.
+
+### Original-source provenance
+
+For managed Steam Frame installs, Frame CyberDeck records which original Quest payload produced the installed Frame build.
+
+That provenance is used for contribution workflows so the application can contribute the **original APK/folder**, not the converted and re-signed Frame APK.
+
+A local validation tool is included:
+
+```fish
+fish scripts/frame-contribution-dry-run.fish com.Icosa.OpenBrush
+```
+
+It validates package/version identity, provenance, HWID metadata, and archive creation without performing a network upload.
 
 ---
 
-## `// FEATURES`
+## `// LOCAL_SIDELOADING`
 
-**`[ LIBRARY ]`** — optional, only when you add a server
+Local sideloading does not require a vrSrc API key.
 
-- Sideloader-first: works on first launch with zero config; a library is entirely opt-in
-- Add your own server under **Manage Remotes** (a server config or an rclone config) to unlock a browsable library
-- Card view + table view, persistent sort, size presets, 18+ filter
-- Table view stretches to fill the window so wide screens aren't wasted
-- `NEW` / `UPDATED` badges driven off real `lastUpdated` timestamps
+With a Steam Frame connected, you can:
 
-// NOTE: `NEW` = added to the library in the last 30 days. `UPDATED` = existing game updated in the last 7 days. Both badges can appear on the same title simultaneously.
+- Install an APK
+- Install an extracted game folder
+- Install supported ZIP payloads
+- Convert compatible Quest APKs automatically
+- Deploy converted builds to the Frame
+- Launch managed titles
+- Uninstall managed titles
 
-**`[ TRANSFERS ]`**
-
-- Up to 5 parallel downloads with live progress
-- Live `// TRANSFER_BUS` strip in the header — rotates through active transfers with name, stage, %, speed, and ETA
-- Unified Transfers drawer with stage-aware labels (`Installing APK...`, `Copying OBB...`)
-- Scan existing downloads folder and reconcile against the library
-- Clear-completed, retry, and per-item delete actions
-- Close the window mid-transfer? Cyberdeck warns you with `[ TRANSFERS IN PROGRESS ]` before letting you bail (works for both X and Cmd+Q on macOS)
-
-**`[ DEVICE / ADB ]`**
-
-- Auto-connect Quest on launch
-- ADB Shell dialog with built-in **quick-command shortcuts**:
-  - `PERFORMANCE` — pin CPU/GPU level, swap refresh rate (72/90/120Hz), reset texture
-  - `UPDATES` — block / unblock the OS updater and Meta Store
-  - `SYSTEM` — reboot variants, battery, storage, wifi, IP, proximity toggle
-  - `PACKAGES` — list 3rd-party / all / current focused app
-  - `WIRELESS` — `tcpip 5555`, `adb devices`
-- **Custom user macros** — define your own labelled shortcut for any command you spam (right-click to edit/delete, persisted across sessions)
-- Disable-sideloading toggle for safety
-- WiFi bookmarks for wireless ADB
-
-**`[ TRAILERS ]`**
-
-- Locked-down `youtube-nocookie.com/embed/` player — no ads, no suggested videos, no subscribe button, no comments, no end-screen "Watch next" grid
-- Autoplays as soon as you open the trailer drawer
-
-**`[ INTERFACE ]`**
-
-- Glitch boot intro, neon Hacker Console, themed dialogs top to bottom
-- Compact laptop-friendly header — drops down to a 900x640 min window
-- Dark mode done right (no half-themed popups)
-- Accent color picker, tab memory
-- **Font picker** — swap Courier New for Console / Terminal / System Mono if the default is hard to read
-- **Optional sound effects** — drop `click.wav`, `type.wav`, or `matrix.wav` into your user-data `sounds/` folder (or `resources/sounds/` for bundled), and the UI plays them on button clicks, the boot intro typing, and the ADB shell matrix load. Toggle + volume in Settings, with a per-file "✓ READY / — missing" status readout.
-- Colorblind mode now covers the whole UI — version subtitles, filter counters, Transfers button, battery pill, breach animation all swap palette
-- Font scale up to 200%
-- One-click log upload from Settings → Log Upload
+The application also retains the original VR CyberDeck Android/Quest paths where they are still applicable.
 
 ---
 
-## `// DOWNLOAD`
+## `// CATALOG_AND_CONTRIBUTIONS`
 
-| File                                  | Platform            |
-| ------------------------------------- | ------------------- |
-| `vr-cyberdeck-x.x.x-x64.dmg`          | macOS x64           |
-| `vr-cyberdeck-x.x.x-arm64.dmg`        | macOS arm64         |
-| `vr-cyberdeck-x.x.x-setup-x64.exe`    | Windows — Installer |
-| `vr-cyberdeck-x.x.x-portable-x64.exe` | Windows — Portable  |
-| `vr-cyberdeck-x.x.x-x86_64.AppImage`  | Linux x64           |
-| `vr-cyberdeck-x.x.x-arm64.AppImage`   | Linux ARM64         |
-| `vr-cyberdeck-x.x.x-amd64.deb`        | Debian/Ubuntu x64   |
-| `vr-cyberdeck-x.x.x-arm64.deb`        | Debian/Ubuntu ARM64 |
+Catalog access is optional and requires an authorized API key.
 
-Always grab the latest release. If it's already installed, just update in-app.
+When authorized catalog access is configured, Frame CyberDeck can:
 
-**macOS — "App is damaged":**
+- Sync catalog metadata
+- Compare installed package/version metadata against the catalog
+- Detect packages that are missing or newer
+- Prepare eligible contributions using the provided `upload.config`
+- Use the recorded original source for Steam Frame contributions
 
-```
-xattr -c /Applications/VR\ CyberDeck.app
-```
+The public/catalog download path is intentionally conservative:
 
-**Linux AppImage:**
+- Maximum 2 concurrent downloads
+- Maximum 2 rclone transfers on the protected endpoint
+- Request TPS limit of 1 with burst 2
 
-```
-chmod +x vr-cyberdeck-x.x.x-x86_64.AppImage
-./vr-cyberdeck-x.x.x-x86_64.AppImage
-```
-
-**Linux — Quest only connects after accepting the "Allow access to data" prompt:**
-
-Linux needs a udev rule before ADB can reach the headset (Windows gets this from its driver). If the Quest shows up as **NO USB ACCESS**, click **FIX USB ACCESS** on its card, or run:
-
-```
-sh scripts/linux-quest-udev.sh
-```
-
-Then unplug and replug the Quest. After that it connects as soon as it's plugged in, and you can dismiss the data prompt.
+There is no "download all" or bulk-download function.
 
 ---
 
-## `// JACK_IN`
+## `// STEAM_FRAME_SETUP`
 
-1. Install the build for your OS
-2. Plug in your Quest via USB (data-capable cable)
-3. Allow USB Debugging on the headset
-4. Drag an APK, ZIP, game folder, or OBB folder onto the deck to sideload it
+### 1. Pair SteamOS Devkit access
 
-That's it — no account, no server, no JSON to edit.
+Pair the Steam Frame once using Valve's SteamOS Devkit client.
 
-> Want a browsable library instead? Add an authorized server config or rclone config under **Manage Remotes**. Other advanced flows live in **Other Settings**.
+Frame CyberDeck expects the normal Devkit SSH key at:
 
-> Power user? Open the **ADB Shell** right from the deck — the shortcut panel above the terminal covers most Quest tweaks in one click, and you can save your own commands as `MY MACROS` pills.
+```
+~/.config/steamos-devkit/devkit_rsa
+```
 
----
+### 2. Connect the Frame
 
-## `// FEEDBACK`
+For development, the Frame host can be supplied explicitly:
 
-Found a bug? Got an idea? Want to swap notes with other CyberDeck users?
+```fish
+set -x FRAME_CYBERDECK_HOST 192.168.x.x
+npm run dev
+```
 
-- **[Open an issue](https://github.com/mitch030504/FrameCyberDeck/issues/new)** for crashes, broken downloads, Steam Frame deployment issues, or anything that looks wrong. Include a log file when possible.
+### 3. Install a compatible Quest APK
 
-If you've got a sound clip you think would suit the UI (terminal click, mechanical keyboard tap, matrix-style hum), open an issue — happy to bundle community favourites in a later build.
+Use **Manual Install → Install APK File** or drag a supported APK into the sideloader.
+
+Frame CyberDeck will convert the APK, deploy it through SteamOS Devkit, refresh the installed-title list, and make the managed title available for launch/uninstall.
 
 ---
 
 ## `// BUILD_FROM_SOURCE`
 
-Frame CyberDeck builds and runs in local sideloader mode without a vrSrc API key.
+Frame CyberDeck is designed to build without a vrSrc API key.
 
 ```sh
 npm install --legacy-peer-deps
@@ -176,20 +166,70 @@ npm run build
 
 To build an installable package:
 
-| Platform | Command             |
-| -------- | ------------------- |
-| Windows  | `npm run build:win:x64` |
-| macOS    | `npm run build:mac:x64` |
-| Linux    | `npm run build:linux:x64` |
+| Platform | Command |
+| --- | --- |
+| Windows x64 | `npm run build:win:x64` |
+| macOS x64 | `npm run build:mac:x64` |
+| Linux x64 | `npm run build:linux:x64` |
+| Linux ARM64 | `npm run build:linux:arm64` |
 
-An authorized catalog key is optional and should never be committed. For development it can be supplied at runtime with `FRAME_CYBERDECK_API_KEY`.
+An authorized catalog key can be supplied at runtime during development:
+
+```sh
+FRAME_CYBERDECK_API_KEY=...
+```
+
+Never commit an API key.
 
 ---
 
-## `// CREDITS`
+## `// TESTED_FRAME_PATH`
 
-Built on top of ApprenticeVR by **jimzrt**. Without that foundation this project doesn't exist.
+The current Steam Frame path has been exercised end-to-end with Open Brush:
+
+```
+original Quest APK
+        ↓
+metadata inspection
+        ↓
+OVR Port conversion
+        ↓
+Frame OpenXR bridge injection
+        ↓
+zipalign + signing + verification
+        ↓
+SteamOS Devkit deployment
+        ↓
+installed-title refresh
+        ↓
+launch
+        ↓
+uninstall / reinstall
+        ↓
+original-source provenance
+        ↓
+offline contribution packaging validation
+```
+
+This validates the complete local path. Live catalog comparison and final `upload.config` transmission require authorized server access.
+
+---
+
+## `// PROJECT_STATUS`
+
+Frame CyberDeck is currently an early Steam Frame-focused fork.
+
+The Frame implementation is functional, but compatibility still depends on the individual Quest application and the capabilities of the conversion/runtime stack. Not every Quest title should be expected to work.
+
+Issues and Frame-specific test reports belong in this repository:
+
+- **[Open an issue](https://github.com/mitch030504/FrameCyberDeck/issues/new)**
+- **[FrameCyberDeck repository](https://github.com/mitch030504/FrameCyberDeck)**
+
+---
 
 ## `// LICENSE`
 
-GNU GPL v3
+GNU GPL v3.
+
+See the repository `LICENSE` file for the full license text.
