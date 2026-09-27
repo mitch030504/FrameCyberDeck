@@ -24,7 +24,7 @@ describe('GameDescriptionPanel', () => {
     expect(screen.getByLabelText('Loading description…')).toBeTruthy()
   })
 
-  it('renders plain text with its source link', () => {
+  it('renders plain text with non-clickable source attribution', () => {
     render(
       <GameDescriptionPanel
         loading={false}
@@ -44,8 +44,7 @@ describe('GameDescriptionPanel', () => {
     )
 
     expect(screen.getByText('A virtual reality puzzle game.')).toBeTruthy()
-    expect(screen.getByRole('link', { name: 'Source: Wikipedia' }).getAttribute('href')).toBe(
-      'https://en.wikipedia.org/wiki/Test'
-    )
+    expect(screen.getByText('Source: Wikipedia')).toBeTruthy()
+    expect(screen.queryByRole('link')).toBeNull()
   })
 })
