@@ -592,7 +592,10 @@ app.whenReady().then(async () => {
 
   // --- Steam Frame Handlers ---
   typedIpcMain.handle('frame:run-package', async (_event, packageName) => {
-    return await frameDevkitService.runPackage(packageName)
+    console.log(`[IPC] Launching Steam Frame package: ${packageName}`)
+    const success = await frameDevkitService.runPackage(packageName)
+    console.log(`[IPC] Steam Frame launch result for ${packageName}: ${success}`)
+    return success
   })
 
   // --- Game Handlers ---
