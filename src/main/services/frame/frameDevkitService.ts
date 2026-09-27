@@ -1,5 +1,4 @@
 import { app } from 'electron'
-import { existsSync } from 'fs'
 import { promises as fs } from 'fs'
 import { basename, dirname, join, resolve } from 'path'
 import { execa } from 'execa'
@@ -26,8 +25,6 @@ export interface FrameDeployResult {
 type ProgressReporter = (step: string, percent?: number) => void
 
 class FrameDevkitService {
-  private runtime: DevkitRuntime | null = null
-
   private getHelperPath(): string {
     return app.isPackaged
       ? join(process.resourcesPath, 'frame-devkit-bridge.py')
