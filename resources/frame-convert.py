@@ -487,7 +487,6 @@ def convert(
         run(
             [
                 build / "apksigner",
-                "-J--enable-native-access=ALL-UNNAMED",
                 "sign",
                 "--ks",
                 key,
@@ -501,7 +500,6 @@ def convert(
         run(
             [
                 build / "apksigner",
-                "-J--enable-native-access=ALL-UNNAMED",
                 "verify",
                 "--verbose",
                 game_apk,
