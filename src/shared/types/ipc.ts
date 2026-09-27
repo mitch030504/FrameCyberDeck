@@ -71,6 +71,9 @@ export interface IPCChannels {
   'adb:run-local-adb-command': DefineChannel<[args: string], string>
   'adb:fix-linux-usb-access': DefineChannel<[], { success: boolean; message: string }>
 
+  // Steam Frame related channels
+  'frame:run-package': DefineChannel<[packageName: string], boolean>
+
   // Game related channels
   'games:get-games': DefineChannel<[], GameInfo[]>
   'games:get-blacklist-games': DefineChannel<[], BlacklistEntry[]>
