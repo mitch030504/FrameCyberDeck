@@ -1,7 +1,7 @@
 {
   "name": "frame-cyberdeck",
   "version": "0.1.0",
-  "description": "Steam Frame-specific CyberDeck fork with SteamOS Devkit Android deployment",
+  "description": "Steam Frame-focused fork of VR CyberDeck with Quest-to-Frame conversion and SteamOS Devkit deployment",
   "main": "./out/main/index.js",
   "author": "mitch030504",
   "homepage": "https://github.com/mitch030504/FrameCyberDeck",
