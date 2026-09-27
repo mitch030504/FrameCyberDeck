@@ -472,7 +472,7 @@ const CARD_COLS_MAX = 12
  * travel, so the column floor is the lever that actually works.
  */
 const LOGS_WIKI_URL =
-  'https://github.com/DeliciousMeatPop/VRCD/wiki/Have-an-issue%3F-SEND-YOUR-DAMN-LOGS'
+  'https://github.com/mitch030504/FrameCyberDeck/issues/new'
 
 /** Small inline link to the "how to send your logs" wiki guide. Opens in the
  *  system browser via the main window's window-open handler. */
@@ -2442,7 +2442,7 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
             <div className="sideloader-footer">
               {appVersion && <span className="ver">v{appVersion}</span>}
               <a
-                href="https://github.com/DeliciousMeatPop/VRCD"
+                href="https://github.com/mitch030504/FrameCyberDeck"
                 target="_blank"
                 rel="noopener noreferrer"
               >
@@ -2836,7 +2836,7 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
               style={{ display: 'flex', gap: '8px', justifyContent: 'center', flexWrap: 'wrap' }}
             >
               <a
-                href="https://github.com/DeliciousMeatPop/VRCD"
+                href="https://github.com/mitch030504/FrameCyberDeck"
                 target="_blank"
                 rel="noopener noreferrer"
                 style={{
