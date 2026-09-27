@@ -2,7 +2,6 @@ import { app } from 'electron'
 import { existsSync } from 'fs'
 import { promises as fs } from 'fs'
 import { basename, dirname, join, resolve } from 'path'
-import { homedir } from 'os'
 import { execa } from 'execa'
 
 export interface FrameDevkitStatus {
@@ -26,11 +25,6 @@ export interface FrameDeployResult {
 
 type ProgressReporter = (step: string, percent?: number) => void
 
-interface DevkitRuntime {
-  python: string
-  pyz: string
-}
-
 class FrameDevkitService {
   private runtime: DevkitRuntime | null = null
 
@@ -40,89 +34,27 @@ class FrameDevkitService {
       : join(app.getAppPath(), 'resources', 'frame-devkit-bridge.py')
   }
 
-  private devkitRoots(): string[] {
-    const roots = [
-      process.env.STEAMOS_DEVKIT_CLIENT_ROOT,
-      join(homedir(), '.local/share/Steam/steamapps/common/SteamOSDevkitClient'),
-      join(homedir(), '.steam/steam/steamapps/common/SteamOSDevkitClient'),
-      join(homedir(), '.steam/root/steamapps/common/SteamOSDevkitClient'),
-      join(
-        homedir(),
-        '.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/SteamOSDevkitClient'
-      )
-    ].filter((value): value is string => Boolean(value && value.trim()))
-
-    return [...new Set(roots.map((root) => resolve(root)))]
-  }
-
-  private async findPyzFiles(root: string, depth = 3): Promise<string[]> {
-    if (depth < 0 || !existsSync(root)) return []
-    const result: string[] = []
-    let entries
-    try {
-      entries = await fs.readdir(root, { withFileTypes: true })
-    } catch {
-      return []
-    }
-
-    for (const entry of entries) {
-      const full = join(root, entry.name)
-      if (entry.isFile() && /^devkit-gui(?:-cp\d+)?\.pyz$/i.test(entry.name)) {
-        result.push(full)
-      } else if (entry.isDirectory() && depth > 0) {
-        result.push(...(await this.findPyzFiles(full, depth - 1)))
-      }
-    }
-    return result
-  }
-
-  private pythonCandidatesForPyz(pyz: string): string[] {
-    const candidates: string[] = []
-    const match = basename(pyz).match(/-cp(\d)(\d+)\.pyz$/i)
-    if (match) candidates.push(`python${match[1]}.${match[2]}`)
-    candidates.push('python3', 'python')
-    return [...new Set(candidates)]
-  }
-
-  private async resolveRuntime(): Promise<DevkitRuntime> {
-    if (this.runtime) return this.runtime
-
-    const explicitPyz = process.env.STEAMOS_DEVKIT_PYZ?.trim()
-    const pyzFiles = explicitPyz ? [resolve(explicitPyz)] : []
-    if (!explicitPyz) {
-      for (const root of this.devkitRoots()) {
-        pyzFiles.push(...(await this.findPyzFiles(root)))
-      }
-    }
-
-    if (pyzFiles.length === 0) {
-      throw new Error(
-        'SteamOS Devkit Client was not found. Install it from Steam, or set STEAMOS_DEVKIT_PYZ to its devkit-gui-*.pyz file.'
-      )
-    }
-
-    const helper = this.getHelperPath()
-    if (!existsSync(helper)) {
-      throw new Error(`Frame Devkit helper is missing: ${helper}`)
-    }
+  private async resolvePython(): Promise<string> {
+    const candidates = [
+      process.env.FRAME_CYBERDECK_PYTHON?.trim(),
+      'python3',
+      'python'
+    ].filter((value): value is string => Boolean(value))
 
     const failures: string[] = []
-    for (const pyz of [...new Set(pyzFiles)]) {
-      for (const python of this.pythonCandidatesForPyz(pyz)) {
-        try {
-          await execa(python, ['--version'])
-          this.runtime = { python, pyz }
-          return this.runtime
-        } catch (error) {
-          failures.push(
-            `${python} for ${basename(pyz)}: ${error instanceof Error ? error.message : String(error)}`
-          )
-        }
+    for (const python of [...new Set(candidates)]) {
+      try {
+        await execa(python, ['--version'])
+        return python
+      } catch (error) {
+        failures.push(
+          `${python}: ${error instanceof Error ? error.message : String(error)}`
+        )
       }
     }
 
     throw new Error(
-      `SteamOS Devkit Client was found, but no compatible Python interpreter was available. ${failures.join(' | ')}`
+      `Python 3 is required for Steam Frame Devkit deployment. ${failures.join(' | ')}`
     )
   }
 
@@ -131,17 +63,11 @@ class FrameDevkitService {
     args: string[] = [],
     host = process.env.FRAME_CYBERDECK_HOST?.trim() || 'frame'
   ): Promise<T> {
-    const runtime = await this.resolveRuntime()
+    const python = await this.resolvePython()
     const helper = this.getHelperPath()
     const { stdout, stderr } = await execa(
-      runtime.python,
-      [helper, '--host', host, command, ...args],
-      {
-        env: {
-          ...process.env,
-          STEAMOS_DEVKIT_PYZ: runtime.pyz
-        }
-      }
+      python,
+      [helper, '--host', host, command, ...args]
     )
 
     if (stderr.trim()) console.log(`[Frame Devkit] ${stderr.trim()}`)
@@ -166,8 +92,10 @@ class FrameDevkitService {
     return await this.bridge<FrameDevkitStatus>('status', [], host)
   }
 
-  async register(host?: string): Promise<void> {
-    await this.bridge<{ ok: boolean; error?: string }>('register', [], host)
+  async register(_host?: string): Promise<void> {
+    throw new Error(
+      'Register the Steam Frame once in the official SteamOS Devkit Client; Frame CyberDeck reuses that Devkit SSH identity.'
+    )
   }
 
   private async walkFiles(root: string, maxDepth: number): Promise<string[]> {
