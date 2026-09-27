@@ -335,6 +335,16 @@ class FrameDevkitService {
     return true
   }
 
+  async runPackage(packageName: string, host?: string): Promise<boolean> {
+    const games = await this.listGames(host)
+    const game = games.find((entry) => entry.packageName === packageName || entry.gameid === packageName)
+    if (!game) {
+      console.warn(`[Frame Devkit] No installed title found for ${packageName}`)
+      return false
+    }
+    return await this.runGame(game.gameid, host)
+  }
+
   async deploy(
     sourcePath: string,
     title: string,
