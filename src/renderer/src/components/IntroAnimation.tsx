@@ -231,7 +231,7 @@ const IntroAnimation: React.FC<IntroAnimationProps> = ({ onComplete }) => {
             letterSpacing: '0.08em'
           }}
         >
-          <div>VR CYBERDECK v{appVersion}</div>
+          <div>FRAME CYBERDECK v{appVersion}</div>
           <div>SECURE TERMINAL — DELICIOUSMEATPOP</div>
           <div>
             STATUS:{' '}
