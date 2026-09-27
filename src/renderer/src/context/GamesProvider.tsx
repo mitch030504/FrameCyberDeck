@@ -285,7 +285,7 @@ export const GamesProvider: React.FC<GamesProviderProps> = ({ children }) => {
       .filter((pkg) => pkg.packageName && !catalogPackages.has(pkg.packageName))
       .map((pkg) => ({
         id: pkg.packageName,
-        name: pkg.packageName,
+        name: pkg.applicationLabel || pkg.packageName,
         packageName: pkg.packageName,
         version: String(pkg.versionCode),
         size: '0',
