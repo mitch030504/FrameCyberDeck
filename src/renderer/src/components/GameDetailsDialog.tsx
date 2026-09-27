@@ -415,7 +415,7 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
               Launch on Frame
             </Button>
           )}
-          {!noSideload && (
+          {!noSideload && !g.notOnServer && (
             <Button
               appearance="secondary"
               icon={<ArrowSyncRegular />}
