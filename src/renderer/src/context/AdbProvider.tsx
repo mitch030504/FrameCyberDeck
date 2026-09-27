@@ -290,8 +290,8 @@ export const AdbProvider: React.FC<AdbProviderProps> = ({ children }) => {
   useEffect(() => {
     if (isConnected && selectedDevice) {
       if (selectedDeviceDetails?.isSteamFrame) {
-        setPackages([])
         setUserNameState('steamos')
+        loadPackages()
         return
       }
       loadPackages()
