@@ -85,5 +85,9 @@
       "electron",
       "esbuild"
     ]
+  },
+  "allowScripts": {
+    "electron@36.9.5": true,
+    "esbuild@0.25.12": true
   }
 }
