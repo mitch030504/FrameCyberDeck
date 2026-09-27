@@ -518,14 +518,7 @@ const ErrorDetailDialog: React.FC<ErrorDetailDialogProps> = ({
               >
                 {diag.links.map((link, i) => (
                   <li key={i} style={{ fontFamily: 'monospace', fontSize: 12, lineHeight: 1.45 }}>
-                    <a
-                      href={link.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      style={{ color: NEON }}
-                    >
-                      {link.label}
-                    </a>
+                    {link.label}
                   </li>
                 ))}
               </ul>
