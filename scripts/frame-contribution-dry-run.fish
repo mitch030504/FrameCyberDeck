@@ -44,7 +44,11 @@ print(source)
 print(version)
 print(game_id)
 ' "$registry" "$package_name")
-or exit $status
+
+if test (count $fields) -ne 3
+    echo "ERROR: could not read a complete provenance record for $package_name" >&2
+    exit 1
+end
 
 set -l source_path $fields[1]
 set -l expected_version $fields[2]
@@ -87,7 +91,7 @@ if test -z "$aapt"
 end
 
 set -l badging ("$aapt" dump badging "$source_path" 2>/dev/null)
-or begin
+if test (count $badging) -eq 0
     echo "ERROR: aapt could not inspect $source_path" >&2
     exit 1
 end
