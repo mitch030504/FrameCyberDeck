@@ -246,21 +246,7 @@ const DependencyErrorLogActions: React.FC = () => {
             wordBreak: 'break-all'
           }}
         >
-          {result.startsWith('http') ? (
-            <>
-              Log uploaded (copied to clipboard):{' '}
-              <a
-                href={result}
-                target="_blank"
-                rel="noopener noreferrer"
-                style={{ color: tokens.colorBrandForeground1 }}
-              >
-                {result}
-              </a>
-            </>
-          ) : (
-            result
-          )}
+          {result.startsWith('http') ? 'Log uploaded and copied to clipboard.' : result}
         </Text>
       )}
     </div>
@@ -368,10 +354,10 @@ const MainContent: React.FC<MainContentProps> = ({
             </Text>
             <ol style={{ textAlign: 'left', marginTop: tokens.spacingVerticalS }}>
               <li style={{ marginBottom: tokens.spacingVerticalXS }}>
-                <Text>Change your DNS to Cloudflare (1.1.1.1) or Google (8.8.8.8)</Text>
+                <Text>Try a different DNS resolver</Text>
               </li>
               <li style={{ marginBottom: tokens.spacingVerticalXS }}>
-                <Text>Use a VPN like ProtonVPN or Cloudflare WARP (both free)</Text>
+                <Text>Try a VPN if your network filters software downloads</Text>
               </li>
               <li style={{ marginBottom: tokens.spacingVerticalXS }}>
                 <Text>Check your router/firewall settings</Text>
@@ -380,7 +366,7 @@ const MainContent: React.FC<MainContentProps> = ({
             <Text style={{ marginTop: tokens.spacingVerticalM }}>
               For detailed troubleshooting, see:{' '}
               <a
-                href="https://github.com/jimzrt/apprenticeVr#troubleshooting-guide"
+                href="https://github.com/mitch030504/FrameCyberDeck/issues"
                 target="_blank"
                 rel="noopener noreferrer"
                 style={{ color: tokens.colorBrandForeground1 }}
@@ -463,32 +449,11 @@ const MainContent: React.FC<MainContentProps> = ({
                 <span style={{ fontFamily: 'monospace' }}>bin</span> folder and skips the
                 download/unpack step entirely. Open <strong>Terminal</strong> and run:
               </Text>
-              <pre
-                style={{
-                  textAlign: 'left',
-                  background: tokens.colorNeutralBackground3,
-                  padding: tokens.spacingVerticalS,
-                  borderRadius: tokens.borderRadiusMedium,
-                  fontSize: '11px',
-                  overflowX: 'auto',
-                  whiteSpace: 'pre-wrap',
-                  wordBreak: 'break-all',
-                  marginTop: tokens.spacingVerticalS
-                }}
-              >
-                {[
-                  'BIN="$HOME/Library/Application Support/vr-cyberdeck/bin"',
-                  'mkdir -p "$BIN" && cd "$(mktemp -d)"',
-                  '',
-                  '# rclone (pinned to v1.72.1)',
-                  'curl -L -o rclone.zip https://github.com/rclone/rclone/releases/download/v1.72.1/rclone-v1.72.1-osx-arm64.zip',
-                  'unzip -o rclone.zip && cp rclone-v1.72.1-osx-arm64/rclone "$BIN/rclone" && chmod +x "$BIN/rclone"',
-                  '',
-                  '# adb (Android platform-tools)',
-                  'curl -L -o pt.zip https://dl.google.com/android/repository/platform-tools-latest-darwin.zip',
-                  'unzip -o pt.zip && cp platform-tools/adb "$BIN/adb" && chmod +x "$BIN/adb"'
-                ].join('\n')}
-              </pre>
+              <Text style={{ marginTop: tokens.spacingVerticalS }}>
+                FrameCyberDeck normally downloads required dependencies automatically. If dependency
+                setup fails repeatedly, open the project GitHub troubleshooting/issues page from the
+                link below and attach the application log.
+              </Text>
               <Text style={{ marginTop: tokens.spacingVerticalXS }}>
                 Then quit and reopen the app. (If you have Homebrew, `brew install rclone
                 android-platform-tools` and copying those binaries into the same folder works too —
