@@ -199,8 +199,8 @@ class FrameDevkitService {
   private safeDevkitName(title: string): string {
     const safe = title
       .normalize('NFKD')
-      .replace(/[^A-Za-z0-9._-]+/g, '-')
-      .replace(/^-+|-+$/g, '')
+      .replace(/[^A-Za-z0-9._]+/g, '_')
+      .replace(/^_+|_+$/g, '')
       .slice(0, 80)
     return safe || `frame-game-${Date.now()}`
   }
