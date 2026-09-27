@@ -247,19 +247,128 @@ def deploy(
     )
 
 
-def list_games(host: str, port: int) -> None:
+def list_games_data(host: str, port: int) -> tuple[dict, list[dict]]:
     current = status(host, port)
     if not current["paired"]:
         fail(
             "Steam Frame is reachable but not paired for Devkit SSH: "
             + str(current.get("pairError") or "unknown SSH error")
         )
+
+    login = str(current["login"])
     result = ssh_command(
         host,
-        str(current["login"]),
+        login,
         "python3 ~/devkit-utils/steamos-list-games",
     )
-    emit({"ok": True, "games": json.loads(result.stdout)})
+    raw_games = json.loads(result.stdout)
+    games: list[dict] = []
+
+    for raw in raw_games:
+        gameid = str(raw.get("gameid") or "")
+        if not gameid:
+            continue
+
+        metadata_result = ssh_command(
+            host,
+            login,
+            "cat "
+            + shlex.quote(f"~/devkit-game/{gameid}/frame-cyberdeck.json")
+            + " 2>/dev/null || cat "
+            + shlex.quote(f"~/devkit-game/{gameid}/frame-conversion.json")
+            + " 2>/dev/null || true",
+            check=False,
+        )
+        metadata: dict = {}
+        text = (metadata_result.stdout or "").strip()
+        if text:
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    metadata = parsed
+            except json.JSONDecodeError:
+                pass
+
+        package_name = metadata.get("packageName") or metadata.get("package") or gameid
+        version_code = metadata.get("versionCode", 0)
+        try:
+            version_code = int(version_code)
+        except (TypeError, ValueError):
+            version_code = 0
+
+        games.append(
+            {
+                "gameid": gameid,
+                "packageName": str(package_name),
+                "versionCode": version_code,
+                "versionName": str(metadata.get("versionName") or ""),
+                "title": str(metadata.get("title") or gameid),
+            }
+        )
+
+    return current, games
+
+
+def list_games(host: str, port: int) -> None:
+    _, games = list_games_data(host, port)
+    emit({"ok": True, "games": games})
+
+
+def delete_game(host: str, port: int, name: str) -> None:
+    validate_gameid(name)
+    current, games = list_games_data(host, port)
+    if not any(game["gameid"] == name for game in games):
+        fail(f"Devkit title not found: {name}")
+
+    login = str(current["login"])
+    try:
+        ssh_command(
+            host,
+            login,
+            "python3 ~/devkit-utils/steamos-delete --delete-title " + shlex.quote(name),
+        )
+        ssh_command(
+            host,
+            login,
+            "rm -f "
+            + shlex.quote(f"~/devkit-game/{name}-argv.json")
+            + " "
+            + shlex.quote(f"~/devkit-game/{name}-settings.json"),
+            check=False,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (
+            (exc.stderr.strip() if isinstance(exc.stderr, str) else "")
+            or (exc.stdout.strip() if isinstance(exc.stdout, str) else "")
+            or str(exc)
+        )
+        fail(f"SteamOS Devkit delete failed: {detail}")
+
+    emit({"ok": True, "name": name})
+
+
+def run_game(host: str, port: int, name: str) -> None:
+    validate_gameid(name)
+    current, games = list_games_data(host, port)
+    if not any(game["gameid"] == name for game in games):
+        fail(f"Devkit title not found: {name}")
+
+    try:
+        ssh_command(
+            host,
+            str(current["login"]),
+            "python3 ~/devkit-utils/steam-devkit-rpc run-game "
+            f"gameid={shlex.quote(name)}",
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (
+            (exc.stderr.strip() if isinstance(exc.stderr, str) else "")
+            or (exc.stdout.strip() if isinstance(exc.stdout, str) else "")
+            or str(exc)
+        )
+        fail(f"SteamOS Devkit launch failed: {detail}")
+
+    emit({"ok": True, "name": name})
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -269,6 +378,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
     sub.add_parser("list")
+    delete = sub.add_parser("delete")
+    delete.add_argument("--name", required=True)
+    run = sub.add_parser("run")
+    run.add_argument("--name", required=True)
     d = sub.add_parser("deploy")
     d.add_argument("--name", required=True)
     d.add_argument("--directory", required=True)
@@ -283,6 +396,10 @@ def main() -> None:
         emit(status(args.host, args.port))
     elif args.command == "list":
         list_games(args.host, args.port)
+    elif args.command == "delete":
+        delete_game(args.host, args.port, args.name)
+    elif args.command == "run":
+        run_game(args.host, args.port, args.name)
     elif args.command == "deploy":
         deploy(
             args.host,
