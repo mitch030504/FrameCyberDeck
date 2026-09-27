@@ -25,7 +25,8 @@ import {
   ServerConfigInfo,
   WiFiBookmark,
   LocalUploadError,
-  BackupAPIRenderer
+  BackupAPIRenderer,
+  FrameAPIRenderer
 } from '@shared/types'
 import { typedIpcRenderer } from '@shared/ipc-utils'
 
@@ -112,6 +113,10 @@ const api = {
     fixLinuxUsbAccess: (): Promise<{ success: boolean; message: string }> =>
       typedIpcRenderer.invoke('adb:fix-linux-usb-access')
   } satisfies AdbAPIRenderer,
+  frame: {
+    runPackage: (packageName: string): Promise<boolean> =>
+      typedIpcRenderer.invoke('frame:run-package', packageName)
+  } satisfies FrameAPIRenderer,
   games: {
     getGames: (): Promise<GameInfo[]> => typedIpcRenderer.invoke('games:get-games'),
     getBlacklistGames: () => typedIpcRenderer.invoke('games:get-blacklist-games'),
