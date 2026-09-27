@@ -165,15 +165,24 @@ If you've got a sound clip you think would suit the UI (terminal click, mechanic
 
 ## `// BUILD_FROM_SOURCE`
 
-```
+Frame CyberDeck builds and runs in local sideloader mode without a vrSrc API key.
+
+```sh
 npm install --legacy-peer-deps
+npm run typecheck
+npm test
+npm run build
 ```
 
-| Platform | Command                                                         |
-| -------- | --------------------------------------------------------------- |
-| Windows  | `npx electron-vite build && npx electron-builder --win --x64`   |
-| macOS    | `npx electron-vite build && npx electron-builder --mac --x64`   |
-| Linux    | `npx electron-vite build && npx electron-builder --linux --x64` |
+To build an installable package:
+
+| Platform | Command             |
+| -------- | ------------------- |
+| Windows  | `npm run build:win:x64` |
+| macOS    | `npm run build:mac:x64` |
+| Linux    | `npm run build:linux:x64` |
+
+An authorized catalog key is optional and should never be committed. For development it can be supplied at runtime with `FRAME_CYBERDECK_API_KEY`.
 
 ---
 
@@ -183,4 +192,4 @@ Built on top of ApprenticeVR by **jimzrt**. Without that foundation this project
 
 ## `// LICENSE`
 
-GNU Affero GPL v3
+GNU GPL v3
