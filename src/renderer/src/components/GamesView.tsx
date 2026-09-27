@@ -3706,14 +3706,16 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
                   </ContextMenuItem>
                 ) : contextMenu.game.isInstalled ? (
                   <>
-                    <ContextMenuItem
-                      onClick={() => {
-                        void handleReinstall(contextMenu.game)
-                        setContextMenu(null)
-                      }}
-                    >
-                      ⟳ Reinstall
-                    </ContextMenuItem>
+                    {!contextMenu.game.notOnServer && (
+                      <ContextMenuItem
+                        onClick={() => {
+                          void handleReinstall(contextMenu.game)
+                          setContextMenu(null)
+                        }}
+                      >
+                        ⟳ Reinstall
+                      </ContextMenuItem>
+                    )}
                     <ContextMenuItem
                       danger
                       onClick={() => {
