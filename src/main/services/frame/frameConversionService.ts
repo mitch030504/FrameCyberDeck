@@ -3,6 +3,7 @@ import { existsSync } from 'fs'
 import { promises as fs } from 'fs'
 import { join } from 'path'
 import { execa } from 'execa'
+import settingsService from '../settingsService'
 
 type ProgressReporter = (step: string, percent?: number) => void
 
@@ -103,18 +104,22 @@ class FrameConversionService {
       let stdout = ''
       let stderr = ''
 
-      const requestedRefresh = Number(process.env.FRAME_CYBERDECK_REFRESH_RATE ?? '0')
+      const stored = settingsService.getFrameConversionSettings()
+      const envRefresh = process.env.FRAME_CYBERDECK_REFRESH_RATE
+      const requestedRefresh = envRefresh === undefined ? stored.refreshRate : Number(envRefresh)
       const refreshRate = [0, 72, 80, 90, 120, 144].includes(requestedRefresh)
         ? requestedRefresh
         : 0
       if (requestedRefresh !== refreshRate) {
         console.warn(
-          `[Frame Convert] Ignoring unsupported FRAME_CYBERDECK_REFRESH_RATE=${process.env.FRAME_CYBERDECK_REFRESH_RATE}; using runtime default.`
+          `[Frame Convert] Ignoring unsupported FRAME_CYBERDECK_REFRESH_RATE=${envRefresh}; using runtime default.`
         )
       }
-      const extendedCompat = /^(1|true|yes|on)$/i.test(
-        process.env.FRAME_CYBERDECK_EXTENDED_COMPAT ?? ''
-      )
+      const envExtended = process.env.FRAME_CYBERDECK_EXTENDED_COMPAT
+      const extendedCompat =
+        envExtended === undefined
+          ? stored.extendedCompat
+          : /^(1|true|yes|on)$/i.test(envExtended)
 
       const convertArgs = [
         helper,
