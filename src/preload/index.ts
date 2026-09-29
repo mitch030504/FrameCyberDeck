@@ -26,7 +26,8 @@ import {
   WiFiBookmark,
   LocalUploadError,
   BackupAPIRenderer,
-  FrameAPIRenderer
+  FrameAPIRenderer,
+  FrameConversionSettings
 } from '@shared/types'
 import { typedIpcRenderer } from '@shared/ipc-utils'
 
@@ -314,7 +315,13 @@ const api = {
     setExistingDownloadAction: (v) =>
       typedIpcRenderer.invoke('settings:set-existing-download-action', v),
     getDownloadProxy: () => typedIpcRenderer.invoke('settings:get-download-proxy'),
-    setDownloadProxy: (settings) => typedIpcRenderer.invoke('settings:set-download-proxy', settings)
+    setDownloadProxy: (settings) => typedIpcRenderer.invoke('settings:set-download-proxy', settings),
+    getFrameConversionSettings: (): Promise<FrameConversionSettings> =>
+      typedIpcRenderer.invoke('settings:get-frame-conversion'),
+    setFrameConversionSettings: (
+      settings: FrameConversionSettings
+    ): Promise<FrameConversionSettings> =>
+      typedIpcRenderer.invoke('settings:set-frame-conversion', settings)
   } satisfies SettingsAPIRenderer,
   // Logs APIs
   logs: {
