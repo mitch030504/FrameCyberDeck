@@ -4,7 +4,9 @@ import {
   ServerConfigInfo,
   ExistingDownloadAction,
   WindowBounds,
-  DownloadProxySettings
+  DownloadProxySettings,
+  FrameConversionSettings,
+  FrameRefreshRate
 } from '@shared/types'
 import { sanitizeBaseUri } from '@shared/serverConfig'
 import { app, nativeTheme } from 'electron'
@@ -36,7 +38,11 @@ class SettingsService extends EventEmitter implements SettingsAPI {
       serverConfig: { baseUri: '', password: '' },
       maxConcurrentDownloads: 2,
       existingDownloadAction: 'ask',
-      downloadProxy: { ...DEFAULT_DOWNLOAD_PROXY_SETTINGS }
+      downloadProxy: { ...DEFAULT_DOWNLOAD_PROXY_SETTINGS },
+      frameConversion: {
+        refreshRate: 0,
+        extendedCompat: false
+      }
     }
 
     // Load settings from disk
@@ -139,6 +145,30 @@ class SettingsService extends EventEmitter implements SettingsAPI {
     return { ...normalized }
   }
 
+  getFrameConversionSettings(): FrameConversionSettings {
+    const raw = this.settings.frameConversion ?? { refreshRate: 0, extendedCompat: false }
+    const allowed: FrameRefreshRate[] = [0, 72, 80, 90, 120, 144]
+    const refreshRate = allowed.includes(raw.refreshRate as FrameRefreshRate)
+      ? (raw.refreshRate as FrameRefreshRate)
+      : 0
+    return {
+      refreshRate,
+      extendedCompat: Boolean(raw.extendedCompat)
+    }
+  }
+
+  setFrameConversionSettings(settings: FrameConversionSettings): FrameConversionSettings {
+    const allowed: FrameRefreshRate[] = [0, 72, 80, 90, 120, 144]
+    const normalized: FrameConversionSettings = {
+      refreshRate: allowed.includes(settings.refreshRate) ? settings.refreshRate : 0,
+      extendedCompat: Boolean(settings.extendedCompat)
+    }
+    this.settings.frameConversion = normalized
+    this.saveSettings()
+    this.emit('frame-conversion-settings-changed', normalized)
+    return { ...normalized }
+  }
+
   getWindowBounds(): WindowBounds | undefined {
     return this.settings.windowBounds
   }
@@ -156,6 +186,7 @@ class SettingsService extends EventEmitter implements SettingsAPI {
         const loadedSettings = JSON.parse(data)
         this.settings = { ...this.settings, ...loadedSettings }
         this.settings.downloadProxy = readPersistedDownloadProxySettings(loadedSettings.downloadProxy)
+        this.settings.frameConversion = this.getFrameConversionSettings()
         console.log('Settings loaded successfully')
       } else {
         console.log('No settings file found, using defaults')
