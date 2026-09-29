@@ -8,6 +8,7 @@ import os
 import pathlib
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -20,13 +21,20 @@ OVRPORT_RUNTIME_VERSION = "3.4.3-23204ea"
 OVRPORT_ZIP_URL = "https://github.com/ovrport/app/releases/download/1.2.3/cli-jar.zip"
 OVRPORT_ZIP_SHA256 = "3239408ff1e97ad016916825c216dc3016c0ffa7db7c317221ed3f1244441594"
 
-QUEST2FRAME_COMMIT = "607e17067b04b7c521e23e5fc0a626edb3db5940"
+QUEST2FRAME_COMMIT = "c9f1e4d9a705575e103c136d865b869e3d87b256"
 FRAME_BRIDGE_URL = (
     "https://raw.githubusercontent.com/MichaelScottsman/Quest2Frame/"
     + QUEST2FRAME_COMMIT
     + "/native/frame_bridge.c"
 )
-FRAME_BRIDGE_GIT_BLOB_SHA1 = "705078c497e9868c64fba5c67671205bb3494c1f"
+FRAME_BRIDGE_GIT_BLOB_SHA1 = "e2fc56eb8d7a9897805e354749ead7f9b25baec5"
+
+PASSTHROUGH_BRIDGE_URL = (
+    "https://raw.githubusercontent.com/MichaelScottsman/Quest2Frame/"
+    + QUEST2FRAME_COMMIT
+    + "/native/passthrough_bridge.c"
+)
+PASSTHROUGH_BRIDGE_GIT_BLOB_SHA1 = "279169e5ae9972d139ab765b3e331128187625ff"
 
 OPENXR_REVISION = "f2448a8797c85814aa892efc1ab8707900fbcc78"
 OPENXR_HEADERS = {
@@ -243,26 +251,46 @@ def ensure_ovrport(root: pathlib.Path) -> pathlib.Path:
     return jar
 
 
+def ensure_pinned_source(
+    url: str,
+    destination: pathlib.Path,
+    expected_blob: str,
+    label: str,
+) -> pathlib.Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    current = destination.read_bytes() if destination.is_file() else b""
+    if current and git_blob_sha1(current) == expected_blob:
+        return destination
+
+    request = urllib.request.Request(url, headers={"User-Agent": "FrameCyberDeck/0.1"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        data = response.read()
+    actual_blob = git_blob_sha1(data)
+    if actual_blob != expected_blob:
+        raise RuntimeError(
+            f"{label} source mismatch: expected git blob {expected_blob}, got {actual_blob}"
+        )
+    destination.write_bytes(data)
+    return destination
+
+
 def ensure_adapter(root: pathlib.Path, sdk: pathlib.Path) -> pathlib.Path:
     adapter_dir = root / "frame-adapter"
     output = adapter_dir / "libopenxr_loader_generic.so"
-    if output.is_file():
-        return output
 
-    source = adapter_dir / "frame_bridge.c"
-    source.parent.mkdir(parents=True, exist_ok=True)
-    if not source.is_file():
-        request = urllib.request.Request(
-            FRAME_BRIDGE_URL, headers={"User-Agent": "FrameCyberDeck/0.1"}
-        )
-        with urllib.request.urlopen(request, timeout=30) as response:
-            data = response.read()
-        actual_blob = git_blob_sha1(data)
-        if actual_blob != FRAME_BRIDGE_GIT_BLOB_SHA1:
-            raise RuntimeError(
-                f"Quest2Frame adapter source mismatch: expected git blob {FRAME_BRIDGE_GIT_BLOB_SHA1}, got {actual_blob}"
-            )
-        source.write_bytes(data)
+    # Quest2Frame added refresh-rate support to the native adapter. Existing
+    # FrameCyberDeck users may already have the old cached binary, so invalidate
+    # it when the capability marker is absent instead of silently reusing it.
+    if output.is_file() and b"Q2F_REFRESH_RATE_V1" in output.read_bytes():
+        return output
+    output.unlink(missing_ok=True)
+
+    source = ensure_pinned_source(
+        FRAME_BRIDGE_URL,
+        adapter_dir / "frame_bridge.c",
+        FRAME_BRIDGE_GIT_BLOB_SHA1,
+        "Quest2Frame adapter",
+    )
 
     include = adapter_dir / "include" / "openxr"
     include.mkdir(parents=True, exist_ok=True)
@@ -330,15 +358,78 @@ def resolve_apk(source: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
     return preferred[0], source
 
 
-def settings_bytes(scale: float, controllers: bool, foveation: bool) -> bytes:
+SUPPORTED_REFRESH_RATES = (0, 72, 80, 90, 120, 144)
+
+
+def normalize_refresh_rate(value: int | float | str) -> int:
+    try:
+        rate = int(float(value))
+    except (TypeError, ValueError):
+        raise RuntimeError("Refresh rate must be Default, 72, 80, 90, 120, or 144 Hz")
+    if rate not in SUPPORTED_REFRESH_RATES:
+        raise RuntimeError("Refresh rate must be Default, 72, 80, 90, 120, or 144 Hz")
+    return rate
+
+
+def settings_bytes(
+    scale: float,
+    controllers: bool,
+    foveation: bool,
+    refresh_rate: int = 0,
+) -> bytes:
     if scale < 50 or scale > 200:
         raise RuntimeError("Resolution scale must be between 50 and 200 percent")
+    refresh_rate = normalize_refresh_rate(refresh_rate)
     text = (
         f"scale={scale / 100.0:.3f}\n"
         f"controller_fix={1 if controllers else 0}\n"
         f"foveation_fix={1 if foveation else 0}\n"
+        f"refresh_rate={refresh_rate}\n"
     )
     return text.encode("utf-8")
+
+
+def rename_soname(
+    data: bytes,
+    expected: bytes = b"libopenxr_loader.so",
+    replacement: bytes = b"libq2f_original.so",
+) -> bytes:
+    """Rename only DT_SONAME in an ELF64 little-endian library."""
+    if data[:6] != b"\x7fELF\x02\x01" or len(replacement) > len(expected):
+        raise RuntimeError("Expected ELF64 little-endian OpenXR loader")
+    result = bytearray(data)
+    offset = struct.unpack_from("<Q", result, 32)[0]
+    size, count = struct.unpack_from("<HH", result, 54)
+    segments = [
+        struct.unpack_from("<IIQQQQQQ", result, offset + i * size)
+        for i in range(count)
+    ]
+    dynamic = next((p for p in segments if p[0] == 2), None)
+    if dynamic is None:
+        raise RuntimeError("OpenXR loader has no ELF dynamic segment")
+    tags: dict[int, int] = {}
+    for pos in range(dynamic[2], dynamic[2] + dynamic[5], 16):
+        tag, value = struct.unpack_from("<QQ", result, pos)
+        if not tag:
+            break
+        tags[tag] = value
+    if 5 not in tags or 14 not in tags:
+        raise RuntimeError("OpenXR loader has no DT_STRTAB/DT_SONAME")
+    address = tags[5] + tags[14]
+    segment = next(
+        (p for p in segments if p[0] == 1 and p[3] <= address < p[3] + p[5]),
+        None,
+    )
+    if segment is None:
+        raise RuntimeError("Could not map OpenXR loader SONAME")
+    start = segment[2] + address - segment[3]
+    end = result.index(0, start)
+    if result[start:end] != expected:
+        raise RuntimeError("Unexpected OpenXR loader SONAME; refusing compatibility wrap")
+    result[start : end + 1] = replacement + b"\0" * (
+        end - start + 1 - len(replacement)
+    )
+    return bytes(result)
 
 
 def is_frame_converted(apk: pathlib.Path) -> bool:
@@ -377,13 +468,21 @@ def convert(
     scale: float,
     controllers: bool,
     foveation: bool,
+    refresh_rate: int = 0,
+    extended_compat: bool = False,
 ) -> dict:
     source_apk, source_root = resolve_apk(input_path)
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     game_apk = output_dir / "game.apk"
 
+    refresh_rate = normalize_refresh_rate(refresh_rate)
+
     if is_frame_converted(source_apk):
+        if refresh_rate or extended_compat:
+            raise RuntimeError(
+                "Custom refresh/extended compatibility settings require reconversion from the original Quest APK."
+            )
         log("APK already contains Frame conversion markers; copying without repatching.")
         shutil.copy2(source_apk, game_apk)
         obb_count = copy_obbs(source_root, output_dir)
@@ -472,7 +571,7 @@ def convert(
             dst.write(adapter, loader)
             dst.writestr(
                 prefix + "libframe_settings.so",
-                settings_bytes(scale, controllers, foveation),
+                settings_bytes(scale, controllers, foveation, refresh_rate),
             )
 
         aligned = work / "aligned.apk"
@@ -506,6 +605,105 @@ def convert(
             ]
         )
 
+        if extended_compat:
+            log(
+                "Applying Quest2Frame experimental passthrough/swapchain compatibility adapter"
+            )
+            compat_source = ensure_pinned_source(
+                PASSTHROUGH_BRIDGE_URL,
+                root / "frame-adapter" / "passthrough_bridge.c",
+                PASSTHROUGH_BRIDGE_GIT_BLOB_SHA1,
+                "Quest2Frame passthrough adapter",
+            )
+            toolchain = find_ndk_toolchain(sdk)
+            clang = toolchain / "bin" / "clang"
+            sysroot = toolchain / "sysroot"
+            include = root / "frame-adapter" / "include"
+            prefix = "lib/arm64-v8a/"
+            outer = work / "extended-compat"
+            outer.mkdir()
+
+            with zipfile.ZipFile(game_apk) as archive:
+                current_loader = prefix + "libopenxr_loader.so"
+                if current_loader not in archive.namelist():
+                    raise RuntimeError(
+                        "Converted APK has no libopenxr_loader.so for compatibility wrapping"
+                    )
+                original_loader = outer / "libq2f_original.so"
+                original_loader.write_bytes(
+                    rename_soname(archive.read(current_loader))
+                )
+
+            outer_loader = outer / "libopenxr_loader.so"
+            run(
+                [
+                    clang,
+                    "--target=aarch64-linux-android29",
+                    f"--sysroot={sysroot}",
+                    "-shared",
+                    "-fPIC",
+                    "-O2",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-Wl,-Bsymbolic",
+                    "-Wl,-z,max-page-size=16384",
+                    "-Wl,-soname,libopenxr_loader.so",
+                    "-I",
+                    include,
+                    compat_source,
+                    "-Wl,--no-as-needed",
+                    original_loader,
+                    "-ldl",
+                    "-llog",
+                    "-o",
+                    outer_loader,
+                ]
+            )
+
+            wrapped_unsigned = outer / "unsigned.apk"
+            with zipfile.ZipFile(game_apk, "r") as src, zipfile.ZipFile(
+                wrapped_unsigned, "w", zipfile.ZIP_DEFLATED
+            ) as dst:
+                for item in src.infolist():
+                    if (
+                        item.filename.startswith("META-INF/")
+                        or item.filename == prefix + "libopenxr_loader.so"
+                    ):
+                        continue
+                    dst.writestr(item, src.read(item.filename))
+                dst.write(outer_loader, prefix + "libopenxr_loader.so")
+                dst.write(original_loader, prefix + "libq2f_original.so")
+
+            wrapped_aligned = outer / "aligned.apk"
+            run(
+                [
+                    build / "zipalign",
+                    "-f",
+                    "-P",
+                    "16",
+                    "4",
+                    wrapped_unsigned,
+                    wrapped_aligned,
+                ]
+            )
+            wrapped_apk = outer / "game.apk"
+            run(
+                [
+                    build / "apksigner",
+                    "sign",
+                    "--ks",
+                    key,
+                    "--ks-pass",
+                    "pass:password",
+                    "--out",
+                    wrapped_apk,
+                    wrapped_aligned,
+                ]
+            )
+            run([build / "apksigner", "verify", "--verbose", wrapped_apk])
+            shutil.copy2(wrapped_apk, game_apk)
+
         obb_count = copy_obbs(source_root, output_dir)
         result = {
             "ok": True,
@@ -521,6 +719,9 @@ def convert(
             "sha256": sha256(game_apk),
             "ovrportAppVersion": OVRPORT_APP_VERSION,
             "ovrportRuntimeVersion": OVRPORT_RUNTIME_VERSION,
+            "quest2FrameCommit": QUEST2FRAME_COMMIT,
+            "refreshRate": refresh_rate,
+            "extendedCompat": extended_compat,
         }
         (output_dir / "frame-conversion.json").write_text(
             json.dumps(result, indent=2), encoding="utf-8"
@@ -549,9 +750,13 @@ def doctor() -> dict:
     result["ovrportCached"] = (
         tools_root() / "ovrport-cli" / "overportcli-1.2.3-all.jar"
     ).is_file()
-    result["adapterCached"] = (
-        tools_root() / "frame-adapter" / "libopenxr_loader_generic.so"
-    ).is_file()
+    adapter_path = tools_root() / "frame-adapter" / "libopenxr_loader_generic.so"
+    result["adapterCached"] = adapter_path.is_file()
+    result["adapterRefreshCapable"] = (
+        adapter_path.is_file()
+        and b"Q2F_REFRESH_RATE_V1" in adapter_path.read_bytes()
+    )
+    result["quest2FrameCommit"] = QUEST2FRAME_COMMIT
     return result
 
 
@@ -567,6 +772,21 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--scale", type=float, default=100.0)
     c.add_argument("--no-controller-fix", action="store_true")
     c.add_argument("--no-foveation-fix", action="store_true")
+    c.add_argument(
+        "--refresh-rate",
+        type=int,
+        default=0,
+        choices=SUPPORTED_REFRESH_RATES,
+        help="Requested headset refresh rate; 0 keeps the runtime default.",
+    )
+    c.add_argument(
+        "--extended-compat",
+        action="store_true",
+        help=(
+            "Opt in to Quest2Frame's experimental outer adapter for supported "
+            "Quest passthrough underlays and 1-2 px swapchain rectangle overflows."
+        ),
+    )
     return p
 
 
@@ -584,6 +804,8 @@ def main() -> None:
                     scale=args.scale,
                     controllers=not args.no_controller_fix,
                     foveation=not args.no_foveation_fix,
+                    refresh_rate=args.refresh_rate,
+                    extended_compat=args.extended_compat,
                 )
             )
             return
