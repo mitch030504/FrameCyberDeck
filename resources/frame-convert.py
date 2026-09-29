@@ -295,7 +295,7 @@ def instrument_frame_bridge_source(
         (
             "static int foveation_fix = 1, controller_fix = 1;\n"
             "__attribute__((used)) static const char framecyberdeck_diagnostic_capability[] = "
-            "\\"FCD_Q2F_DIAGNOSTICS_V1\\";\n"
+            "\"FCD_Q2F_DIAGNOSTICS_V1\";\n"
         ),
         "capability marker",
     )
