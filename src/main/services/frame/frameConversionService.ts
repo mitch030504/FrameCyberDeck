@@ -18,6 +18,11 @@ export interface FrameConversionResult {
   directory: string
   obbCount: number
   sha256: string
+  ovrportAppVersion?: string
+  ovrportRuntimeVersion?: string
+  quest2FrameCommit?: string
+  refreshRate?: number
+  extendedCompat?: boolean
   error?: string
 }
 
@@ -97,10 +102,40 @@ class FrameConversionService {
 
       let stdout = ''
       let stderr = ''
+
+      const requestedRefresh = Number(process.env.FRAME_CYBERDECK_REFRESH_RATE ?? '0')
+      const refreshRate = [0, 72, 80, 90, 120, 144].includes(requestedRefresh)
+        ? requestedRefresh
+        : 0
+      if (requestedRefresh !== refreshRate) {
+        console.warn(
+          `[Frame Convert] Ignoring unsupported FRAME_CYBERDECK_REFRESH_RATE=${process.env.FRAME_CYBERDECK_REFRESH_RATE}; using runtime default.`
+        )
+      }
+      const extendedCompat = /^(1|true|yes|on)$/i.test(
+        process.env.FRAME_CYBERDECK_EXTENDED_COMPAT ?? ''
+      )
+
+      const convertArgs = [
+        helper,
+        'convert',
+        '--input',
+        sourcePath,
+        '--output',
+        output,
+        '--refresh-rate',
+        String(refreshRate)
+      ]
+      if (extendedCompat) convertArgs.push('--extended-compat')
+
+      console.log(
+        `[Frame Convert] Options: refresh=${refreshRate || 'default'}, extendedCompat=${extendedCompat}`
+      )
+
       try {
         const execution = await execa(
           python,
-          [helper, 'convert', '--input', sourcePath, '--output', output],
+          convertArgs,
           {
             env: process.env
           }
