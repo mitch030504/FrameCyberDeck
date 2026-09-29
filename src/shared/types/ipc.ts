@@ -27,7 +27,8 @@ import {
   DownloadProxySettings,
   GameDescriptionRequest,
   GameDescriptionResult,
-  GameDescriptionSnapshot
+  GameDescriptionSnapshot,
+  FrameConversionSettings
 } from './index'
 
 // Define types for all IPC channels between renderer and main
@@ -151,6 +152,11 @@ export interface IPCChannels {
   'settings:set-existing-download-action': DefineChannel<[v: ExistingDownloadAction], void>
   'settings:get-download-proxy': DefineChannel<[], DownloadProxySettings>
   'settings:set-download-proxy': DefineChannel<[settings: DownloadProxySettings], DownloadProxySettings>
+  'settings:get-frame-conversion': DefineChannel<[], FrameConversionSettings>
+  'settings:set-frame-conversion': DefineChannel<
+    [settings: FrameConversionSettings],
+    FrameConversionSettings
+  >
 
   // Log upload related channels
   'logs:upload-current': DefineChannel<[], { url: string; password: string; slug: string } | null>
