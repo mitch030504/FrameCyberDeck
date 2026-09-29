@@ -28,6 +28,7 @@ FRAME_BRIDGE_URL = (
     + "/native/frame_bridge.c"
 )
 FRAME_BRIDGE_GIT_BLOB_SHA1 = "e2fc56eb8d7a9897805e354749ead7f9b25baec5"
+FRAME_BRIDGE_DIAGNOSTIC_CAPABILITY = b"FCD_Q2F_DIAGNOSTICS_V1"
 
 PASSTHROUGH_BRIDGE_URL = (
     "https://raw.githubusercontent.com/MichaelScottsman/Quest2Frame/"
@@ -274,6 +275,155 @@ def ensure_pinned_source(
     return destination
 
 
+def instrument_frame_bridge_source(
+    source: pathlib.Path,
+    destination: pathlib.Path,
+) -> pathlib.Path:
+    """Add diagnostic-only logging to the hash-verified Quest2Frame adapter."""
+    text = source.read_text(encoding="utf-8")
+
+    def replace_once(old: str, new: str, label: str) -> None:
+        nonlocal text
+        if text.count(old) != 1:
+            raise RuntimeError(
+                f"Quest2Frame diagnostic patch anchor mismatch for {label}"
+            )
+        text = text.replace(old, new, 1)
+
+    replace_once(
+        "static int foveation_fix = 1, controller_fix = 1;\n",
+        (
+            "static int foveation_fix = 1, controller_fix = 1;\n"
+            "__attribute__((used)) static const char framecyberdeck_diagnostic_capability[] = "
+            "\\"FCD_Q2F_DIAGNOSTICS_V1\\";\n"
+        ),
+        "capability marker",
+    )
+
+    replace_once(
+        """    const XrBaseInStructure *next = fixed.next;
+    while (foveation_fix && next && next->type == XR_TYPE_SWAPCHAIN_CREATE_INFO_FOVEATION_FB) next = next->next;
+    fixed.next = next;
+""",
+        """    const XrBaseInStructure *next = fixed.next;
+    unsigned stripped_foveation = 0;
+    while (foveation_fix && next && next->type == XR_TYPE_SWAPCHAIN_CREATE_INFO_FOVEATION_FB) {
+        next = next->next;
+        ++stripped_foveation;
+    }
+    fixed.next = next;
+    if (stripped_foveation)
+        __android_log_print(ANDROID_LOG_INFO, "FrameBridge", "Q2FTEST foveation-swapchain: stripped=%u", stripped_foveation);
+""",
+        "swapchain foveation stripping",
+    )
+
+    replace_once(
+        """    if (!locations) return XR_ERROR_VALIDATION_FAILURE;
+    locations->isActive = XR_FALSE;
+""",
+        """    if (!locations) return XR_ERROR_VALIDATION_FAILURE;
+    static unsigned hand_reports;
+    if (hand_reports++ < 8)
+        __android_log_print(ANDROID_LOG_INFO, "FrameBridge", "Q2FTEST hand-tracking: xrLocateHandJointsEXT forced inactive");
+    locations->isActive = XR_FALSE;
+""",
+        "hand tracking suppression",
+    )
+
+    replace_once(
+        """        if (str && path && XR_SUCCEEDED(str(current, state->interactionProfile, sizeof(name), &size, name)) && (strstr(name, "/valve/") || strstr(name, "/khr/generic_controller")))
+            path(current, "/interaction_profiles/oculus/touch_controller", &state->interactionProfile);
+""",
+        """        if (str && path && XR_SUCCEEDED(str(current, state->interactionProfile, sizeof(name), &size, name)) && (strstr(name, "/valve/") || strstr(name, "/khr/generic_controller"))) {
+            XrResult rewritten = path(current, "/interaction_profiles/oculus/touch_controller", &state->interactionProfile);
+            static unsigned profile_reports;
+            if (profile_reports++ < 16)
+                __android_log_print(ANDROID_LOG_INFO, "FrameBridge", "Q2FTEST controller-profile: source=%s target=/interaction_profiles/oculus/touch_controller result=%d", name, rewritten);
+        }
+""",
+        "controller profile rewrite",
+    )
+
+    replace_once(
+        """    uint32_t kept=0;
+    for (uint32_t i=0; i<total; ++i) {
+        if (strstr(all[i].extensionName, "foveation")) continue;
+        if (properties && kept < capacity) properties[kept] = all[i];
+        ++kept;
+    }
+    free(all); *count=kept;
+""",
+        """    uint32_t kept=0, hidden=0;
+    for (uint32_t i=0; i<total; ++i) {
+        if (strstr(all[i].extensionName, "foveation")) { ++hidden; continue; }
+        if (properties && kept < capacity) properties[kept] = all[i];
+        ++kept;
+    }
+    if (hidden) {
+        static unsigned foveation_reports;
+        if (foveation_reports++ < 16)
+            __android_log_print(ANDROID_LOG_INFO, "FrameBridge", "Q2FTEST foveation-extensions: hidden=%u total=%u kept=%u", hidden, total, kept);
+    }
+    free(all); *count=kept;
+""",
+        "foveation extension filtering",
+    )
+
+    replace_once(
+        """XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateApiLayerProperties(uint32_t capacity, uint32_t *count, XrApiLayerProperties *properties) {
+""",
+        """XRAPI_ATTR XrResult XRAPI_CALL xrSuggestInteractionProfileBindings(XrInstance instance, const XrInteractionProfileSuggestedBinding *suggested) {
+    PFN_xrSuggestInteractionProfileBindings fn = (PFN_xrSuggestInteractionProfileBindings)resolve(instance, "xrSuggestInteractionProfileBindings");
+    if (!fn) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    XrResult result = fn(instance, suggested);
+    static unsigned binding_reports;
+    if (binding_reports++ < 32) {
+        PFN_xrPathToString str = (PFN_xrPathToString)resolve(instance, "xrPathToString");
+        char profile[XR_MAX_PATH_LENGTH] = "<null>";
+        uint32_t size = 0;
+        if (suggested && str && suggested->interactionProfile)
+            if (XR_FAILED(str(instance, suggested->interactionProfile, sizeof(profile), &size, profile)))
+                snprintf(profile, sizeof(profile), "<unresolved>");
+        uint32_t count = suggested ? suggested->countSuggestedBindings : 0;
+        __android_log_print(ANDROID_LOG_INFO, "FrameBridge", "Q2FTEST bindings: profile=%s count=%u result=%d", profile, count, result);
+        if (suggested && suggested->suggestedBindings && str) {
+            uint32_t limit = count < 24 ? count : 24;
+            for (uint32_t i=0; i<limit; ++i) {
+                char binding[XR_MAX_PATH_LENGTH] = "<unresolved>";
+                size = 0;
+                if (suggested->suggestedBindings[i].binding &&
+                    XR_SUCCEEDED(str(instance, suggested->suggestedBindings[i].binding, sizeof(binding), &size, binding)))
+                    __android_log_print(ANDROID_LOG_INFO, "FrameBridge", "Q2FTEST binding[%u]=%s", i, binding);
+                else
+                    __android_log_print(ANDROID_LOG_INFO, "FrameBridge", "Q2FTEST binding[%u]=<unresolved>", i);
+            }
+            if (count > limit)
+                __android_log_print(ANDROID_LOG_INFO, "FrameBridge", "Q2FTEST bindings: %u additional bindings omitted", count - limit);
+        }
+    }
+    return result;
+}
+XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateApiLayerProperties(uint32_t capacity, uint32_t *count, XrApiLayerProperties *properties) {
+""",
+        "binding diagnostics wrapper",
+    )
+
+    replace_once(
+        """    HOOK(xrCreateSwapchain) HOOK(xrLocateHandJointsEXT)
+    HOOK(xrGetCurrentInteractionProfile) HOOK(xrEnumerateInstanceExtensionProperties)
+""",
+        """    HOOK(xrCreateSwapchain) HOOK(xrLocateHandJointsEXT)
+    HOOK(xrGetCurrentInteractionProfile) HOOK(xrSuggestInteractionProfileBindings)
+    HOOK(xrEnumerateInstanceExtensionProperties)
+""",
+        "binding diagnostics hook",
+    )
+
+    destination.write_text(text, encoding="utf-8")
+    return destination
+
+
 def ensure_adapter(root: pathlib.Path, sdk: pathlib.Path) -> pathlib.Path:
     adapter_dir = root / "frame-adapter"
     output = adapter_dir / "libopenxr_loader_generic.so"
@@ -281,8 +431,13 @@ def ensure_adapter(root: pathlib.Path, sdk: pathlib.Path) -> pathlib.Path:
     # Quest2Frame added refresh-rate support to the native adapter. Existing
     # FrameCyberDeck users may already have the old cached binary, so invalidate
     # it when the capability marker is absent instead of silently reusing it.
-    if output.is_file() and b"Q2F_REFRESH_RATE_V1" in output.read_bytes():
-        return output
+    if output.is_file():
+        cached = output.read_bytes()
+        if (
+            b"Q2F_REFRESH_RATE_V1" in cached
+            and FRAME_BRIDGE_DIAGNOSTIC_CAPABILITY in cached
+        ):
+            return output
     output.unlink(missing_ok=True)
 
     source = ensure_pinned_source(
@@ -290,6 +445,11 @@ def ensure_adapter(root: pathlib.Path, sdk: pathlib.Path) -> pathlib.Path:
         adapter_dir / "frame_bridge.c",
         FRAME_BRIDGE_GIT_BLOB_SHA1,
         "Quest2Frame adapter",
+    )
+
+    instrumented_source = instrument_frame_bridge_source(
+        source,
+        adapter_dir / "frame_bridge.instrumented.c",
     )
 
     include = adapter_dir / "include" / "openxr"
@@ -324,7 +484,7 @@ def ensure_adapter(root: pathlib.Path, sdk: pathlib.Path) -> pathlib.Path:
             "-Wl,-soname,libopenxr_loader_generic.so",
             "-I",
             include.parent,
-            source,
+            instrumented_source,
             "-ldl",
             "-llog",
             "-o",
@@ -755,6 +915,10 @@ def doctor() -> dict:
     result["adapterRefreshCapable"] = (
         adapter_path.is_file()
         and b"Q2F_REFRESH_RATE_V1" in adapter_path.read_bytes()
+    )
+    result["adapterDiagnosticsCapable"] = (
+        adapter_path.is_file()
+        and FRAME_BRIDGE_DIAGNOSTIC_CAPABILITY in adapter_path.read_bytes()
     )
     result["quest2FrameCommit"] = QUEST2FRAME_COMMIT
     return result
