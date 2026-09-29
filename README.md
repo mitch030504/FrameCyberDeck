@@ -56,18 +56,15 @@ The normal path uses the updated native bridge with per-game OpenXR display-refr
 
 The original source APK is never overwritten.
 
-For development/testing, optional Frame conversion controls can be set before launching the app:
+Frame conversion options are available under **Other Settings → Steam Frame Conversion**:
+
+- **Requested display refresh rate:** Runtime default, 72, 80, 90, 120 or 144 Hz.
+- **Extended compatibility adapter:** opt-in Quest2Frame passthrough-underlay → alpha-blend translation plus the validated 1–2 px swapchain rectangle-overflow correction.
+
+For development/testing, environment variables can override the saved UI settings:
 
 ```fish
-# Keep runtime-selected refresh rate (default)
-set -x FRAME_CYBERDECK_REFRESH_RATE 0
-
-# Or request one of: 72, 80, 90, 120, 144
 set -x FRAME_CYBERDECK_REFRESH_RATE 90
-
-# Experimental Quest2Frame outer adapter:
-# passthrough-underlay -> alpha-blend translation plus the validated
-# 1-2 px swapchain rectangle-overflow correction.
 set -x FRAME_CYBERDECK_EXTENDED_COMPAT 1
 ```
 
