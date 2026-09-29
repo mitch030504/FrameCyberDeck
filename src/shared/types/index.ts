@@ -507,6 +507,13 @@ export interface WindowBounds {
   maximized?: boolean
 }
 
+export type FrameRefreshRate = 0 | 72 | 80 | 90 | 120 | 144
+
+export interface FrameConversionSettings {
+  refreshRate: FrameRefreshRate
+  extendedCompat: boolean
+}
+
 export interface Settings {
   downloadPath: string
   downloadSpeedLimit: number
@@ -517,6 +524,7 @@ export interface Settings {
   maxConcurrentDownloads: number
   existingDownloadAction?: ExistingDownloadAction
   downloadProxy: DownloadProxySettings
+  frameConversion: FrameConversionSettings
   windowBounds?: WindowBounds
 }
 
@@ -537,6 +545,8 @@ export interface SettingsAPI {
   setExistingDownloadAction: (v: ExistingDownloadAction) => void
   getDownloadProxy: () => DownloadProxySettings
   setDownloadProxy: (settings: DownloadProxySettings) => DownloadProxySettings
+  getFrameConversionSettings: () => FrameConversionSettings
+  setFrameConversionSettings: (settings: FrameConversionSettings) => FrameConversionSettings
 }
 
 export interface SettingsAPIRenderer extends Modify<
@@ -558,6 +568,10 @@ export interface SettingsAPIRenderer extends Modify<
     setExistingDownloadAction: (v: ExistingDownloadAction) => Promise<void>
     getDownloadProxy: () => Promise<DownloadProxySettings>
     setDownloadProxy: (settings: DownloadProxySettings) => Promise<DownloadProxySettings>
+    getFrameConversionSettings: () => Promise<FrameConversionSettings>
+    setFrameConversionSettings: (
+      settings: FrameConversionSettings
+    ) => Promise<FrameConversionSettings>
   }
 > {}
 
