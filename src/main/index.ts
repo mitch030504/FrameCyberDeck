@@ -873,6 +873,12 @@ app.whenReady().then(async () => {
   typedIpcMain.handle('settings:set-download-proxy', (_event, settings) =>
     settingsService.setDownloadProxy(settings)
   )
+  typedIpcMain.handle('settings:get-frame-conversion', () =>
+    settingsService.getFrameConversionSettings()
+  )
+  typedIpcMain.handle('settings:set-frame-conversion', (_event, settings) =>
+    settingsService.setFrameConversionSettings(settings)
+  )
 
   // --- Logs Handlers ---
   typedIpcMain.handle('logs:upload-current', async () => {
