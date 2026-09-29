@@ -51,7 +51,27 @@ Frame CyberDeck can convert a compatible Quest APK before deployment:
 5. Verify the resulting APK
 6. Stage it for SteamOS Devkit deployment
 
+The converter is currently pinned to Quest2Frame commit `c9f1e4d9a705575e103c136d865b869e3d87b256`.
+The normal path uses the updated native bridge with per-game OpenXR display-refresh support while keeping the runtime default unless explicitly requested.
+
 The original source APK is never overwritten.
+
+For development/testing, optional Frame conversion controls can be set before launching the app:
+
+```fish
+# Keep runtime-selected refresh rate (default)
+set -x FRAME_CYBERDECK_REFRESH_RATE 0
+
+# Or request one of: 72, 80, 90, 120, 144
+set -x FRAME_CYBERDECK_REFRESH_RATE 90
+
+# Experimental Quest2Frame outer adapter:
+# passthrough-underlay -> alpha-blend translation plus the validated
+# 1-2 px swapchain rectangle-overflow correction.
+set -x FRAME_CYBERDECK_EXTENDED_COMPAT 1
+```
+
+The extended compatibility adapter is opt-in because it changes the OpenXR call path. It is intended for specific titles that need the upstream passthrough or swapchain-rectangle workarounds; normal conversions leave it disabled.
 
 ### SteamOS Devkit deployment
 
