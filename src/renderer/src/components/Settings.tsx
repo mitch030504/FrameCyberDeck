@@ -46,7 +46,11 @@ import {
 import BackupBetaWarningDialog from './backup/BackupBetaWarningDialog'
 import BackupPanel from './backup/BackupPanel'
 import { useSoundEffects, SOUND_NAMES } from '../hooks/useSoundEffects'
-import type { DownloadProxySettings } from '@shared/types'
+import type {
+  DownloadProxySettings,
+  FrameConversionSettings,
+  FrameRefreshRate
+} from '@shared/types'
 
 // Supported speed units with conversion factors to KB/s
 const SPEED_UNITS = [
@@ -1790,6 +1794,135 @@ const DownloadProxySettingsPanel: React.FC = () => {
   )
 }
 
+const FRAME_REFRESH_OPTIONS: Array<{ label: string; value: FrameRefreshRate }> = [
+  { label: 'Runtime default', value: 0 },
+  { label: '72 Hz', value: 72 },
+  { label: '80 Hz', value: 80 },
+  { label: '90 Hz', value: 90 },
+  { label: '120 Hz', value: 120 },
+  { label: '144 Hz', value: 144 }
+]
+
+const FrameConversionSettingsPanel: React.FC = () => {
+  const styles = useStyles()
+  const [settings, setSettings] = useState<FrameConversionSettings>({
+    refreshRate: 0,
+    extendedCompat: false
+  })
+  const [loaded, setLoaded] = useState(false)
+  const [saved, setSaved] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    window.api.settings
+      .getFrameConversionSettings()
+      .then((value) => {
+        if (active) {
+          setSettings(value)
+          setLoaded(true)
+        }
+      })
+      .catch((error) => {
+        console.error('[Settings] Failed to load Frame conversion settings:', error)
+        if (active) setLoaded(true)
+      })
+    return () => {
+      active = false
+    }
+  }, [])
+
+  const save = async (): Promise<void> => {
+    try {
+      const normalized = await window.api.settings.setFrameConversionSettings(settings)
+      setSettings(normalized)
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2500)
+    } catch (error) {
+      console.error('[Settings] Failed to save Frame conversion settings:', error)
+    }
+  }
+
+  if (!loaded) {
+    return (
+      <Card className={styles.card}>
+        <div className={styles.cardContent}>
+          <Spinner size="small" label="Loading Steam Frame conversion settings..." />
+        </div>
+      </Card>
+    )
+  }
+
+  return (
+    <Card className={styles.card}>
+      <CardHeader description={<Subtitle1>Steam Frame Conversion</Subtitle1>} />
+      <div className={styles.cardContent}>
+        <div className={styles.speedFormRow}>
+          <div className={styles.speedControl}>
+            <Text>Requested display refresh rate</Text>
+            <Dropdown
+              value={
+                FRAME_REFRESH_OPTIONS.find((entry) => entry.value === settings.refreshRate)?.label ??
+                'Runtime default'
+              }
+              selectedOptions={[String(settings.refreshRate)]}
+              onOptionSelect={(_, data) => {
+                const parsed = Number(data.optionValue ?? 0) as FrameRefreshRate
+                setSettings((current) => ({ ...current, refreshRate: parsed }))
+              }}
+              mountNode={document.getElementById('portal')}
+            >
+              {FRAME_REFRESH_OPTIONS.map((entry) => (
+                <Option key={entry.value} value={String(entry.value)} text={entry.label}>
+                  {entry.label}
+                </Option>
+              ))}
+            </Dropdown>
+            <Text className={styles.hint}>
+              <InfoRegular />
+              Runtime default is safest. A requested rate is only used when the Frame runtime reports
+              that mode as supported.
+            </Text>
+          </div>
+
+          <div className={styles.speedControl}>
+            <Text>Extended compatibility adapter</Text>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <Switch
+                checked={settings.extendedCompat}
+                onChange={(_, data) =>
+                  setSettings((current) => ({ ...current, extendedCompat: data.checked }))
+                }
+              />
+              <Text>{settings.extendedCompat ? 'Enabled' : 'Disabled'}</Text>
+            </div>
+            <Text className={styles.hint}>
+              <InfoRegular />
+              Experimental Quest2Frame passthrough/alpha-blend translation plus the validated 1–2 px
+              swapchain rectangle correction. Leave disabled unless a title needs it.
+            </Text>
+          </div>
+        </div>
+
+        <div
+          className={styles.formRow}
+          style={{ justifyContent: 'flex-end', marginTop: tokens.spacingVerticalM }}
+        >
+          <button onClick={() => void save()} style={neonBtn}>
+            Save Frame Settings
+          </button>
+        </div>
+
+        {saved && (
+          <Text className={styles.success}>
+            <CheckmarkCircleRegular />
+            Steam Frame conversion settings saved.
+          </Text>
+        )}
+      </div>
+    </Card>
+  )
+}
+
 const Settings: React.FC = () => {
   const styles = useStyles()
   const {
@@ -1817,6 +1950,7 @@ const Settings: React.FC = () => {
     logs: false,
     backups: false,
     download: false,
+    frameConversion: false,
     blacklist: false,
     content: false,
     matrixId: false,
@@ -2365,6 +2499,16 @@ const Settings: React.FC = () => {
             </div>
           </Card>
         )}
+
+        <div>
+          <SectionHeader
+            label="// STEAM FRAME CONVERSION"
+            sectionKey="frameConversion"
+            openSections={openSections}
+            onToggle={toggleSection}
+          />
+          {openSections.frameConversion && <FrameConversionSettingsPanel />}
+        </div>
 
         <div>
           <SectionHeader
