@@ -106,3 +106,64 @@ f;./b.bin;2`
   const { files } = parseReleaseManifest(input)
   assert.deepEqual(files, [{ path: 'a.bin', size: 1 }])
 })
+
+// --- verifyReleaseTree ------------------------------------------------------
+
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { verifyReleaseTree } from './releaseManifest.ts'
+
+const MANIFEST = `#VRPRELEASEMANIFEST 1.0
+Test Game;Test Game v1 -VRP;com.example.game;1;2026-01-01 00:00 UTC;1;0;0;0
+
+#filelist
+type;name;size
+f;./release.manifest;999
+f;./com.example.game.apk;100
+d;./com.example.game;0
+f;./com.example.game/data.obb;50
+`
+
+async function makeRelease(dir, { apkSize = 100, obbSize = 50, omitApk = false, manifest = MANIFEST } = {}) {
+  await mkdir(join(dir, 'com.example.game'), { recursive: true })
+  await writeFile(join(dir, RELEASE_MANIFEST_FILENAME), manifest, 'utf-8')
+  if (!omitApk) await writeFile(join(dir, 'com.example.game.apk'), Buffer.alloc(apkSize))
+  await writeFile(join(dir, 'com.example.game', 'data.obb'), Buffer.alloc(obbSize))
+}
+
+test('verifyReleaseTree accepts a complete release and skips sidecars', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'vrp-manifest-'))
+  try {
+    await makeRelease(dir)
+    // release.manifest itself (a sidecar) is intentionally absent.
+    assert.equal(await verifyReleaseTree(dir), true)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('verifyReleaseTree rejects missing files, wrong sizes and absent manifests', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'vrp-manifest-'))
+  try {
+    const missing = join(base, 'missing')
+    await makeRelease(missing, { omitApk: true })
+    assert.equal(await verifyReleaseTree(missing), false)
+
+    const wrongSize = join(base, 'wrong-size')
+    await makeRelease(wrongSize, { apkSize: 99 })
+    assert.equal(await verifyReleaseTree(wrongSize), false)
+
+    const noManifest = join(base, 'no-manifest')
+    await mkdir(noManifest, { recursive: true })
+    await writeFile(join(noManifest, 'com.example.game.apk'), Buffer.alloc(100))
+    assert.equal(await verifyReleaseTree(noManifest), false)
+
+    const garbage = join(base, 'garbage')
+    await mkdir(garbage, { recursive: true })
+    await writeFile(join(garbage, RELEASE_MANIFEST_FILENAME), 'not a manifest', 'utf-8')
+    assert.equal(await verifyReleaseTree(garbage), false)
+  } finally {
+    await rm(base, { recursive: true, force: true })
+  }
+})

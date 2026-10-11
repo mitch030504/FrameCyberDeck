@@ -6,6 +6,7 @@ Frame CyberDeck is the Steam Frame-focused fork of VR CyberDeck.
 
 - Detects native SteamOS ADB separately from Quest/Android devices.
 - Converts compatible Quest APKs before deployment.
+- Skips re-downloading a release that is already complete on disk, verified file-by-file against its own `release.manifest`.
 - Uses OVR Port `3.4.3-23204ea`.
 - Injects the prebuilt FrameBridge adapter from FramePort, pinned to commit `5424e429e46e53fe51497babac124dd91dbb73bf` and SHA-256-verified against FramePort's manifest. Its passthrough emulation and swapchain fixes are built in; no separate compatibility wrapper is needed.
 - Invalidates cached adapters that do not match the pinned SHA-256.

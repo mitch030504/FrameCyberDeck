@@ -21,6 +21,9 @@
  * stripping the leading "./".
  */
 
+import { readFile, stat } from 'fs/promises'
+import { join } from 'path'
+
 export interface ManifestFileEntry {
   /** Path relative to the release root, forward-slash separated, no leading "./". */
   path: string
@@ -111,4 +114,34 @@ export function parseReleaseManifest(content: string): ParsedReleaseManifest {
   }
 
   return { files }
+}
+
+/**
+ * True when the release folder at `releaseRoot` already holds every payload
+ * file listed by its own `release.manifest`, each with the exact expected
+ * size. Missing/unreadable/garbage manifest or any missing or wrong-sized
+ * file returns false, so callers can fail open to a fresh download.
+ */
+export async function verifyReleaseTree(releaseRoot: string): Promise<boolean> {
+  let content: string
+  try {
+    content = await readFile(join(releaseRoot, RELEASE_MANIFEST_FILENAME), 'utf-8')
+  } catch {
+    return false
+  }
+
+  const payload = parseReleaseManifest(content).files.filter(
+    (entry) => !isReleaseMetadataSidecar(entry.path)
+  )
+  if (payload.length === 0) return false
+
+  for (const entry of payload) {
+    try {
+      const info = await stat(join(releaseRoot, entry.path))
+      if (!info.isFile() || info.size !== entry.size) return false
+    } catch {
+      return false
+    }
+  }
+  return true
 }

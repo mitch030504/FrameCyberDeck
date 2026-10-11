@@ -11,6 +11,7 @@ import { DownloadItem } from '@shared/types'
 import { DownloadStatus } from '@shared/types'
 import { getAvailableDiskSpace, parseSizeToBytes, formatBytes } from './utils'
 import { isCompletedDownloadFile, validateDownloadCompletion } from './archiveDiscovery'
+import { verifyReleaseTree } from './releaseManifest'
 import {
   buildGameArchiveRcloneEnvironment,
   captureGameArchiveRouting,
@@ -47,6 +48,27 @@ export class DownloadProcessor {
   // Add getter for vrpConfig
   public getVrpConfig(): VrpConfig | null {
     return this.vrpConfig
+  }
+
+  /**
+   * Result to return from a download entry point when the release folder
+   * already verifies complete against its own release.manifest, so the
+   * pipeline can go straight to extraction/install. Null means: download.
+   */
+  private async alreadyCompleteResult(
+    item: DownloadItem,
+    downloadPath: string
+  ): Promise<{ success: boolean; startExtraction: boolean; finalState?: DownloadItem } | null> {
+    if (!(await verifyReleaseTree(downloadPath))) return null
+    console.log(
+      `[DownProc] ${item.releaseName} is already complete on disk; skipping download.`
+    )
+    this.updateItemStatus(item.releaseName, 'Downloading', 100)
+    return {
+      success: true,
+      startExtraction: true,
+      finalState: this.queueManager.findItem(item.releaseName)
+    }
   }
 
   // Centralized update method using QueueManager and emitting update
@@ -144,6 +166,11 @@ export class DownloadProcessor {
       ? item.downloadPath
       : join(item.downloadPath, item.releaseName)
     this.queueManager.updateItem(item.releaseName, { downloadPath: downloadPath })
+
+    // A previous run may have left the complete release on disk. Verify it
+    // against its own manifest and skip the transfer entirely.
+    const skip = await this.alreadyCompleteResult(item, downloadPath)
+    if (skip) return skip
 
     try {
       await fs.mkdir(downloadPath, { recursive: true })
@@ -758,6 +785,14 @@ export class DownloadProcessor {
   ): Promise<{ success: boolean; startExtraction: boolean; finalState?: DownloadItem }> {
     console.log(`[DownProc] Resuming download for ${item.releaseName}...`)
     const routing = captureGameArchiveRouting(settingsService.getDownloadProxy())
+
+    // The interrupted run may have actually finished writing every file; if the
+    // release verifies complete against its manifest, skip the transfer.
+    const downloadPath = item.downloadPath.endsWith(item.releaseName)
+      ? item.downloadPath
+      : join(item.downloadPath, item.releaseName)
+    const skip = await this.alreadyCompleteResult(item, downloadPath)
+    if (skip) return skip
 
     // Active mirrors are allowed only when this download's routing snapshot preserves direct routing.
     let mirrorConfig: { configFilePath: string; remoteName: string } | undefined
