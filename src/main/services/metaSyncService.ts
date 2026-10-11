@@ -21,6 +21,9 @@ function emitProgress(progress: MetaSyncProgress): void {
 // the community tooling (OculusGraphQLApiLib) has stable access to.
 const DOC_ENTITLEMENTS = '4850747515044496'
 const DOC_BINARY_DETAILS = '4734929166632773'
+// Leaner binary query: no asset-file names or DLC flags, but survives the
+// binaries the rich query rejects ("reduce the amount of data").
+const DOC_BINARY_DETAILS_LEAN = '24072064135771905'
 const DOWNLOAD_URI = 'https://securecdn.oculus.com/binaries/download/'
 
 interface EntitlementsResponse {
@@ -49,14 +52,25 @@ interface EntitlementsResponse {
     }
   }
 }
+interface BinaryAssetFile {
+  id: string
+  file_name?: string
+  /** Rich query only: false marks optional content the Quest installer skips. */
+  is_required?: boolean | null
+  /** Rich query only: set for entitlement-gated store DLC. */
+  iap_item?: { id: string } | null
+}
+
 interface BinaryDetailsResponse {
   data?: {
     node?: {
       obb_binary?: { id: string; file_name?: string } | null
-      asset_files?: { nodes: { id: string; file_name?: string }[] }
+      asset_files?: { nodes?: BinaryAssetFile[] }
     }
   }
 }
+
+type BinaryDetailsNode = NonNullable<NonNullable<BinaryDetailsResponse['data']>['node']>
 
 export interface EntitledTitle {
   appId: string
@@ -114,7 +128,11 @@ export function selectCandidates(
   for (const title of entitledTitles) {
     const serverVersion = serverVersionByPackage.get(title.packageName)
     if (serverVersion !== undefined && title.versionCode <= serverVersion) continue
-    if (serverVersion === undefined && (isDemoTitle(title) || !isPaidGrantReason(title.grantReason))) continue
+    if (
+      serverVersion === undefined &&
+      (isDemoTitle(title) || !isPaidGrantReason(title.grantReason))
+    )
+      continue
     if (isBlacklisted(title.packageName, title.versionCode)) continue
     candidates.push({
       packageName: title.packageName,
@@ -174,6 +192,46 @@ class MetaSyncService {
     )
   }
 
+  /**
+   * Two persisted queries expose a binary's files. The rich one names each
+   * asset file and marks DLC, but Meta rejects it ("reduce the amount of
+   * data") on binaries with very large asset lists — Beat Saber lists 294
+   * DLC packs. The lean one returns at least the OBB for those.
+   */
+  private async fetchBinaryDetails(
+    binaryId: string,
+    token: string
+  ): Promise<{ node: BinaryDetailsNode; lean: boolean }> {
+    const parse = (response: BinaryDetailsResponse): BinaryDetailsNode => {
+      const node = response.data?.node
+      if (!node) throw new Error('Meta returned no binary details for this title')
+      return node
+    }
+    try {
+      return {
+        node: parse(
+          await graphRequest<BinaryDetailsResponse>(
+            DOC_BINARY_DETAILS,
+            { binaryID: binaryId },
+            token
+          )
+        ),
+        lean: false
+      }
+    } catch {
+      return {
+        node: parse(
+          await graphRequest<BinaryDetailsResponse>(
+            DOC_BINARY_DETAILS_LEAN,
+            { binaryID: binaryId },
+            token
+          )
+        ),
+        lean: true
+      }
+    }
+  }
+
   private async downloadBinary(id: string, destination: string, token: string): Promise<void> {
     // The token is a query parameter; never log this URL.
     const response = await fetch(
@@ -228,24 +286,24 @@ class MetaSyncService {
                 percent
               })
 
-            const details = await graphRequest<BinaryDetailsResponse>(
-              DOC_BINARY_DETAILS,
-              { binaryID: candidate.binaryId },
-              token
+            const { node, lean } = await this.fetchBinaryDetails(candidate.binaryId, token)
+            // Required files only: optional store DLC is entitlement-gated and
+            // is not part of the release the Quest installer downloads.
+            const assets = lean
+              ? // Lean nodes carry no file names; such binaries (huge DLC
+                // lists, e.g. Beat Saber) ship the base game as APK + OBB.
+                []
+              : (node.asset_files?.nodes ?? []).filter(
+                  (file) => file.is_required !== false && !file.iap_item
+                )
+            const obbs = [...(node.obb_binary ? [node.obb_binary] : []), ...assets].map(
+              (file, index) => ({
+                ...file,
+                // Releases ship data under their own names (Unity bundles, Unreal
+                // .pak chunks, Sounds.obb), not the classic main.<pkg>.obb form.
+                name: basename(file.file_name || `data${index}.obb`)
+              })
             )
-            const node = details.data?.node
-            if (!node) {
-              throw new Error('Meta returned no binary details for this title')
-            }
-            const obbs = [
-              ...(node.obb_binary ? [node.obb_binary] : []),
-              ...(node.asset_files?.nodes ?? [])
-            ].map((file, index) => ({
-              ...file,
-              // Releases ship data under their own names (Unity bundles, Unreal
-              // .pak chunks, Sounds.obb), not the classic main.<pkg>.obb form.
-              name: basename(file.file_name || `data${index}.obb`)
-            }))
 
             emit('Downloading APK', 0)
             await this.downloadBinary(candidate.binaryId, apkPath, token)

@@ -218,7 +218,9 @@ describe('metaSyncService.queueUpdates', () => {
           asset_files: {
             nodes: [
               { id: 'a1', file_name: 'pakchunk2100-Android_ASTC.pak' },
-              { id: 'a2', file_name: '../../evil.obb' }
+              { id: 'a2', file_name: '../../evil.obb' },
+              { id: 'a3', file_name: 'optional-dlc.pack', is_required: false },
+              { id: 'a4', file_name: 'paid-dlc.pack', iap_item: { id: 'iap1' } }
             ]
           }
         }
@@ -269,6 +271,56 @@ describe('metaSyncService.queueUpdates', () => {
           join(stageDir, 'evil.obb'),
           join(stageDir, 'pakchunk2100-Android_ASTC.pak')
         ]
+      })
+    )
+  })
+
+  it('falls back to the lean binary query and downloads APK + OBB only when the rich one fails', async () => {
+    vi.mocked(metaAccountService.getToken).mockResolvedValue('OCmocktoken')
+    const graphMock = graphRequest as unknown as ReturnType<typeof vi.fn>
+    graphMock.mockRejectedValueOnce(new Error('Meta request failed (500)')).mockResolvedValue({
+      data: {
+        node: {
+          obb_binary: { id: 'o1', file_name: 'main.3148.com.beatgames.beatsaber.obb' },
+          asset_files: { nodes: [{ id: 'a1' }, { id: 'a2' }] }
+        }
+      }
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('data'))
+            controller.close()
+          }
+        })
+      }))
+    )
+    const addSpy = vi.spyOn(uploadService, 'addMetaItemToQueue').mockReturnValue(true)
+
+    const queued = await metaSyncService.queueUpdates([
+      {
+        packageName: 'com.beatgames.beatsaber',
+        appId: '2',
+        displayName: 'Beat Saber',
+        versionCode: 3148,
+        version: '1.42',
+        binaryId: 'b2',
+        kind: 'new'
+      }
+    ])
+
+    expect(queued).toBe(1)
+    const stageDir = join(paths.root, 'uploads', 'meta', 'com.beatgames.beatsaber', '3148')
+    expect((await fs.readdir(stageDir)).sort()).toEqual(
+      ['.complete', 'com.beatgames.beatsaber.apk', 'main.3148.com.beatgames.beatsaber.obb'].sort()
+    )
+    expect(addSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        packageName: 'com.beatgames.beatsaber',
+        sourceObbPaths: [join(stageDir, 'main.3148.com.beatgames.beatsaber.obb')]
       })
     )
   })
