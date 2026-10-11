@@ -260,8 +260,8 @@ const api = {
   metaSync: {
     getAccountStatus: (): Promise<MetaAccountStatus> =>
       typedIpcRenderer.invoke('meta-account:get-status'),
-    loginWithBrowser: (): Promise<MetaLoginResult> =>
-      typedIpcRenderer.invoke('meta-account:login-browser'),
+    loginWithSso: (): Promise<MetaLoginResult> =>
+      typedIpcRenderer.invoke('meta-account:login-sso'),
     loginWithToken: (token: string): Promise<MetaLoginResult> =>
       typedIpcRenderer.invoke('meta-account:login-token', token),
     logout: (): Promise<void> => typedIpcRenderer.invoke('meta-account:logout'),

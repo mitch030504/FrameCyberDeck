@@ -1,10 +1,23 @@
 import { app, BrowserWindow, safeStorage } from 'electron'
 import { promises as fs } from 'fs'
 import { join } from 'path'
+import { createHash, timingSafeEqual } from 'crypto'
 import { EventEmitter } from 'events'
 
 const GRAPH_URI = 'https://graph.oculus.com/graphql'
 const USER_AGENT = 'OculusGraphQLApiLib/1.0'
+
+// Native SSO protocol adapted from AXRB (github.com/Android-XR-Bridge/AXRB)
+// and RiftLift's meta_auth.py (both GPLv3): Meta hands the app a short-lived
+// challenge, the user signs in on auth.meta.com (password and 2FA stay with
+// Meta), and the app receives an encrypted session blob it exchanges for a
+// user token. The app never sees the password.
+const SSO_APP_ID = '512466987071624'
+const SSO_CLIENT = `FRL|${SSO_APP_ID}|01d4a1f7fd0682aea7ee8ae987704d63`
+const META_GRAPH_URI = 'https://meta.graph.meta.com'
+// The profile token must be minted for Meta's own Quest app to be accepted
+// by the Quest delivery endpoints.
+const SSO_PROFILE_APP_ID = '1582076955407037'
 
 /** User access tokens always start with FRL/OC; OC|... is an app token. */
 export function isUserTokenShape(token: string): boolean {
@@ -132,47 +145,115 @@ class MetaAccountService extends EventEmitter {
   }
 
   /**
-   * In-app Meta login: the user signs in (2FA included) in an embedded browser
-   * window; the app never sees the password, only the resulting `oc_ac_at`
-   * session cookie, which Meta's own web client uses as the user token.
+   * Meta native SSO login: the user signs in (2FA included) on Meta's own
+   * auth page in an embedded window; the app receives only the callback's
+   * encrypted session blob and exchanges it for a Quest account token.
    */
-  async loginWithBrowser(): Promise<{ ok: boolean; name?: string; error?: string }> {
+  async loginWithSso(): Promise<{ ok: boolean; name?: string; error?: string }> {
+    let challenge: { native_sso_token?: string; native_sso_etoken?: string }
+    try {
+      const response = await fetch(`${META_GRAPH_URI}/webview_tokens_query`, {
+        method: 'POST',
+        headers: { 'User-Agent': USER_AGENT },
+        body: new URLSearchParams({ access_token: SSO_CLIENT })
+      })
+      if (!response.ok) throw new Error(`Meta sign-in request failed (${response.status})`)
+      challenge = (await response.json()) as {
+        native_sso_token?: string
+        native_sso_etoken?: string
+      }
+      if (!challenge.native_sso_token || !challenge.native_sso_etoken) {
+        throw new Error('Meta did not return a sign-in challenge.')
+      }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : 'Sign-in failed' }
+    }
+    const confirmUrl = `https://auth.meta.com/native_sso/confirm?${new URLSearchParams({
+      native_app_id: SSO_APP_ID,
+      source_app_id: SSO_APP_ID,
+      native_sso_etoken: challenge.native_sso_etoken,
+      utm_source: 'frame-cyberdeck'
+    })}`
+    // The callback must echo the challenge's hash; compare constantly.
+    const expectedToken = createHash('sha256')
+      .update(challenge.native_sso_token)
+      .digest('hex')
+      .slice(0, 16)
+
     return new Promise((resolve) => {
-      const partition = 'meta-login'
       const window = new BrowserWindow({
         width: 480,
         height: 720,
         title: 'Sign in to Meta',
         autoHideMenuBar: true,
-        webPreferences: { partition, nodeIntegration: false, contextIsolation: true }
+        webPreferences: { nodeIntegration: false, contextIsolation: true }
       })
 
       let settled = false
       const finish = (result: { ok: boolean; name?: string; error?: string }): void => {
         if (settled) return
         settled = true
-        clearInterval(poll)
         window.destroy()
         resolve(result)
       }
 
-      const poll = setInterval(async () => {
-        if (window.isDestroyed()) return
+      const completeLogin = async (callbackUrl: string): Promise<void> => {
         try {
-          const cookies = await window.webContents.session.cookies.get({
-            url: 'https://developer.oculus.com'
-          })
-          const token = cookies.find((cookie) => cookie.name === 'oc_ac_at')?.value
-          if (token && isUserTokenShape(token)) {
-            finish(await this.setToken(token))
+          const url = new URL(callbackUrl)
+          if (!['oculus:', 'oculus-client:'].includes(url.protocol)) return
+          const token = url.searchParams.get('token') ?? ''
+          const blob = url.searchParams.get('blob') ?? ''
+          if (
+            token.length !== expectedToken.length ||
+            !timingSafeEqual(Buffer.from(token), Buffer.from(expectedToken))
+          ) {
+            throw new Error('Sign-in callback did not match this session.')
           }
-        } catch {
-          /* keep polling while the login page is up */
+          if (!blob) throw new Error('Invalid sign-in response.')
+          const decrypted = await this.ssoPost('/webview_blobs_decrypt', {
+            access_token: SSO_CLIENT,
+            blob,
+            request_token: challenge.native_sso_token!
+          }).then((data) => data as { access_token?: string })
+          if (!decrypted.access_token) throw new Error('Meta did not return a session token.')
+          const profile = await this.ssoPost('/graphql', {
+            access_token: decrypted.access_token,
+            doc_id: '24112177345042346',
+            variables: JSON.stringify({ app_id: SSO_PROFILE_APP_ID })
+          }).then(
+            (data) =>
+              data as {
+                data?: {
+                  xfr_create_profile_token?: { profile_tokens?: { access_token?: string }[] }
+                }
+              }
+          )
+          const questToken =
+            profile.data?.xfr_create_profile_token?.profile_tokens?.[0]?.access_token
+          if (!questToken) throw new Error('Meta did not return a Quest account token.')
+          finish(await this.setToken(questToken))
+        } catch (error) {
+          finish({ ok: false, error: error instanceof Error ? error.message : 'Sign-in failed' })
         }
-      }, 1500)
+      }
+
+      // Custom-protocol navigations never load; intercept and consume them.
+      const intercept = (event: Electron.Event, url: string): void => {
+        if (!url.startsWith('oculus:') && !url.startsWith('oculus-client:')) return
+        event.preventDefault()
+        void completeLogin(url)
+      }
+      window.webContents.on('will-navigate', intercept)
+      window.webContents.on('will-redirect', intercept)
+      window.webContents.setWindowOpenHandler(({ url }) => {
+        if (url.startsWith('oculus:') || url.startsWith('oculus-client:')) {
+          void completeLogin(url)
+          return { action: 'deny' }
+        }
+        return { action: 'allow' }
+      })
 
       window.on('closed', () => {
-        clearInterval(poll)
         finish({ ok: false, error: 'Login window closed before finishing sign-in.' })
       })
 
@@ -182,8 +263,21 @@ class MetaAccountService extends EventEmitter {
         }
       })
 
-      void window.loadURL('https://developer.oculus.com/manage')
+      void window.loadURL(confirmUrl)
     })
+  }
+
+  /** POST to meta.graph.meta.com's plain JSON endpoints (never logged). */
+  private async ssoPost(path: string, fields: Record<string, string>): Promise<unknown> {
+    const response = await fetch(`${META_GRAPH_URI}${path}`, {
+      method: 'POST',
+      headers: { 'User-Agent': USER_AGENT },
+      body: new URLSearchParams(fields)
+    })
+    if (!response.ok) {
+      throw new Error(`Meta sign-in request failed (${response.status})`)
+    }
+    return response.json()
   }
 }
 

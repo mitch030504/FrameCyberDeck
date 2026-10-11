@@ -127,7 +127,7 @@ export interface IPCChannels {
 
   // Meta account / owned-titles sync
   'meta-account:get-status': DefineChannel<[], MetaAccountStatus>
-  'meta-account:login-browser': DefineChannel<[], MetaLoginResult>
+  'meta-account:login-sso': DefineChannel<[], MetaLoginResult>
   'meta-account:login-token': DefineChannel<[token: string], MetaLoginResult>
   'meta-account:logout': DefineChannel<[], void>
   'meta-sync:find-updates': DefineChannel<[], { candidates: MetaSyncCandidate[]; error?: string }>

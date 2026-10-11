@@ -119,9 +119,9 @@ const MetaSyncDialog: React.FC = () => {
     return unsubscribe
   }, [])
 
-  const handleLoginBrowser = async (): Promise<void> => {
+  const handleLoginSso = async (): Promise<void> => {
     setError(null)
-    const result = await window.api.metaSync.loginWithBrowser()
+    const result = await window.api.metaSync.loginWithSso()
     if (result.ok) {
       await refreshAccount()
     } else {
@@ -237,7 +237,7 @@ const MetaSyncDialog: React.FC = () => {
               ) : (
                 <>
                   <div className={styles.actionRow}>
-                    <Button icon={<PersonCircleRegular />} onClick={handleLoginBrowser}>
+                    <Button icon={<PersonCircleRegular />} onClick={handleLoginSso}>
                       {'Sign in with Meta'}
                     </Button>
                   </div>

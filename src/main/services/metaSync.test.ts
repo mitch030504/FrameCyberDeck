@@ -23,7 +23,7 @@ vi.mock('./dependencyService', () => ({ default: {} }))
 vi.mock('./frame/frameDevkitService', () => ({ default: {} }))
 vi.mock('./fileSafety', () => ({ childPath: (base: string) => base }))
 
-import metaSyncService, { selectCandidates } from './metaSyncService'
+import metaSyncService, { safeFileName, selectCandidates } from './metaSyncService'
 import metaAccountService, { graphRequest } from './metaAccountService'
 import uploadService from './uploadService'
 
@@ -207,6 +207,22 @@ describe('uploadService.addMetaItemToQueue', () => {
   })
 })
 
+describe('safeFileName', () => {
+  it('accepts real release file names and rejects unsafe ones', () => {
+    expect(safeFileName('pakchunk2100-Android_ASTC.pak')).toBe('pakchunk2100-Android_ASTC.pak')
+    expect(safeFileName('main.3148.com.beatgames.beatsaber.obb')).toBe(
+      'main.3148.com.beatgames.beatsaber.obb'
+    )
+    expect(safeFileName('Sounds.obb')).toBe('Sounds.obb')
+    expect(safeFileName('../../evil.obb')).toBeNull()
+    expect(safeFileName('con')).toBeNull()
+    expect(safeFileName('nul.obb')).toBeNull()
+    expect(safeFileName('trailing.obb ')).toBeNull()
+    expect(safeFileName('bad<name.obb')).toBeNull()
+    expect(safeFileName('')).toBeNull()
+  })
+})
+
 describe('metaSyncService.queueUpdates', () => {
   it('downloads data files under their release names and queues them all for upload', async () => {
     vi.mocked(metaAccountService.getToken).mockResolvedValue('OCmocktoken')
@@ -230,6 +246,8 @@ describe('metaSyncService.queueUpdates', () => {
       'fetch',
       vi.fn(async () => ({
         ok: true,
+        status: 200,
+        headers: { get: (): null => null },
         body: new ReadableStream({
           start(controller) {
             controller.enqueue(new TextEncoder().encode('data'))
@@ -290,6 +308,8 @@ describe('metaSyncService.queueUpdates', () => {
       'fetch',
       vi.fn(async () => ({
         ok: true,
+        status: 200,
+        headers: { get: (): null => null },
         body: new ReadableStream({
           start(controller) {
             controller.enqueue(new TextEncoder().encode('data'))
@@ -323,5 +343,154 @@ describe('metaSyncService.queueUpdates', () => {
         sourceObbPaths: [join(stageDir, 'main.3148.com.beatgames.beatsaber.obb')]
       })
     )
+  })
+
+  it('downloads owned add-on files along with the base release', async () => {
+    vi.mocked(metaAccountService.getToken).mockResolvedValue('OCmocktoken')
+    const graphMock = graphRequest as unknown as ReturnType<typeof vi.fn>
+    graphMock
+      .mockResolvedValueOnce({
+        data: {
+          node: {
+            obb_binary: { id: 'o1', file_name: 'Sounds.obb' },
+            asset_files: {
+              nodes: [
+                { id: 'f1', file_name: 'pack-one.obb', size: '4', iap_item: { id: 'dlc1' } },
+                { id: 'f2', file_name: 'pack-two.obb', size: '4', iap_item: { id: 'dlc2' } }
+              ]
+            }
+          }
+        }
+      })
+      .mockResolvedValueOnce({
+        data: {
+          node: {
+            latest_supported_binary: {
+              firstIapItems: {
+                edges: [
+                  { node: { id: 'dlc1', is_viewer_entitled: true } },
+                  { node: { id: 'dlc2', is_viewer_entitled: false } }
+                ]
+              }
+            }
+          }
+        }
+      })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        headers: { get: (): null => null },
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('data'))
+            controller.close()
+          }
+        })
+      }))
+    )
+    const addSpy = vi.spyOn(uploadService, 'addMetaItemToQueue').mockReturnValue(true)
+
+    const queued = await metaSyncService.queueUpdates([
+      {
+        packageName: 'com.example.dlcgame',
+        appId: '3',
+        displayName: 'DLC Game',
+        versionCode: 7,
+        version: '1.0',
+        binaryId: 'b3',
+        kind: 'new'
+      }
+    ])
+
+    expect(queued).toBe(1)
+    const stageDir = join(paths.root, 'uploads', 'meta', 'com.example.dlcgame', '7')
+    const staged = (await fs.readdir(stageDir)).sort()
+    expect(staged).toContain('pack-one.obb')
+    expect(staged).not.toContain('pack-two.obb')
+    expect(addSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        packageName: 'com.example.dlcgame',
+        sourceObbPaths: [join(stageDir, 'Sounds.obb'), join(stageDir, 'pack-one.obb')]
+      })
+    )
+  })
+})
+
+describe('metaSyncService.downloadBinary', () => {
+  it('resumes from the part file when the ETag matches', async () => {
+    const destination = join(paths.root, 'resume.apk')
+    const part = `${destination}.part`
+    await fs.writeFile(part, 'data')
+    await fs.writeFile(`${part}.json`, JSON.stringify({ size: 8, etag: '"abc"' }))
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        status: 206,
+        headers: {
+          get: (header: string): string | null =>
+            header === 'content-range' ? 'bytes 4-7/8' : header === 'etag' ? '"abc"' : null
+        },
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('more'))
+            controller.close()
+          }
+        })
+      }))
+    )
+
+    await (
+      metaSyncService as unknown as {
+        downloadBinary: (
+          id: string,
+          destination: string,
+          token: string,
+          size: number
+        ) => Promise<void>
+      }
+    ).downloadBinary('id', destination, 'OCmocktoken', 8)
+
+    expect(await fs.readFile(destination, 'utf-8')).toBe('datamore')
+    await expect(fs.access(part)).rejects.toThrow()
+    await expect(fs.access(`${part}.json`)).rejects.toThrow()
+  })
+
+  it('restarts from scratch when the server ignores the range', async () => {
+    const destination = join(paths.root, 'restart.apk')
+    const part = `${destination}.part`
+    await fs.writeFile(part, 'stale')
+    await fs.writeFile(`${part}.json`, JSON.stringify({ size: 8, etag: '"old"' }))
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        headers: {
+          get: (header: string): string | null => (header === 'etag' ? '"new"' : null)
+        },
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('fresh'))
+            controller.close()
+          }
+        })
+      }))
+    )
+
+    await (
+      metaSyncService as unknown as {
+        downloadBinary: (
+          id: string,
+          destination: string,
+          token: string,
+          size: number
+        ) => Promise<void>
+      }
+    ).downloadBinary('id', destination, 'OCmocktoken', 5)
+
+    expect(await fs.readFile(destination, 'utf-8')).toBe('fresh')
   })
 })

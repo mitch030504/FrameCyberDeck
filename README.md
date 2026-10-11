@@ -58,6 +58,8 @@ Frame CyberDeck also applies FramePort's per-game recipes (catalog by spoopyghos
 
 All credits for the recipes, the FrameBridge adapter, the shim libraries, and the ELF surgery techniques belong to **spoopyghosty0** and the [FramePort](https://github.com/spoopyghosty0/frameport) project (GPLv3, like this project).
 
+The Meta native SSO sign-in and the resumable, size-verified download logic are adapted from **[AXRB](https://github.com/Android-XR-Bridge/AXRB)** (GPLv3), whose native SSO protocol in turn comes from RiftLift's `meta_auth.py` (GPL-3.0-or-later).
+
 The original source APK is never overwritten.
 
 Frame conversion options are available under **Other Settings → Steam Frame Conversion**:
@@ -105,12 +107,12 @@ It validates package/version identity, provenance, HWID metadata, and archive cr
 
 Frame CyberDeck can sign in to your Meta account and contribute owned Quest titles that the server does not have yet.
 
-- **Sign-in:** an in-app browser window handles the Meta login (including 2FA); the password is never stored, only the resulting session token. If the embedded login is blocked, paste a user token instead. The token is validated against Meta and stored encrypted through the OS keychain.
+- **Sign-in:** Meta's native SSO flow opens Meta's own login page (including 2FA) in an embedded window; the password stays with Meta, and the app receives only an encrypted session blob it exchanges for a Quest account token. If sign-in is unavailable, paste a user token instead. The token is validated against Meta and stored encrypted through the OS keychain.
 - **Check:** a single entitlement query lists everything the account owns, with each title's latest Android binary (id, version code, package name). These are compared against the server catalog.
 - **What becomes a candidate:**
   - Updates — any owned title the server already carries where Meta has a newer version.
   - New titles — only entitlements that were **paid**: purchases, preorders, cross-buy grants, and subscription (Horizon+) claims. Free downloads, promo keys, and trial grants never contribute a title the server does not already have, and neither do demos — even the ones Meta grants through a paid-style offer.
-- **Download & contribute:** selected titles download their APK and data files from Meta's entitled CDN into the uploads cache — classic OBB files as well as data shipped under its own name (Unreal `.pak` chunks, named OBBs like `Sounds.obb`) — and enter the normal contribution pipeline (HWID metadata, archive creation, `upload.config` upload) unchanged. Downloaded versions are cached, so re-checks never re-download, and every successfully contributed version is recorded so it is never uploaded twice; a newer version still gets offered.
+- **Download & contribute:** selected titles download their APK and data files from Meta's entitled CDN into the uploads cache — classic OBB files as well as data shipped under its own name (Unreal `.pak` chunks, named OBBs like `Sounds.obb`) — plus the files of store add-ons the account owns (e.g. music packs), and enter the normal contribution pipeline (HWID metadata, archive creation, `upload.config` upload) unchanged. Downloads are resumable (an interrupted multi-gigabyte OBB continues from where it stopped) and size-verified, disk space is checked before the transfer starts, downloaded versions are cached so re-checks never re-download, and every successfully contributed version is recorded so it is never uploaded twice; a newer version still gets offered.
 - Tokens are never written to logs, and download URLs carrying the token are not logged either.
 
 ---

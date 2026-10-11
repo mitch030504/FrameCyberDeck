@@ -55,6 +55,8 @@ interface EntitlementsResponse {
 interface BinaryAssetFile {
   id: string
   file_name?: string
+  /** Byte size as a decimal string, when Meta reports it. */
+  size?: string | number
   /** Rich query only: false marks optional content the Quest installer skips. */
   is_required?: boolean | null
   /** Rich query only: set for entitlement-gated store DLC. */
@@ -64,13 +66,58 @@ interface BinaryAssetFile {
 interface BinaryDetailsResponse {
   data?: {
     node?: {
-      obb_binary?: { id: string; file_name?: string } | null
+      /** Byte size of the APK itself, when Meta reports it. */
+      size?: string | number
+      obb_binary?: { id: string; file_name?: string; size?: string | number } | null
       asset_files?: { nodes?: BinaryAssetFile[] }
     }
   }
 }
 
 type BinaryDetailsNode = NonNullable<NonNullable<BinaryDetailsResponse['data']>['node']>
+
+// Add-ons (iap items) for an app: this doc now only lists the packs and
+// whether the viewer is entitled to them — file metadata is no longer part
+// of the response. The pack a file belongs to comes from the rich binary
+// query's iap_item link, which is what ties owned packs to their files.
+const DOC_DLC = '3853229151363174'
+
+interface DlcItem {
+  id?: string
+  is_viewer_entitled?: boolean
+}
+
+interface DlcResponse {
+  data?: {
+    node?: {
+      latest_supported_binary?: {
+        firstIapItems?: { edges?: { node?: DlcItem }[]; nodes?: DlcItem[] }
+      }
+      firstIapItems?: { edges?: { node?: DlcItem }[]; nodes?: DlcItem[] }
+      iap_items?: { nodes?: DlcItem[] }
+    }
+  }
+}
+
+/**
+ * A release file name Meta can be trusted with: no path traversal, control
+ * characters, Windows-reserved device names, or trailing dots/spaces that
+ * break later extraction. Returns null when the name cannot be used.
+ */
+export function safeFileName(raw: string): string | null {
+  if (
+    !raw ||
+    raw.length > 220 ||
+    // Control characters are exactly what this check exists to reject.
+    // eslint-disable-next-line no-control-regex
+    /[<>:"/\\|?*\x00-\x1f]/.test(raw) ||
+    /[. ]$/.test(raw) ||
+    /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(raw)
+  ) {
+    return null
+  }
+  return raw
+}
 
 export interface EntitledTitle {
   appId: string
@@ -232,16 +279,153 @@ class MetaSyncService {
     }
   }
 
-  private async downloadBinary(id: string, destination: string, token: string): Promise<void> {
+  /**
+   * Download one Meta file with resume support (adapted from AXRB's
+   * download.mjs, GPLv3): bytes land in a `.part` file next to an
+   * `{size, etag}` sidecar. A retry continues from the byte offset when the
+   * ETag still matches; the part file is only renamed over the destination
+   * once its exact size has arrived, so an interrupted download can never be
+   * mistaken for a complete one.
+   */
+  private async downloadBinary(
+    id: string,
+    destination: string,
+    token: string,
+    expectedSize = 0,
+    onProgress?: (received: number, total: number) => void
+  ): Promise<void> {
+    const part = `${destination}.part`
+    const sidecar = `${part}.json`
     // The token is a query parameter; never log this URL.
-    const response = await fetch(
-      `${DOWNLOAD_URI}?id=${id}&access_token=${encodeURIComponent(token)}`,
-      { headers: { 'User-Agent': 'OculusGraphQLApiLib/1.0' } }
-    )
+    const url = `${DOWNLOAD_URI}?id=${id}&access_token=${encodeURIComponent(token)}`
+
+    let offset = 0
+    let resumeEtag = ''
+    try {
+      const meta = JSON.parse(await fs.readFile(sidecar, 'utf-8')) as {
+        size?: number
+        etag?: string
+      }
+      const stat = await fs.stat(part)
+      // Only resume against a stable ETag with the expected size on record.
+      if (
+        expectedSize &&
+        meta.size === expectedSize &&
+        meta.etag &&
+        !meta.etag.startsWith('W/') &&
+        stat.size <= expectedSize
+      ) {
+        offset = stat.size
+        resumeEtag = meta.etag
+      }
+    } catch {
+      /* no previous attempt: start from scratch */
+    }
+
+    const headers: Record<string, string> = { 'User-Agent': 'OculusGraphQLApiLib/1.0' }
+    if (offset) {
+      headers.Range = `bytes=${offset}-`
+      headers['If-Range'] = resumeEtag
+    }
+    const response = await fetch(url, { headers })
     if (!response.ok || !response.body) {
       throw new Error(`Download failed (${response.status})`)
     }
-    await pipeline(Readable.fromWeb(response.body as never), createWriteStream(destination))
+    if (response.status === 206) {
+      const range = response.headers.get('content-range')?.match(/^bytes (\d+)-(\d+)\/(\d+)$/)
+      if (!range || Number(range[1]) !== offset) {
+        throw new Error('Server returned an inconsistent download range.')
+      }
+    } else if (offset) {
+      offset = 0 // server ignored the range: restart the file from scratch
+    }
+    await fs.writeFile(
+      sidecar,
+      JSON.stringify({ size: expectedSize, etag: response.headers.get('etag') || '' })
+    )
+
+    // Abort after 30 minutes without a chunk; a slow transfer is fine, a dead
+    // one must not hang the sync forever.
+    const idle = new AbortController()
+    const timer = setTimeout(
+      () => idle.abort(new Error('Download stalled for 30 minutes.')),
+      30 * 60 * 1000
+    )
+    let received = offset
+    try {
+      await pipeline(
+        async function* () {
+          for await (const chunk of Readable.fromWeb(response.body as never)) {
+            idle.signal.throwIfAborted()
+            timer.refresh()
+            received += chunk.length
+            if (expectedSize && received > expectedSize) {
+              throw new Error('Download exceeded its expected size.')
+            }
+            onProgress?.(received, expectedSize)
+            yield chunk
+          }
+        },
+        createWriteStream(part, { flags: offset ? 'a' : 'w' }),
+        { signal: idle.signal }
+      )
+      if (!received || (expectedSize && received !== expectedSize)) {
+        throw new Error('Download ended before the complete file arrived.')
+      }
+    } catch (error) {
+      // Keep the part file and sidecar so a retry can resume.
+      const reason = idle.signal.aborted ? idle.signal.reason : error
+      throw reason instanceof Error ? reason : new Error(String(reason))
+    } finally {
+      clearTimeout(timer)
+    }
+    await fs.rename(part, destination)
+    await fs.rm(sidecar, { force: true })
+  }
+
+  /**
+   * A release is downloaded, then copied into upload staging and zipped:
+   * require room for roughly two copies before starting a multi-gigabyte
+   * fetch, instead of failing halfway through.
+   */
+  private async assertFreeSpace(directory: string, bytes: number): Promise<void> {
+    if (!bytes) return
+    const stats = await fs.statfs(directory)
+    const free = Number(stats.bavail) * Number(stats.bsize)
+    if (free < bytes * 2) {
+      throw new Error(
+        `Not enough disk space: this release needs about ${(bytes / 1e9).toFixed(1)} GB plus the same again for upload staging.`
+      )
+    }
+  }
+
+  /**
+   * Store add-on (DLC) ids this account is entitled to, so paid add-on
+   * files (e.g. music packs) reach the server along with the base release.
+   * A failed lookup only drops add-ons for that title, never the release.
+   */
+  private async fetchOwnedDlcItemIds(appId: string, token: string): Promise<Set<string>> {
+    const owned = new Set<string>()
+    if (!appId) return owned
+    try {
+      const response = await graphRequest<DlcResponse>(
+        DOC_DLC,
+        { id: appId, first: 200, last: null, after: null, before: null, forward: true },
+        token
+      )
+      const binary = response.data?.node?.latest_supported_binary ?? response.data?.node
+      const items = [
+        ...(binary?.firstIapItems?.edges ?? []).map((edge) => edge.node),
+        ...(binary?.firstIapItems?.nodes ?? []),
+        ...(response.data?.node?.iap_items?.nodes ?? [])
+      ]
+      for (const item of items) {
+        if (item?.id && item.is_viewer_entitled) owned.add(item.id)
+      }
+    } catch (error) {
+      console.warn(`[MetaSync] Could not check owned add-ons for ${appId}:`, error)
+    }
+    return owned
   }
 
   private async pathExists(path: string): Promise<boolean> {
@@ -287,32 +471,73 @@ class MetaSyncService {
               })
 
             const { node, lean } = await this.fetchBinaryDetails(candidate.binaryId, token)
-            // Required files only: optional store DLC is entitlement-gated and
-            // is not part of the release the Quest installer downloads.
+            // Required files plus owned add-ons: a store-DLC file needs its
+            // pack's entitlement; optional non-DLC content the Quest installer
+            // skips stays off the server.
+            const ownedDlcIds = lean
+              ? new Set<string>() // no asset names on this path, so no add-ons
+              : await this.fetchOwnedDlcItemIds(candidate.appId, token)
             const assets = lean
               ? // Lean nodes carry no file names; such binaries (huge DLC
                 // lists, e.g. Beat Saber) ship the base game as APK + OBB.
                 []
-              : (node.asset_files?.nodes ?? []).filter(
-                  (file) => file.is_required !== false && !file.iap_item
-                )
-            const obbs = [...(node.obb_binary ? [node.obb_binary] : []), ...assets].map(
-              (file, index) => ({
-                ...file,
-                // Releases ship data under their own names (Unity bundles, Unreal
-                // .pak chunks, Sounds.obb), not the classic main.<pkg>.obb form.
-                name: basename(file.file_name || `data${index}.obb`)
-              })
-            )
+              : (node.asset_files?.nodes ?? []).filter((file) => {
+                  const dlcId = file.iap_item?.id
+                  return dlcId ? ownedDlcIds.has(dlcId) : file.is_required !== false
+                })
+            // Releases ship data under their own names (Unity bundles, Unreal
+            // .pak chunks, Sounds.obb), not the classic main.<pkg>.obb form.
+            const obbs: (BinaryAssetFile & { name: string })[] = []
+            const seenNames = new Set<string>()
+            for (const [index, file] of [
+              ...(node.obb_binary ? [node.obb_binary] : []),
+              ...assets
+            ].entries()) {
+              // An unsafe name falls back to a generic one instead of
+              // blocking the release; duplicates are dropped.
+              const name =
+                safeFileName(basename(file.file_name || `data${index}.obb`)) ?? `data${index}.obb`
+              if (seenNames.has(name)) continue
+              seenNames.add(name)
+              obbs.push({ ...file, name })
+            }
 
+            // A release is downloaded, then copied into upload staging and
+            // zipped: require room for roughly two copies before starting.
+            const totalSize = [
+              Number(node.size) || 0,
+              ...obbs.map((file) => Number(file.size) || 0)
+            ].reduce((sum, size) => sum + size, 0)
+            await this.assertFreeSpace(stageDir, totalSize)
+
+            const apkSize = Number(node.size) || 0
             emit('Downloading APK', 0)
-            await this.downloadBinary(candidate.binaryId, apkPath, token)
+            await this.downloadBinary(
+              candidate.binaryId,
+              apkPath,
+              token,
+              apkSize,
+              (received, total) => {
+                emit('Downloading APK', total ? Math.round((received / total) * 10) : 0)
+              }
+            )
             emit('Downloading data files', 10)
             let done = 0
             for (const obb of obbs) {
-              await this.downloadBinary(obb.id, join(stageDir, obb.name), token)
+              await this.downloadBinary(
+                obb.id,
+                join(stageDir, obb.name),
+                token,
+                Number(obb.size) || 0,
+                (received, total) => {
+                  const fraction = total ? received / total : 0
+                  emit(
+                    'Downloading data files',
+                    10 + Math.round(((done + fraction) / obbs.length) * 80)
+                  )
+                }
+              )
               done++
-              emit('Downloading data files', 10 + Math.round((done / obbs.length) * 80))
             }
             await fs.writeFile(join(stageDir, '.complete'), new Date().toISOString(), 'utf-8')
           }

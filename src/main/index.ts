@@ -753,9 +753,9 @@ app.whenReady().then(async () => {
   // --- Meta account / owned-titles sync handlers ---
   typedIpcMain.handle('meta-account:get-status', () => metaAccountService.getStatus())
 
-  typedIpcMain.handle('meta-account:login-browser', async () => {
-    console.log('[IPC] Opening Meta sign-in window')
-    return metaAccountService.loginWithBrowser()
+  typedIpcMain.handle('meta-account:login-sso', async () => {
+    console.log('[IPC] Opening Meta native SSO sign-in window')
+    return metaAccountService.loginWithSso()
   })
 
   typedIpcMain.handle('meta-account:login-token', async (_event, token) => {

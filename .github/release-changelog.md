@@ -12,9 +12,10 @@
 
 **Meta owned-title sync**
 
-- Sign in to your Meta account from the uploads view (in-app browser login with 2FA, or paste a user token). The token is stored encrypted through the OS keychain; passwords never touch the app.
+- Sign in to your Meta account through Meta's native SSO flow — the login page (2FA included) is Meta's own, the app only receives the resulting session. If sign-in is unavailable, paste a user token. The token is stored encrypted through the OS keychain; passwords never touch the app.
 - "Sync Meta Library" compares your owned Quest titles against the server catalog: updates for anything the server already carries, plus new titles you actually paid for (purchases, preorders, cross-buy, and Horizon+ subscription claims — free downloads and demos stay off the server).
-- Selected titles download their APK and data files from Meta's entitled CDN — classic OBBs as well as releases that ship data under their own names (Unreal `.pak` chunks, named OBBs) — and go through the regular contribution pipeline. Downloaded versions are cached and never re-fetched, and successfully contributed versions are recorded so they are never uploaded twice.
+- Selected titles download their APK and data files from Meta's entitled CDN — classic OBBs as well as releases that ship data under their own names (Unreal `.pak` chunks, named OBBs) — plus the files of owned store add-ons such as music packs. Downloads are resumable and size-verified, disk space is checked up front, and contributed versions are recorded so they are never uploaded twice.
+- The native SSO protocol and resumable download logic are adapted from AXRB (GPLv3).
 
 **Steam Frame fixes**
 

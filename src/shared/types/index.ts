@@ -491,7 +491,7 @@ export interface MetaLoginResult {
 
 export interface MetaSyncAPI {
   getAccountStatus: () => Promise<MetaAccountStatus>
-  loginWithBrowser: () => Promise<MetaLoginResult>
+  loginWithSso: () => Promise<MetaLoginResult>
   loginWithToken: (token: string) => Promise<MetaLoginResult>
   logout: () => Promise<void>
   findUpdates: () => Promise<{ candidates: MetaSyncCandidate[]; error?: string }>
