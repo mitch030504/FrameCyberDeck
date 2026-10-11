@@ -83,7 +83,9 @@ class FrameConversionService {
     const helper = this.getHelperPath()
     if (!existsSync(helper)) throw new Error(`Frame conversion helper is missing: ${helper}`)
 
-    const base = join(app.getPath('temp'), 'frame-cyberdeck-converted')
+    // Stage on the real disk, not the OS temp dir: /tmp is a small tmpfs on
+    // many Linux distros, and a large game's OBBs overflow it mid-copy.
+    const base = join(app.getPath('userData'), 'frame-cyberdeck-converted')
     await fs.mkdir(base, { recursive: true })
     const safeTitle =
       title
