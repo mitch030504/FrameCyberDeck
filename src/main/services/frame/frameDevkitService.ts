@@ -3,6 +3,7 @@ import { promises as fs } from 'fs'
 import { basename, dirname, join, resolve } from 'path'
 import { execa } from 'execa'
 import type { PackageInfo } from '@shared/types'
+import adbService from '../adbService'
 
 export interface FrameDevkitStatus {
   ok: boolean
@@ -112,6 +113,43 @@ class FrameDevkitService {
     )
   }
 
+  /**
+   * Devkit endpoint forwarded over the Frame's USB ADB connection, so
+   * deploys ride the USB cable instead of Wi-Fi. Fixed local ports keep the
+   * forward list from growing; adb silently rebinds an existing forward.
+   */
+  private async usbDevkitEndpoint(): Promise<{
+    host: string
+    port: number
+    sshPort: number
+  } | null> {
+    try {
+      const devices = await adbService.listDevices()
+      // USB serials contain no ':' — network adb devices are 'host:port'.
+      const frame = devices.find(
+        (device) => device.isSteamFrame && device.type === 'device' && !device.id.includes(':')
+      )
+      if (!frame) return null
+      const httpPort = (
+        await adbService.runLocalAdbCommand(`-s ${frame.id} forward tcp:43200 tcp:32000`)
+      ).trim()
+      const sshPort = (
+        await adbService.runLocalAdbCommand(`-s ${frame.id} forward tcp:43222 tcp:22`)
+      ).trim()
+      if (!/^\d+$/.test(httpPort) || !/^\d+$/.test(sshPort)) return null
+      console.log(
+        `[Frame Devkit] Using USB ADB forwards for ${frame.id}: devkit=:${httpPort}, ssh=:${sshPort}`
+      )
+      return { host: '127.0.0.1', port: Number(httpPort), sshPort: Number(sshPort) }
+    } catch (error) {
+      console.warn(
+        '[Frame Devkit] USB devkit endpoint unavailable, falling back to hostname:',
+        error instanceof Error ? error.message : String(error)
+      )
+      return null
+    }
+  }
+
   private async bridge<T extends { ok: boolean; error?: string }>(
     command: string,
     args: string[] = [],
@@ -120,10 +158,29 @@ class FrameDevkitService {
     const python = await this.resolvePython()
     const helper = this.getHelperPath()
 
+    // Prefer the USB cable when a Frame is attached over ADB; an explicit
+    // FRAME_CYBERDECK_HOST override keeps direct hostname access.
+    let bridgeHost = host
+    let bridgeArgs: string[] = []
+    if (!process.env.FRAME_CYBERDECK_HOST?.trim()) {
+      const usb = await this.usbDevkitEndpoint()
+      if (usb) {
+        bridgeHost = usb.host
+        bridgeArgs = ['--port', String(usb.port), '--ssh-port', String(usb.sshPort)]
+      }
+    }
+
     let stdout = ''
     let stderr = ''
     try {
-      const result = await execa(python, [helper, '--host', host, command, ...args])
+      const result = await execa(python, [
+        helper,
+        '--host',
+        bridgeHost,
+        ...bridgeArgs,
+        command,
+        ...args
+      ])
       stdout = result.stdout
       stderr = result.stderr
     } catch (error) {

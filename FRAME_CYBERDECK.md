@@ -11,7 +11,7 @@ Frame CyberDeck is the Steam Frame-focused fork of VR CyberDeck.
 - Injects the prebuilt FrameBridge adapter from FramePort, pinned to commit `5424e429e46e53fe51497babac124dd91dbb73bf` and SHA-256-verified against FramePort's manifest. Its passthrough emulation and swapchain fixes are built in; no separate compatibility wrapper is needed.
 - Invalidates cached adapters that do not match the pinned SHA-256.
 - Supports optional per-game refresh-rate requests: runtime default, 72, 80, 90, 96, 108, 120 or 144 Hz.
-- Deploys converted titles through SteamOS Devkit and the `fauxdroid` runtime.
+- Deploys converted titles through SteamOS Devkit and the `fauxdroid` runtime. When the Frame is attached over USB, devkit traffic (HTTP, SSH, rsync) is tunneled through ADB port forwards on the cable instead of Wi-Fi.
 - Tracks managed package/version/title metadata.
 - Preserves original-source provenance for contribution workflows.
 

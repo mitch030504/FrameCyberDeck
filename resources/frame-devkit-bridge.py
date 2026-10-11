@@ -66,6 +66,7 @@ def ssh_command(
     command: str,
     *,
     check: bool = True,
+    port: int = 22,
 ) -> subprocess.CompletedProcess[str]:
     key = private_key_path()
     if not key.is_file():
@@ -86,6 +87,8 @@ def ssh_command(
             "IdentitiesOnly=yes",
             "-o",
             f"ConnectTimeout={REQUEST_TIMEOUT}",
+            "-p",
+            str(port),
             "-i",
             str(key),
             f"{login}@{host}",
@@ -98,7 +101,7 @@ def ssh_command(
     )
 
 
-def status(host: str, port: int) -> dict:
+def status(host: str, port: int, ssh_port: int = 22) -> dict:
     address, props = devkit_endpoint(host, port)
     login = str(props.get("login") or "steamos")
     key = private_key_path()
@@ -114,7 +117,7 @@ def status(host: str, port: int) -> dict:
         pair_error = "ssh is not installed on the host"
     else:
         try:
-            result = ssh_command(address, login, "true", check=False)
+            result = ssh_command(address, login, "true", check=False, port=ssh_port)
             paired = result.returncode == 0
             if not paired:
                 pair_error = (result.stderr or result.stdout or "SSH authentication failed").strip()
@@ -153,10 +156,11 @@ def deploy(
     directory: str,
     start_command: str,
     start: bool,
+    ssh_port: int = 22,
 ) -> None:
     require_tools()
     name = validate_gameid(name)
-    current = status(host, port)
+    current = status(host, port, ssh_port)
     if not current["paired"]:
         fail(
             "Steam Frame is reachable but not paired for Devkit SSH: "
@@ -177,6 +181,7 @@ def deploy(
             login,
             "python3 ~/devkit-utils/steamos-prepare-upload "
             f"--gameid {shlex.quote(name)} --restart-steam 0",
+            port=ssh_port,
         )
         prepared = json.loads(prep.stdout)
         remote_user = str(prepared["user"])
@@ -187,6 +192,8 @@ def deploy(
             shlex.quote(part)
             for part in [
                 "ssh",
+                "-p",
+                str(ssh_port),
                 "-o",
                 "StrictHostKeyChecking=no",
                 "-o",
@@ -231,6 +238,7 @@ def deploy(
             login,
             "python3 ~/devkit-utils/steam-client-create-shortcut "
             f"--parms {shortcut_json}",
+            port=ssh_port,
         )
         create_result = json.loads(created.stdout)
         if "error" in create_result:
@@ -242,6 +250,7 @@ def deploy(
                 login,
                 "python3 ~/devkit-utils/steam-devkit-rpc run-game "
                 f"gameid={shlex.quote(name)}",
+                port=ssh_port,
             )
 
     except subprocess.CalledProcessError as exc:
@@ -268,8 +277,8 @@ def deploy(
     )
 
 
-def list_games_data(host: str, port: int) -> tuple[dict, list[dict]]:
-    current = status(host, port)
+def list_games_data(host: str, port: int, ssh_port: int = 22) -> tuple[dict, list[dict]]:
+    current = status(host, port, ssh_port)
     if not current["paired"]:
         fail(
             "Steam Frame is reachable but not paired for Devkit SSH: "
@@ -282,6 +291,7 @@ def list_games_data(host: str, port: int) -> tuple[dict, list[dict]]:
         address,
         login,
         "python3 ~/devkit-utils/steamos-list-games",
+        port=ssh_port,
     )
     raw_games = json.loads(result.stdout)
     games: list[dict] = []
@@ -301,6 +311,7 @@ def list_games_data(host: str, port: int) -> tuple[dict, list[dict]]:
             + quoted_gameid
             + '/frame-conversion.json 2>/dev/null || true',
             check=False,
+            port=ssh_port,
         )
         metadata: dict = {}
         text = (metadata_result.stdout or "").strip()
@@ -337,14 +348,14 @@ def list_games_data(host: str, port: int) -> tuple[dict, list[dict]]:
     return current, games
 
 
-def list_games(host: str, port: int) -> None:
-    _, games = list_games_data(host, port)
+def list_games(host: str, port: int, ssh_port: int = 22) -> None:
+    _, games = list_games_data(host, port, ssh_port)
     emit({"ok": True, "games": games})
 
 
-def delete_game(host: str, port: int, name: str) -> None:
+def delete_game(host: str, port: int, name: str, ssh_port: int = 22) -> None:
     validate_gameid(name)
-    current, games = list_games_data(host, port)
+    current, games = list_games_data(host, port, ssh_port)
     if not any(game["gameid"] == name for game in games):
         fail(f"Devkit title not found: {name}")
 
@@ -355,6 +366,7 @@ def delete_game(host: str, port: int, name: str) -> None:
             address,
             login,
             "python3 ~/devkit-utils/steamos-delete --delete-title " + shlex.quote(name),
+            port=ssh_port,
         )
         quoted_name = shlex.quote(name)
         ssh_command(
@@ -366,6 +378,7 @@ def delete_game(host: str, port: int, name: str) -> None:
             + quoted_name
             + '-settings.json',
             check=False,
+            port=ssh_port,
         )
     except subprocess.CalledProcessError as exc:
         detail = (
@@ -378,9 +391,9 @@ def delete_game(host: str, port: int, name: str) -> None:
     emit({"ok": True, "name": name})
 
 
-def run_game(host: str, port: int, name: str) -> None:
+def run_game(host: str, port: int, name: str, ssh_port: int = 22) -> None:
     validate_gameid(name)
-    current, games = list_games_data(host, port)
+    current, games = list_games_data(host, port, ssh_port)
     if not any(game["gameid"] == name for game in games):
         fail(f"Devkit title not found: {name}")
 
@@ -390,6 +403,7 @@ def run_game(host: str, port: int, name: str) -> None:
             str(current["login"]),
             "python3 ~/devkit-utils/steam-devkit-rpc run-game "
             f"gameid={shlex.quote(name)}",
+            port=ssh_port,
         )
     except subprocess.CalledProcessError as exc:
         detail = (
@@ -406,6 +420,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Frame CyberDeck SteamOS Devkit bridge")
     p.add_argument("--host", default="frame")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument("--ssh-port", type=int, default=22)
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("status")
     sub.add_parser("list")
@@ -424,13 +439,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     if args.command == "status":
-        emit(status(args.host, args.port))
+        emit(status(args.host, args.port, args.ssh_port))
     elif args.command == "list":
-        list_games(args.host, args.port)
+        list_games(args.host, args.port, args.ssh_port)
     elif args.command == "delete":
-        delete_game(args.host, args.port, args.name)
+        delete_game(args.host, args.port, args.name, args.ssh_port)
     elif args.command == "run":
-        run_game(args.host, args.port, args.name)
+        run_game(args.host, args.port, args.name, args.ssh_port)
     elif args.command == "deploy":
         deploy(
             args.host,
@@ -439,6 +454,7 @@ def main() -> None:
             args.directory,
             args.start_command,
             args.start,
+            args.ssh_port,
         )
     else:
         fail(f"Unknown command: {args.command}")
