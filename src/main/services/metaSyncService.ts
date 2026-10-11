@@ -70,6 +70,20 @@ export interface EntitledTitle {
 }
 
 /**
+ * Demo detection for new-title candidates: Meta grants some demos through
+ * PAID_OFFER, so the grant reason alone does not exclude them. A demo's
+ * display name carries the word "demo"; its package's last segment ends with
+ * it (com.beatgames.beatsaber.demo, com.survios.CreedDemo).
+ */
+const DEMO_NAME = /\bdemo\b/i
+const DEMO_PACKAGE = /demo$/i
+
+function isDemoTitle(title: EntitledTitle): boolean {
+  const lastSegment = title.packageName.split('.').pop() ?? ''
+  return DEMO_NAME.test(title.displayName) || DEMO_PACKAGE.test(lastSegment)
+}
+
+/**
  * Grant reasons that mark a purchase: only these justify adding a title
  * that is not on the server yet. Free downloads (NUX, UNKNOWN, promo keys)
  * stay off the server. Updates to titles the server already carries are
@@ -100,7 +114,7 @@ export function selectCandidates(
   for (const title of entitledTitles) {
     const serverVersion = serverVersionByPackage.get(title.packageName)
     if (serverVersion !== undefined && title.versionCode <= serverVersion) continue
-    if (serverVersion === undefined && !isPaidGrantReason(title.grantReason)) continue
+    if (serverVersion === undefined && (isDemoTitle(title) || !isPaidGrantReason(title.grantReason))) continue
     if (isBlacklisted(title.packageName, title.versionCode)) continue
     candidates.push({
       packageName: title.packageName,

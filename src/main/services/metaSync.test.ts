@@ -112,6 +112,53 @@ describe('selectCandidates', () => {
     expect(candidates.map((candidate) => candidate.packageName)).toEqual(['com.new.game'])
   })
 
+  it('skips paid-granted demos as new titles but offers updates for demos already on the server', () => {
+    const demoTitles = [
+      {
+        appId: '888',
+        displayName: 'Beat Saber - Demo',
+        packageName: 'com.beatgames.beatsaber.demo',
+        versionCode: 10,
+        version: '1.0',
+        binaryId: 'b8',
+        grantReason: 'PAID_OFFER'
+      },
+      {
+        appId: '999',
+        displayName: 'Creed Demo',
+        packageName: 'com.survios.CreedDemo',
+        versionCode: 4,
+        version: '0.9',
+        binaryId: 'b9',
+        grantReason: 'PAID_OFFER'
+      },
+      {
+        appId: '121',
+        displayName: 'Store Demo',
+        packageName: 'com.store.demo',
+        versionCode: 6,
+        version: '1.1',
+        binaryId: 'b12',
+        grantReason: 'PAID_OFFER'
+      }
+    ]
+    const never = (): boolean => false
+    expect(selectCandidates(demoTitles, [], never)).toEqual([])
+
+    const candidates = selectCandidates(
+      demoTitles,
+      [{ packageName: 'com.store.demo', versionCode: 5 }],
+      never
+    )
+    expect(candidates).toEqual([
+      expect.objectContaining({
+        packageName: 'com.store.demo',
+        kind: 'update',
+        serverVersionCode: 5
+      })
+    ])
+  })
+
   it('keeps an older owned version when the server is newer', () => {
     const candidates = selectCandidates(
       [
