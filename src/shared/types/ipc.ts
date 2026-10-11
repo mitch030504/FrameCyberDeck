@@ -84,10 +84,6 @@ export interface IPCChannels {
   'games:get-last-sync-time': DefineChannel<[], Date | null>
   'games:force-sync-games': DefineChannel<[], GameInfo[]>
   'games:get-note': DefineChannel<[releaseName: string], string>
-  'games:get-trailer-url': DefineChannel<
-    [gameName: string, packageName: string | undefined],
-    string | null
-  >
   'games:get-description': DefineChannel<[request: GameDescriptionRequest], GameDescriptionResult>
   'games:prime-descriptions': DefineChannel<
     [requests: GameDescriptionRequest[]],
@@ -117,6 +113,7 @@ export interface IPCChannels {
     [packageName: string, gameName: string, versionCode: number, deviceId: string],
     string | null
   >
+  'upload:retry': DefineChannel<[packageName: string], boolean>
   'upload:get-queue': DefineChannel<[], UploadItem[]>
   'upload:add-to-queue': DefineChannel<
     [packageName: string, gameName: string, versionCode: number, deviceId: string],
@@ -151,7 +148,10 @@ export interface IPCChannels {
   'settings:get-existing-download-action': DefineChannel<[], ExistingDownloadAction>
   'settings:set-existing-download-action': DefineChannel<[v: ExistingDownloadAction], void>
   'settings:get-download-proxy': DefineChannel<[], DownloadProxySettings>
-  'settings:set-download-proxy': DefineChannel<[settings: DownloadProxySettings], DownloadProxySettings>
+  'settings:set-download-proxy': DefineChannel<
+    [settings: DownloadProxySettings],
+    DownloadProxySettings
+  >
   'settings:get-frame-conversion': DefineChannel<[], FrameConversionSettings>
   'settings:set-frame-conversion': DefineChannel<
     [settings: FrameConversionSettings],
@@ -223,6 +223,7 @@ export interface IPCChannels {
 
 // Types for send (no response) channels
 export interface IPCSendChannels {
+  'download:set-app-connection-state': { selectedDevice: string | null; isConnected: boolean }
   'adb:start-tracking-devices': void
   'adb:stop-tracking-devices': void
   'download:cancel': string

@@ -3,6 +3,7 @@
 import importlib.util
 import pathlib
 import unittest
+from unittest import mock
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location(
@@ -10,6 +11,30 @@ _spec = importlib.util.spec_from_file_location(
 )
 bridge = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bridge)
+
+
+class SecurityTest(unittest.TestCase):
+    def test_rejects_parent_game_ids(self):
+        for name in ('.', '..', '../other'):
+            with self.assertRaises(RuntimeError):
+                bridge.validate_gameid(name)
+        self.assertEqual(bridge.validate_gameid('com.test.game'), 'com.test.game')
+
+    def test_ssh_remembers_and_checks_host_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp)
+            key = home / '.config' / 'steamos-devkit' / 'devkit_rsa'
+            key.parent.mkdir(parents=True)
+            key.touch()
+            with mock.patch.object(bridge.pathlib.Path, 'home', return_value=home), mock.patch.object(bridge.subprocess, 'run') as run:
+                bridge.ssh_command('frame.local', 'deck', 'true')
+                command = run.call_args.args[0]
+                self.assertIn('StrictHostKeyChecking=accept-new', command)
+                self.assertEqual(command[command.index('--') + 1], 'deck@frame.local')
+                self.assertNotIn('StrictHostKeyChecking=no', command)
+                self.assertNotIn('UserKnownHostsFile=/dev/null', command)
+                self.assertTrue((home / '.ssh').is_dir())
+
 
 
 class RsyncPercentTest(unittest.TestCase):
@@ -114,26 +139,53 @@ class PolishShortcutTest(unittest.TestCase):
         self.assertEqual(result['patched'], ['1234'])
         self.assertEqual(result['title'], 'Test Game Deluxe')
 
-        data = open(os.path.join(config, 'shortcuts.vdf'), 'rb').read()
+        data = (pathlib.Path(config) / 'shortcuts.vdf').read_bytes()
         self.assertIn(b'Test Game Deluxe\x00', data)
         self.assertIn(b'Devkit Game: OtherGame\x00', data)
         grid = os.path.join(config, 'grid')
         for name in ('1111p.png', '1111_hero.png'):
-            self.assertEqual(open(os.path.join(grid, name), 'rb').read(), b'png-bytes')
+            self.assertEqual((pathlib.Path(grid) / name).read_bytes(), b'png-bytes')
         self.assertTrue(glob.glob(os.path.join(config, 'shortcuts.vdf.backup-*')))
         self.assertTrue(os.path.exists(os.path.join(tmp, 'systemctl-called')))
-        self.assertIn('restart steam.service', open(os.path.join(tmp, 'systemctl-called')).read())
+        self.assertIn('restart steam.service', (pathlib.Path(tmp) / 'systemctl-called').read_text())
 
     def test_no_match_leaves_everything_alone(self):
         entries = {'0': make_shortcut('OtherGame', 'Devkit Game: OtherGame', 2222)}
         tmp, config = self._sandbox(entries)
         vdf_path = os.path.join(config, 'shortcuts.vdf')
-        before = open(vdf_path, 'rb').read()
+        before = pathlib.Path(vdf_path).read_bytes()
 
         result, _env = run_polish(tmp, os.path.join(tmp, 'nowhere'), 'MissingGame')
         self.assertEqual(result['patched'], [])
-        self.assertEqual(open(vdf_path, 'rb').read(), before)
+        self.assertEqual(pathlib.Path(vdf_path).read_bytes(), before)
         self.assertFalse(os.path.exists(os.path.join(tmp, 'systemctl-called')))
+
+
+class TarStreamTest(unittest.TestCase):
+    def test_round_trip(self):
+        import io
+        import tarfile
+        import tempfile
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = pathlib.Path(tmp) / 'src'
+            (src / 'sub').mkdir(parents=True)
+            (src / 'game.apk').write_bytes(b'apk-bytes')
+            (src / 'sub' / 'data.obb').write_bytes(b'obb-bytes' * 100)
+            buffer = io.BytesIO()
+            percents = []
+            bridge.tar_stream(src, buffer, percents.append)
+            buffer.seek(0)
+            out = pathlib.Path(tmp) / 'out'
+            with tarfile.open(fileobj=buffer, mode='r|gz') as tar:
+                tar.extractall(out, filter='data')
+            names = sorted(str(q.relative_to(out)) for q in out.rglob('*') if q.is_file())
+            extracted = (out / 'sub' / 'data.obb').read_bytes()
+            self.assertEqual(names, ['game.apk', 'sub/data.obb'])
+            self.assertEqual(extracted, b'obb-bytes' * 100)
+            self.assertEqual(percents[-1], 99)
+
 
 if __name__ == '__main__':
     unittest.main()

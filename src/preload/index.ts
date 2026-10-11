@@ -1,5 +1,4 @@
-import { contextBridge, IpcRendererEvent, ipcRenderer, webFrame, webUtils } from 'electron'
-import { electronAPI } from '@electron-toolkit/preload'
+import { contextBridge, IpcRendererEvent, webFrame, webUtils } from 'electron'
 import {
   GameInfo,
   DeviceInfo,
@@ -126,8 +125,7 @@ const api = {
     getLastSyncTime: (): Promise<Date | null> =>
       typedIpcRenderer.invoke('games:get-last-sync-time'),
     forceSync: (): Promise<GameInfo[]> => typedIpcRenderer.invoke('games:force-sync-games'),
-    getTrailerUrl: (gameName: string, packageName: string | undefined): Promise<string | null> =>
-      typedIpcRenderer.invoke('games:get-trailer-url', gameName, packageName),
+
     getDescription: (request) => typedIpcRenderer.invoke('games:get-description', request),
     primeDescriptions: (requests) => typedIpcRenderer.invoke('games:prime-descriptions', requests),
     onDownloadProgress: (callback: (progress: DownloadProgress) => void): (() => void) => {
@@ -212,7 +210,7 @@ const api = {
     setDownloadPath: (path: string): void =>
       typedIpcRenderer.send('download:set-download-path', path),
     setAppConnectionState: (selectedDevice: string | null, isConnected: boolean): void =>
-      ipcRenderer.send('download:set-app-connection-state', selectedDevice, isConnected),
+      typedIpcRenderer.send('download:set-app-connection-state', { selectedDevice, isConnected }),
     setSideloadingDisabled: (disabled: boolean): void =>
       typedIpcRenderer.send('download:set-sideloading-disabled', disabled)
   } satisfies DownloadAPIRenderer,
@@ -235,6 +233,8 @@ const api = {
       typedIpcRenderer.invoke('upload:add-to-queue', packageName, gameName, versionCode, deviceId),
     removeFromQueue: (packageName: string): void =>
       typedIpcRenderer.send('upload:remove', packageName),
+    retryUpload: (packageName: string): Promise<boolean> =>
+      typedIpcRenderer.invoke('upload:retry', packageName),
     cancelUpload: (packageName: string): void =>
       typedIpcRenderer.send('upload:cancel', packageName),
     addLocalItemsToQueue: (paths: string[]): Promise<{ errors: LocalUploadError[] }> =>
@@ -315,7 +315,8 @@ const api = {
     setExistingDownloadAction: (v) =>
       typedIpcRenderer.invoke('settings:set-existing-download-action', v),
     getDownloadProxy: () => typedIpcRenderer.invoke('settings:get-download-proxy'),
-    setDownloadProxy: (settings) => typedIpcRenderer.invoke('settings:set-download-proxy', settings),
+    setDownloadProxy: (settings) =>
+      typedIpcRenderer.invoke('settings:set-download-proxy', settings),
     getFrameConversionSettings: (): Promise<FrameConversionSettings> =>
       typedIpcRenderer.invoke('settings:get-frame-conversion'),
     setFrameConversionSettings: (
@@ -447,14 +448,11 @@ const api = {
 // just add to the DOM global.
 if (process.contextIsolated) {
   try {
-    contextBridge.exposeInMainWorld('electron', electronAPI)
     contextBridge.exposeInMainWorld('api', api)
   } catch (error) {
     console.error(error)
   }
 } else {
-  // @ts-ignore (define in d.ts file for type safety)
-  window.electron = electronAPI
   // @ts-ignore (define in d.ts file for type safety)
   window.api = api
 }

@@ -91,97 +91,41 @@ class DependencyService {
     }
     this.serviceStatus = 'INITIALIZING'
     console.log('Initializing DependencyService...')
-    // Ensure userData bin directory exists for downloads like rclone
-    await fsPromises.mkdir(this.binDir, { recursive: true })
+    try {
+      // Ensure userData bin directory exists for downloads like rclone
+      await fsPromises.mkdir(this.binDir, { recursive: true })
 
-    // Check network connectivity first
-    await this.checkConnectivity(progressCallback)
+      this.checkBundled7zip()
 
-    this.checkBundled7zip()
+      await this.checkOrDownloadRclone(progressCallback)
 
-    await this.checkOrDownloadRclone(progressCallback)
+      await this.checkOrDownloadAdb(progressCallback)
 
-    await this.checkOrDownloadAdb(progressCallback)
+      console.log('DependencyService initialization finished.')
+      this.serviceStatus = 'INITIALIZED'
 
-    console.log('DependencyService initialization finished.')
-    this.serviceStatus = 'INITIALIZED'
+      // Check if all dependencies are ready after initialization
+      if (!this.status.sevenZip.ready || !this.status.rclone.ready || !this.status.adb.ready) {
+        // Throw an error or handle the situation where dependencies aren't ready
+        const missing: ('7zip' | 'rclone' | 'adb')[] = []
+        if (!this.status.sevenZip.ready) missing.push('7zip')
+        if (!this.status.rclone.ready) missing.push('rclone')
+        if (!this.status.adb.ready) missing.push('adb')
+        // Construct error message based on what failed
+        let errorMessage = `Dependency setup failed. Missing or failed: ${missing.join(', ')}. `
+        if (this.status.sevenZip.error) errorMessage += `7zip Error: ${this.status.sevenZip.error} `
+        if (this.status.rclone.error) errorMessage += `Rclone Error: ${this.status.rclone.error}`
+        if (this.status.adb.error) errorMessage += `ADB Error: ${this.status.adb.error}`
 
-    // Check if all dependencies are ready after initialization
-    if (!this.status.sevenZip.ready || !this.status.rclone.ready || !this.status.adb.ready) {
-      // Throw an error or handle the situation where dependencies aren't ready
-      const missing: ('7zip' | 'rclone' | 'adb')[] = []
-      if (!this.status.sevenZip.ready) missing.push('7zip')
-      if (!this.status.rclone.ready) missing.push('rclone')
-      if (!this.status.adb.ready) missing.push('adb')
-      // Construct error message based on what failed
-      let errorMessage = `Dependency setup failed. Missing or failed: ${missing.join(', ')}. `
-      if (this.status.sevenZip.error) errorMessage += `7zip Error: ${this.status.sevenZip.error} `
-      if (this.status.rclone.error) errorMessage += `Rclone Error: ${this.status.rclone.error}`
-      if (this.status.adb.error) errorMessage += `ADB Error: ${this.status.adb.error}`
-
-      console.error(errorMessage)
+        console.error(errorMessage)
+        this.serviceStatus = 'ERROR'
+        throw new Error(errorMessage) // Propagate error to caller
+      }
+    } catch (error) {
       this.serviceStatus = 'ERROR'
-      throw new Error(errorMessage) // Propagate error to caller
+      throw error
     }
     return this.serviceStatus
-  }
-
-  // --- Connectivity Check ---
-
-  private async checkConnectivity(progressCallback?: ProgressCallback): Promise<void> {
-    console.log('Checking network connectivity...')
-    progressCallback?.(this.status, { name: 'connectivity-check', percentage: 0 })
-
-    const criticalUrls = [{ url: 'https://raw.githubusercontent.com', name: 'GitHub' }]
-
-    const failedUrls: string[] = []
-    let completedChecks = 0
-
-    for (const { url, name } of criticalUrls) {
-      try {
-        console.log(`Testing connectivity to ${name}: ${url}`)
-        // A 301 from raw.githubusercontent.com to github.com would make the
-        // check test github.com instead — and github.com is IPv4-only, so it
-        // fails on networks that can only reach GitHub over IPv6. A redirect
-        // already proves the host is reachable; don't follow it.
-        await axios.get(url, {
-          timeout: 10000, // 10 second timeout
-          maxRedirects: 0,
-          validateStatus: (status) => status < 500, // Accept any non-server-error status
-          headers: {
-            'User-Agent': 'VRCyberDeck/2.0'
-          }
-        })
-        console.log(`✓ ${name} is reachable`)
-      } catch (error) {
-        console.error(
-          `✗ Failed to reach ${name} (${url}):`,
-          error instanceof Error ? error.message : String(error)
-        )
-        failedUrls.push(`${name} (${url})`)
-      }
-
-      completedChecks++
-      const percentage = Math.round((completedChecks / criticalUrls.length) * 100)
-      progressCallback?.(this.status, { name: 'connectivity-check', percentage })
-    }
-
-    if (failedUrls.length > 0) {
-      // Create a structured error message that the UI can format nicely
-      const errorMessage = `CONNECTIVITY_ERROR|${failedUrls.join('|')}`
-
-      console.error('Connectivity check failed. Cannot reach:', failedUrls)
-
-      // Set error on all dependencies since network is required
-      this.status.sevenZip.error = errorMessage
-      this.status.rclone.error = errorMessage
-      this.status.adb.error = errorMessage
-
-      throw new Error(errorMessage)
-    }
-
-    console.log('✓ All critical URLs are reachable')
-    progressCallback?.(this.status, { name: 'connectivity-check', percentage: 100 })
   }
 
   // --- 7zip ---

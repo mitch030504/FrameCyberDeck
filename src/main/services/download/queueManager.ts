@@ -1,18 +1,16 @@
 import { join } from 'path'
 import { promises as fs, existsSync } from 'fs'
 import { app } from 'electron'
-import { debounce } from './utils'
+import { childPath, writeJsonAtomic } from '../fileSafety'
 import { DownloadItem } from '@shared/types'
 
 export class QueueManager {
   private queue: DownloadItem[] = []
   private queuePath: string
-  private debouncedSaveQueue: () => void
+  private saveTimer: ReturnType<typeof setTimeout> | undefined
 
   constructor() {
     this.queuePath = join(app.getPath('userData'), 'download-queue.json')
-    // Debounce saveQueue with 'this' bound correctly
-    this.debouncedSaveQueue = debounce(this.saveQueue.bind(this), 1000)
   }
 
   public async loadQueue(): Promise<void> {
@@ -20,6 +18,18 @@ export class QueueManager {
       if (existsSync(this.queuePath)) {
         const data = await fs.readFile(this.queuePath, 'utf-8')
         const loadedQueue: DownloadItem[] = JSON.parse(data)
+        if (!Array.isArray(loadedQueue)) throw new Error('Download queue must be an array')
+        for (const item of loadedQueue) {
+          if (!item || typeof item.releaseName !== 'string')
+            throw new Error('Invalid download queue entry')
+          try {
+            childPath('.', item.releaseName)
+          } catch {
+            item.status = 'Error'
+            item.error = 'Invalid release folder name'
+            item.pid = undefined
+          }
+        }
 
         // Do not prune entries merely because their paths are currently absent.
         // A configured download location may live on a removable drive that is
@@ -48,10 +58,17 @@ export class QueueManager {
     }
   }
 
-  private async saveQueue(): Promise<void> {
+  private scheduleSaveQueue(): void {
+    clearTimeout(this.saveTimer)
+    this.saveTimer = setTimeout(() => {
+      void this.saveQueue()
+    }, 1000)
+  }
+
+  public async saveQueue(): Promise<void> {
+    clearTimeout(this.saveTimer)
     try {
-      const data = JSON.stringify(this.queue, null, 2)
-      await fs.writeFile(this.queuePath, data, 'utf-8')
+      await writeJsonAtomic(this.queuePath, this.queue)
       // console.log('Download queue saved.'); // Maybe too noisy?
     } catch (error) {
       console.error('Error saving download queue:', error)
@@ -87,7 +104,7 @@ export class QueueManager {
 
     this.queue.splice(idx, 1)
     this.queue.splice(firstQueuedIdx, 0, item)
-    this.debouncedSaveQueue()
+    this.scheduleSaveQueue()
     return true
   }
 
@@ -105,7 +122,7 @@ export class QueueManager {
       if (this.queue[i].status === 'Queued') {
         this.queue.splice(idx, 1)
         this.queue.splice(i, 0, item)
-        this.debouncedSaveQueue()
+        this.scheduleSaveQueue()
         return true
       }
     }
@@ -124,7 +141,7 @@ export class QueueManager {
       if (this.queue[i].status === 'Queued') {
         this.queue.splice(idx, 1)
         this.queue.splice(i, 0, item)
-        this.debouncedSaveQueue()
+        this.scheduleSaveQueue()
         return true
       }
     }
@@ -134,7 +151,7 @@ export class QueueManager {
   public addItem(item: DownloadItem): void {
     // Basic add, assumes checks are done beforehand if needed
     this.queue.push(item)
-    this.debouncedSaveQueue()
+    this.scheduleSaveQueue()
   }
 
   // Removes item by releaseName, returns true if found and removed, false otherwise
@@ -142,7 +159,7 @@ export class QueueManager {
     const index = this.findIndex(releaseName)
     if (index !== -1) {
       this.queue.splice(index, 1)
-      this.debouncedSaveQueue()
+      this.scheduleSaveQueue()
       return true
     }
     return false
@@ -154,7 +171,7 @@ export class QueueManager {
     this.queue = this.queue.filter((item) => !predicate(item))
     const removed = this.queue.length < initialLength
     if (removed) {
-      this.debouncedSaveQueue()
+      this.scheduleSaveQueue()
     }
     return removed
   }
@@ -178,7 +195,7 @@ export class QueueManager {
         item.extractProgress = undefined
       }
 
-      this.debouncedSaveQueue()
+      this.scheduleSaveQueue()
       return true
     }
     return false
@@ -197,7 +214,7 @@ export class QueueManager {
       }
     })
     if (changed) {
-      this.debouncedSaveQueue()
+      this.scheduleSaveQueue()
     }
     return changed
   }

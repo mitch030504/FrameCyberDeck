@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import shlex
@@ -10,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import urllib.request
 
 DEFAULT_PORT = 32000
@@ -76,15 +78,16 @@ def ssh_command(
             f"SteamOS Devkit key not found at {key}. Register the Frame once in the official SteamOS Devkit Client."
         )
 
+    (pathlib.Path.home() / ".ssh").mkdir(mode=0o700, parents=True, exist_ok=True)
     return subprocess.run(
         [
             "ssh",
             "-o",
             "BatchMode=yes",
             "-o",
-            "StrictHostKeyChecking=no",
+            "StrictHostKeyChecking=accept-new",
             "-o",
-            "UserKnownHostsFile=/dev/null",
+            "UpdateHostKeys=yes",
             "-o",
             "IdentitiesOnly=yes",
             "-o",
@@ -93,6 +96,7 @@ def ssh_command(
             str(port),
             "-i",
             str(key),
+            "--",
             f"{login}@{host}",
             command,
         ],
@@ -263,6 +267,95 @@ def build_polish_script(gameid: str, directory: str) -> str:
     )
 
 
+def tar_stream(
+    source: pathlib.Path,
+    fileobj,
+    on_progress=None,
+) -> None:
+    """Stream `source` as a gzipped tar into `fileobj`, reporting cumulative
+    byte progress. Pure stdlib: Windows has no rsync, so the upload runs as
+    a tar pipeline over the ssh connection instead."""
+    files = sorted((p for p in source.rglob("*") if p.is_file()))
+    total = sum(p.stat().st_size for p in files)
+    sent = 0
+    last_percent = -1
+    with tarfile.open(fileobj=fileobj, mode="w|gz") as tar:
+        for path in files:
+            tar.add(path, arcname=path.relative_to(source), recursive=False)
+            sent += path.stat().st_size
+            if on_progress and total:
+                percent = min(99, int(sent * 100 / total))
+                if percent != last_percent:
+                    last_percent = percent
+                    on_progress(percent)
+
+
+def upload_directory_over_ssh(
+    source: pathlib.Path,
+    address: str,
+    login: str,
+    ssh_port: int,
+    remote_directory: str,
+) -> None:
+    """Windows upload: tar streamed into `ssh 'mkdir -p … && tar -xzf - -C …'`."""
+    key = private_key_path()
+    if not key.is_file():
+        raise RuntimeError(
+            f"SteamOS Devkit key not found at {key}. Register the Frame once in the official SteamOS Devkit Client."
+        )
+    remote_cmd = f"mkdir -p {shlex.quote(remote_directory)} && tar -xzf - -C {shlex.quote(remote_directory)}"
+    process = subprocess.Popen(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "UpdateHostKeys=yes",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            f"ConnectTimeout={REQUEST_TIMEOUT}",
+            "-p",
+            str(ssh_port),
+            "-i",
+            str(key),
+            "--",
+            f"{login}@{address}",
+            remote_cmd,
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    stderr_tail: list[str] = []
+
+    def drain() -> None:
+        assert process.stderr is not None
+        for line in process.stderr:
+            stderr_tail.append(line.rstrip("\n"))
+            del stderr_tail[:-20]
+
+    import threading
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    assert process.stdin is not None
+    try:
+        tar_stream(source, process.stdin, lambda pct: emit({"ok": True, "deployProgress": pct}))
+        process.stdin.close()
+    finally:
+        if not process.stdin.closed:
+            process.stdin.close()
+    returncode = process.wait()
+    reader.join(timeout=5)
+    if returncode != 0:
+        raise RuntimeError(
+            "SteamOS Devkit upload failed: " + " | ".join(stderr_tail[-5:])
+        )
+
+
 def rsync_percent(text: str) -> int | None:
     """Overall percentage from an rsync --info=progress2 update line, e.g.
     '  12,345,678  45%  12.34MB/s    0:01:23'. Returns the last percentage
@@ -272,7 +365,7 @@ def rsync_percent(text: str) -> int | None:
 
 
 def validate_gameid(value: str) -> str:
-    if not re.fullmatch(r"[A-Za-z0-9._]+", value):
+    if value in (".", "..") or not re.fullmatch(r"[A-Za-z0-9._]+", value):
         raise RuntimeError(
             "Steam Frame shortcut game IDs may only contain letters, digits, dots and underscores; "
             f"got {value!r}"
@@ -281,7 +374,9 @@ def validate_gameid(value: str) -> str:
 
 
 def require_tools() -> None:
-    missing = [name for name in ("ssh", "rsync") if not shutil.which(name)]
+    # rsync does not exist on Windows; the tar-over-ssh upload replaces it.
+    required = ("ssh",) if os.name == "nt" else ("ssh", "rsync")
+    missing = [name for name in required if not shutil.which(name)]
     if missing:
         fail("Missing required host tools: " + ", ".join(missing))
 
@@ -332,9 +427,9 @@ def deploy(
                 "-p",
                 str(ssh_port),
                 "-o",
-                "StrictHostKeyChecking=no",
+                "StrictHostKeyChecking=accept-new",
                 "-o",
-                "UserKnownHostsFile=/dev/null",
+                "UpdateHostKeys=yes",
                 "-o",
                 "IdentitiesOnly=yes",
                 "-i",
@@ -342,49 +437,54 @@ def deploy(
             ]
         )
 
-        rsync_args = [
-            "rsync",
-            "-av",
-            "--info=progress2",
-            "--chmod=Du=rwx,Dgo=rx,Fu=rwx,Fog=rx",
-            "--delete",
-            "--delete-excluded",
-            "--delete-delay",
-            "--checksum",
-            "-e",
-            ssh_transport,
-            f"{str(source).rstrip('/')}/",
-            f"{remote_user}@{address}:{remote_directory.rstrip('/')}/",
-        ]
+        if os.name == "nt":
+            # Windows has no rsync; stream the upload as a tar over ssh.
+            upload_directory_over_ssh(source, address, login, ssh_port, remote_directory)
+        else:
+            rsync_args = [
+                "rsync",
+                "-av",
+                "--info=progress2",
+                "--chmod=Du=rwx,Dgo=rx,Fu=rwx,Fog=rx",
+                "--delete",
+                "--delete-excluded",
+                "--delete-delay",
+                "--checksum",
+                "-e",
+                ssh_transport,
+                "--",
+                f"{str(source).rstrip('/')}/",
+                f"{remote_user}@{address}:{remote_directory.rstrip('/')}/",
+            ]
 
-        # Stream rsync's single overall-progress line and emit each new
-        # percentage as a JSON progress line; the host app forwards them to
-        # the UI. The deploy result remains the final line on stdout.
-        process = subprocess.Popen(
-            rsync_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-        )
-        assert process.stdout is not None
-        last_percent: int | None = None
-        line = ""
-        tail = ""
-        while True:
-            char = process.stdout.read(1)
-            if not char:
-                break
-            tail = (tail + char)[-2000:]
-            if char in "\r\n":
-                percent = rsync_percent(line)
-                if percent is not None and percent != last_percent:
-                    last_percent = percent
-                    emit({"ok": True, "deployProgress": percent})
-                line = ""
-            else:
-                line += char
-                if len(line) > 512:
+            # Stream rsync's single overall-progress line and emit each new
+            # percentage as a JSON progress line; the host app forwards them
+            # to the UI. The deploy result remains the final line on stdout.
+            process = subprocess.Popen(
+                rsync_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            )
+            assert process.stdout is not None
+            last_percent: int | None = None
+            line = ""
+            tail = ""
+            while True:
+                char = process.stdout.read(1)
+                if not char:
+                    break
+                tail = (tail + char)[-2000:]
+                if char in "\r\n":
+                    percent = rsync_percent(line)
+                    if percent is not None and percent != last_percent:
+                        last_percent = percent
+                        emit({"ok": True, "deployProgress": percent})
                     line = ""
-        returncode = process.wait()
-        if returncode != 0:
-            raise subprocess.CalledProcessError(returncode, rsync_args, output=tail)
+                else:
+                    line += char
+                    if len(line) > 512:
+                        line = ""
+            returncode = process.wait()
+            if returncode != 0:
+                raise subprocess.CalledProcessError(returncode, rsync_args, output=tail)
 
         shortcut = {
             "gameid": name,

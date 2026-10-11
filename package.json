@@ -36,10 +36,9 @@
     "tag-version": "VERSION=$(node -p \"require('./package.json').version\") && TAG_NAME=\"v$VERSION\" && (git rev-parse $TAG_NAME >/dev/null 2>&1 || git tag $TAG_NAME) && echo \"Tag $TAG_NAME created or already exists.\""
   },
   "dependencies": {
-    "@devicefarmer/adbkit": "^3.3.8",
-    "@electron-toolkit/preload": "^3.0.2",
+    "@devicefarmer/adbkit": "^3.3.9",
     "@electron-toolkit/utils": "^4.0.0",
-    "axios": "^1.9.0",
+    "axios": "^1.20.0",
     "compare-versions": "^6.1.1",
     "dompurify": "^3.4.16",
     "electron-log": "^5.4.1",
@@ -67,8 +66,8 @@
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.5.2",
     "date-fns": "^4.1.0",
-    "electron": "^36.4.0",
-    "electron-builder": "^26.0.12",
+    "electron": "^43.7.9",
+    "electron-builder": "^26.15.3",
     "electron-vite": "^3.1.0",
     "eslint": "^9.28.0",
     "eslint-plugin-react": "^7.37.5",
@@ -79,17 +78,13 @@
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "typescript": "^5.8.3",
-    "vite": "^6.3.5",
-    "vitest": "^4.1.10"
+    "vite": "^6.4.4",
+    "vitest": "^4.1.11"
   },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "electron",
-      "esbuild"
-    ]
+  "engines": {
+    "node": ">=22.18.0"
   },
-  "allowScripts": {
-    "electron@36.9.5": true,
-    "esbuild@0.25.12": true
+  "overrides": {
+    "@electron/get": "^5.1.0"
   }
 }

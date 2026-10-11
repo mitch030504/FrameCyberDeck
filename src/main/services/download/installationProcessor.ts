@@ -1,3 +1,4 @@
+import { childPath, containedFile } from '../fileSafety'
 import { basename, dirname, join } from 'path'
 import { promises as fs, existsSync } from 'fs'
 import { execa } from 'execa'
@@ -251,7 +252,7 @@ export class InstallationProcessor {
             case 'install': {
               const apkArg = args.find((arg) => arg.toLowerCase().endsWith('.apk'))
               if (apkArg) {
-                const apkPath = join(item.downloadPath!, apkArg)
+                const apkPath = await containedFile(item.downloadPath!, apkArg)
                 if (existsSync(apkPath)) {
                   const installArgs = args.filter((arg) => arg !== apkArg)
                   console.log(
@@ -262,8 +263,10 @@ export class InstallationProcessor {
                   // Ensure -r and -g are included for compatibility and permissions.
                   const combinedFlags = Array.from(new Set(['-r', '-g', ...installArgs]))
 
-                  await this.adbService.installPackage(deviceId, apkPath, { flags: combinedFlags })
-                  commandSuccess = true // Assuming installPackage throws on error
+                  commandSuccess = await this.adbService.installPackage(deviceId, apkPath, {
+                    flags: combinedFlags
+                  })
+                  if (!commandSuccess) errorMessage = `Install failed: ${apkArg}`
                   // if (output?.includes('Success')) {
                   //   commandSuccess = true
                   // } else {
@@ -283,7 +286,7 @@ export class InstallationProcessor {
               if (args.length === 2) {
                 const localPathRelative = args[0]
                 const devicePath = args[1]
-                const localPathAbsolute = join(item.downloadPath!, localPathRelative)
+                const localPathAbsolute = await containedFile(item.downloadPath!, localPathRelative)
                 if (existsSync(localPathAbsolute)) {
                   console.log(`[InstallProc]   Pushing ${localPathAbsolute} to ${devicePath}`)
                   // pushFileOrFolder returns false on failure rather than
@@ -310,7 +313,9 @@ export class InstallationProcessor {
             case 'pull': {
               if (args.length === 1) {
                 const devicePath = args[0]
-                const localTargetPath = join(item.downloadPath!, basename(devicePath))
+                const localTargetPath = childPath(item.downloadPath!, basename(devicePath))
+                if (existsSync(localTargetPath))
+                  await containedFile(item.downloadPath!, localTargetPath)
                 console.log(`[InstallProc]   Pulling ${devicePath} to ${localTargetPath}`)
                 await this.adbService.pullFile(deviceId, devicePath, localTargetPath)
                 commandSuccess = true
@@ -515,7 +520,9 @@ export class InstallationProcessor {
         )
         try {
           // Use the simplified installPackage, now with flags for reinstall and granting permissions
-          await this.adbService.installPackage(deviceId, apkPath, { flags: ['-r', '-g'] })
+          if (!(await this.adbService.installPackage(deviceId, apkPath, { flags: ['-r', '-g'] }))) {
+            throw new Error('APK installation failed')
+          }
           installedApks++
           console.log(`[InstallProc Standard] Successfully installed ${apk}`)
         } catch (installError: unknown) {
@@ -602,7 +609,9 @@ export class InstallationProcessor {
     console.log(`[InstallProc Standard] Installing single APK ${apkPath}...`)
     try {
       onProgress?.(`Installing ${releaseName}…`, 0)
-      await this.adbService.installPackage(deviceId, apkPath, { flags: ['-r', '-g'] })
+      if (!(await this.adbService.installPackage(deviceId, apkPath, { flags: ['-r', '-g'] }))) {
+        throw new Error('APK installation failed')
+      }
       console.log(`[InstallProc Standard] Successfully installed ${releaseName}`)
     } catch (installError: unknown) {
       if (installError instanceof SignatureMismatchError) {

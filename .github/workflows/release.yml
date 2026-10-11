@@ -13,6 +13,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.event.inputs.version }}
+  cancel-in-progress: false
+
 jobs:
   bump-version:
     name: Commit version bump to package.json
@@ -42,12 +46,26 @@ jobs:
           else
             VERSION="$(node -p "require('./package.json').version")"
           fi
-          if [ -z "$VERSION" ]; then
-            echo "::error::Could not resolve a version from inputs/ref/package.json"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Release version must be a valid semantic version"
             exit 1
           fi
           echo "Resolved version: $VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to replace a published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          if DRAFT=$(gh release view "v$VERSION" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$DRAFT" != true ]; then
+              echo "::error::Release v$VERSION is already published. Choose a new version."
+              exit 1
+            fi
+          fi
 
       - name: Write version into package.json and push if changed
         id: push
@@ -58,17 +76,17 @@ jobs:
           set -euxo pipefail
 
           # Update package.json to the requested version.
-          node -e "const fs=require('fs');const p=require('./package.json');p.version=process.env.VERSION;fs.writeFileSync('./package.json',JSON.stringify(p,null,2)+'\n');"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version --ignore-scripts
           echo "package.json is now at: $(node -p "require('./package.json').version")"
 
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          if git diff --quiet -- package.json; then
+          if git diff --quiet -- package.json package-lock.json; then
             echo "No version change — package.json already at $VERSION."
             SHA="$(git rev-parse HEAD)"
           else
-            git add package.json
+            git add package.json package-lock.json
             git commit -m "chore: bump version to $VERSION [skip ci]"
             DEFAULT_BRANCH="$(git remote show origin | sed -n '/HEAD branch/s/.*: //p')"
             echo "Pushing version bump to origin/$DEFAULT_BRANCH"
@@ -101,7 +119,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
+          node-version: '22.x'
           cache: 'npm'
 
       - name: Cache Electron binaries
@@ -120,7 +138,7 @@ jobs:
             ${{ runner.os }}-electron-
 
       - name: Install dependencies
-        run: npm install --legacy-peer-deps
+        run: npm ci --legacy-peer-deps
 
       - name: Determine build command and artifact path
         id: build_details
@@ -163,6 +181,7 @@ jobs:
 
       - name: Build application
         env:
+          BUILD_COMMAND: ${{ steps.build_details.outputs.BUILD_COMMAND }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VRSRC_API_KEY: ${{ secrets.VRSRC_API_KEY }}
           ELECTRON_BUILDER_DOWNLOAD_TIMEOUT: 120000
@@ -174,30 +193,29 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          for i in 1 2 3; do
-            ${{ steps.build_details.outputs.BUILD_COMMAND }} && break
-            echo "Build attempt $i failed, retrying in 30s..."
-            sleep 30
-          done
+          bash .github/scripts/build-with-retries.sh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: build-artifact-${{ matrix.os }}
           path: ${{ steps.build_details.outputs.ARTIFACT_PATH }}
-          if-no-files-found: warn
+          if-no-files-found: error
 
   create_release:
     name: Create GitHub Release
     needs: [bump-version, build]
     # Run even if some OS builds failed, so the successful ones can still publish.
-    if: always()
+    if: always() && needs.bump-version.result == 'success'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ needs.bump-version.outputs.version }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump-version.outputs.sha }}
+          fetch-depth: 0
 
       - name: Sanity-check inputs from previous jobs
         shell: bash
@@ -250,45 +268,42 @@ jobs:
           TAG="v${VERSION}"
           echo "Creating draft release $TAG in $REPO at commit $TARGET_SHA"
 
-          # Best-effort cleanup of any stale release / tag from a previous failed run.
-          # Failure here must NOT abort the job, so wrap each call in `|| true`.
-          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            echo "Found existing release $TAG, deleting before recreate..."
-            gh release delete "$TAG" --repo "$REPO" --yes || true
+          mapfile -d '' ASSETS < <(find artifacts -type f -print0)
+          if [ "${#ASSETS[@]}" -eq 0 ]; then
+            echo "::error::No successful build artifacts were produced."
+            exit 1
           fi
-          # Tag may exist independently of the release; delete if present.
-          gh api -X DELETE "repos/$REPO/git/refs/tags/$TAG" >/dev/null 2>&1 || true
+          # An existing tag must identify exactly the code that produced these assets.
+          TAG_REF=$(git ls-remote --tags origin "refs/tags/$TAG")
+          if [ -n "$TAG_REF" ]; then
+            git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
+            if [ "$(git rev-parse "$TAG^{commit}")" != "$TARGET_SHA" ]; then
+              echo "::error::Existing tag $TAG refers to a different commit."
+              exit 1
+            fi
+          fi
+          if DRAFT=$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$DRAFT" != true ]; then
+              echo "::error::Refusing to modify published release $TAG."
+              exit 1
+            fi
+            EXISTS=true
+          else
+            EXISTS=false
+          fi
 
           # Generate release notes from .github/release-name.txt and .github/release-changelog.md
           RELEASE_NAME="$(head -1 .github/release-name.txt | tr -d '\r\n')"
-          NOTES="$(node .github/scripts/generate-release-notes.js "$VERSION")"
+          node .github/scripts/generate-release-notes.js "$VERSION" > release-notes.md
 
-          gh release create "$TAG" \
-            --repo "$REPO" \
-            --title "Release v${VERSION} — ${RELEASE_NAME}" \
-            --draft \
-            --target "$TARGET_SHA" \
-            --notes "$NOTES"
-          echo "Created draft release $TAG."
-
-          # Upload artifacts. Each missing/empty dir is logged but not fatal.
-          for DIR in \
-            artifacts/build-artifact-windows-latest \
-            artifacts/build-artifact-macos-latest \
-            artifacts/build-artifact-ubuntu-latest; do
-            if [ -d "$DIR" ]; then
-              FILES=$(find "$DIR" -maxdepth 1 -type f)
-              if [ -n "$FILES" ]; then
-                echo "Uploading from $DIR..."
-                # shellcheck disable=SC2086
-                gh release upload "$TAG" $FILES --repo "$REPO" --clobber
-              else
-                echo "No files in $DIR (build may have failed for that OS), skipping."
-              fi
-            else
-              echo "$DIR not found, skipping."
-            fi
-          done
+          if [ "$EXISTS" = true ]; then
+            gh release edit "$TAG" --repo "$REPO" --draft \
+              --title "Release v${VERSION} — ${RELEASE_NAME}" --notes-file release-notes.md
+          else
+            gh release create "$TAG" --repo "$REPO" --draft --target "$TARGET_SHA" \
+              --title "Release v${VERSION} — ${RELEASE_NAME}" --notes-file release-notes.md
+          fi
+          gh release upload "$TAG" "${ASSETS[@]}" --repo "$REPO" --clobber
 
           URL="$(gh release view "$TAG" --repo "$REPO" --json url -q .url)"
           echo "Done. Release URL: $URL"
@@ -296,7 +311,7 @@ jobs:
   mac:
     name: Build macOS DMG
     needs: create_release
-    if: always()
+    if: needs.create_release.result == 'success'
     uses: ./.github/workflows/mac-build.yml
     with:
       version: ${{ needs.create_release.outputs.version }}

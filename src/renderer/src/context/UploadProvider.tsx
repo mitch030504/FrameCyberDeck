@@ -126,24 +126,14 @@ export const UploadProvider: React.FC<UploadProviderProps> = ({ children }) => {
     }
   }, [])
 
-  const retryUpload = useCallback(
-    async (packageName: string): Promise<boolean> => {
-      const item = queue.find((i) => i.packageName === packageName)
-      if (!item) return false
-      try {
-        return await window.api.uploads.addToQueue(
-          item.packageName,
-          item.gameName,
-          item.versionCode,
-          item.deviceId
-        )
-      } catch (err) {
-        console.error('Error retrying upload:', err)
-        return false
-      }
-    },
-    [queue]
-  )
+  const retryUpload = useCallback(async (packageName: string): Promise<boolean> => {
+    try {
+      return await window.api.uploads.retryUpload(packageName)
+    } catch (err) {
+      console.error('Error retrying upload:', err)
+      return false
+    }
+  }, [])
 
   const clearCompleted = useCallback(() => {
     queue

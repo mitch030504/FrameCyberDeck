@@ -81,11 +81,13 @@ Supported operations include:
 
 The Devkit connection is paired externally using Valve's normal SteamOS Devkit flow. Frame CyberDeck then reuses the existing Devkit SSH key.
 
+SSH records a host key on the first connection and rejects changed keys on later connections. If a Frame is reset or another Frame uses the same USB forwarding address, verify its identity before removing the old entry from your SSH `known_hosts` file. HTTPS certificate validation is enabled for catalog and mirror transfers.
+
 ### Original-source provenance
 
 For managed Steam Frame installs, Frame CyberDeck records which original Quest payload produced the installed Frame build.
 
-That provenance is used for contribution workflows so the application can contribute the **original APK/folder**, not the converted and re-signed Frame APK.
+That provenance is used for contribution workflows so the application can contribute the **original APK/folder**, including its matching OBB files. Single APK installs made before OBB provenance was recorded must be reinstalled from the original source before contributing. Original local ZIP files are retained after upload.
 
 A local validation tool is included:
 
@@ -139,6 +141,8 @@ There is no "download all" or bulk-download function.
 
 ## `// STEAM_FRAME_SETUP`
 
+Conversion requires Python 3, a JDK (Java 21 or newer), and Android SDK build-tools containing `aapt`, `zipalign`, and `apksigner`. Set `ANDROID_SDK_ROOT` and `JAVA_HOME` when those installations are outside their usual locations. Windows SDK tools use their native `.exe`/`.bat` filenames; signing runs through the SDK's Java archive. Devkit deployment also requires `ssh` and `rsync` on the host's PATH.
+
 ### 1. Pair SteamOS Devkit access
 
 Pair the Steam Frame once using Valve's SteamOS Devkit client.
@@ -168,10 +172,10 @@ Frame CyberDeck will convert the APK, deploy it through SteamOS Devkit, refresh 
 
 ## `// BUILD_FROM_SOURCE`
 
-Frame CyberDeck is designed to build without a vrSrc API key.
+Frame CyberDeck is designed to build without a vrSrc API key. Use Node.js 22.18 or newer and npm; `package-lock.json` is the authoritative dependency lockfile.
 
 ```sh
-npm install --legacy-peer-deps
+npm ci --legacy-peer-deps
 npm run typecheck
 npm test
 npm run test:node
@@ -181,11 +185,11 @@ npm run build
 
 To build an installable package:
 
-| Platform | Command |
-| --- | --- |
-| Windows x64 | `npm run build:win:x64` |
-| macOS x64 | `npm run build:mac:x64` |
-| Linux x64 | `npm run build:linux:x64` |
+| Platform    | Command                     |
+| ----------- | --------------------------- |
+| Windows x64 | `npm run build:win:x64`     |
+| macOS x64   | `npm run build:mac:x64`     |
+| Linux x64   | `npm run build:linux:x64`   |
 | Linux ARM64 | `npm run build:linux:arm64` |
 
 An authorized catalog key can be supplied at runtime during development:

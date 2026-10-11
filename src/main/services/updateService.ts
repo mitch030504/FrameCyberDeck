@@ -1,3 +1,4 @@
+import { isExternalWebUrl } from '@shared/rendererSecurity'
 import { app, shell } from 'electron'
 import { EventEmitter } from 'events'
 import axios from 'axios'
@@ -251,7 +252,7 @@ class UpdateService extends EventEmitter {
         }
       })
 
-      const totalBytes = parseInt(response.headers['content-length'] || '0', 10)
+      const totalBytes = Number(response.headers['content-length'] ?? 0)
       let downloadedBytes = 0
       let lastEmitTime = Date.now()
       let lastEmitBytes = 0
@@ -360,6 +361,7 @@ class UpdateService extends EventEmitter {
   }
 
   public openDownloadPage(url: string): void {
+    if (!isExternalWebUrl(url)) throw new Error('Only HTTP and HTTPS links can be opened')
     console.log('[UpdateService] Opening download page:', url)
     shell.openExternal(url)
   }

@@ -27,6 +27,7 @@ export interface FrameConversionResult {
 }
 
 class FrameConversionService {
+  private conversions: Promise<void> = Promise.resolve()
   private getHelperPath(): string {
     return app.isPackaged
       ? join(process.resourcesPath, 'frame-convert.py')
@@ -34,11 +35,9 @@ class FrameConversionService {
   }
 
   private async resolvePython(): Promise<string> {
-    const candidates = [
-      process.env.FRAME_CYBERDECK_PYTHON?.trim(),
-      'python3',
-      'python'
-    ].filter((value): value is string => Boolean(value))
+    const candidates = [process.env.FRAME_CYBERDECK_PYTHON?.trim(), 'python3', 'python'].filter(
+      (value): value is string => Boolean(value)
+    )
 
     const errors: string[] = []
     for (const python of [...new Set(candidates)]) {
@@ -53,11 +52,7 @@ class FrameConversionService {
   }
 
   private parseLastJson<T>(stdout: string): T {
-    const line = stdout
-      .trim()
-      .split(/\r?\n/)
-      .filter(Boolean)
-      .at(-1)
+    const line = stdout.trim().split(/\r?\n/).filter(Boolean).at(-1)
     if (!line) throw new Error('Frame converter returned no result')
     try {
       return JSON.parse(line) as T
@@ -74,7 +69,20 @@ class FrameConversionService {
     return this.parseLastJson<Record<string, unknown>>(result.stdout)
   }
 
-  async convert(
+  convert(
+    sourcePath: string,
+    title: string,
+    onProgress?: ProgressReporter
+  ): ReturnType<FrameConversionService['convertNow']> {
+    const conversion = this.conversions.then(() => this.convertNow(sourcePath, title, onProgress))
+    this.conversions = conversion.then(
+      () => {},
+      () => {}
+    )
+    return conversion
+  }
+
+  private async convertNow(
     sourcePath: string,
     title: string,
     onProgress?: ProgressReporter
@@ -131,13 +139,9 @@ class FrameConversionService {
       console.log(`[Frame Convert] Options: refresh=${refreshRate || 'default'}`)
 
       try {
-        const execution = await execa(
-          python,
-          convertArgs,
-          {
-            env: process.env
-          }
-        )
+        const execution = await execa(python, convertArgs, {
+          env: process.env
+        })
         stdout = execution.stdout
         stderr = execution.stderr
       } catch (error) {

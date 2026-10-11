@@ -1,15 +1,4 @@
-import {
-  app,
-  shell,
-  BrowserWindow,
-  screen,
-  protocol,
-  dialog,
-  ipcMain,
-  session,
-  net,
-  Notification
-} from 'electron'
+import { app, shell, BrowserWindow, screen, protocol, dialog, net, Notification } from 'electron'
 import { promises as fsPromises, existsSync } from 'fs'
 // Side-effect import: must run before any service whose singleton constructor
 // reads app.getPath('userData'). ESM evaluates sibling imports in source
@@ -24,7 +13,6 @@ import adbService from './services/adbService'
 import { installQuestUdevRule } from './services/linuxUsbAccess'
 import dependencyService, { DependencyStatus } from './services/dependencyService'
 import gameService from './services/gameService'
-import metaStoreService from './services/metaStoreService'
 import { createGameDescriptionService } from './services/gameDescription/gameDescriptionService'
 import downloadService from './services/downloadService'
 import frameDevkitService from './services/frame/frameDevkitService'
@@ -34,7 +22,9 @@ import logsService from './services/logsService'
 import mirrorService from './services/mirrorService'
 import wifiBookmarksService from './services/wifiBookmarksService'
 import { registerBackupIpc } from './services/backup/backupIpc'
-import { typedIpcMain } from '@shared/ipc-utils'
+import { typedIpcMain, setIpcSenderValidator } from '@shared/ipc-utils'
+import { isExternalWebUrl, isTrustedRendererUrl } from '@shared/rendererSecurity'
+import { containedFile } from './services/fileSafety'
 import settingsService from './services/settingsService'
 import { typedWebContentsSend } from '@shared/ipc-utils'
 import log from 'electron-log/main'
@@ -135,40 +125,13 @@ function createWindow(): void {
     icon: icon,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false,
-      webviewTag: true // Enable <webview> for YouTube trailer embedding
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false
     }
   })
 
   if (startMaximized) mainWindow.maximize()
-
-  // Set up a dedicated session partition for YouTube webview embeds.
-  // The webview runs in its own process where window.top === window,
-  // so YouTube's client-side embed origin checks don't trigger.
-  // We set a Chrome user-agent so YouTube doesn't detect Electron.
-  const ytUrlFilters = [
-    'https://*.youtube.com/*',
-    'https://*.youtube-nocookie.com/*',
-    'https://*.googlevideo.com/*',
-    'https://*.ytimg.com/*'
-  ]
-  const ytSession = session.fromPartition('persist:youtube')
-  ytSession.setUserAgent(
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-  )
-  ytSession.webRequest.onBeforeSendHeaders({ urls: ytUrlFilters }, (details, callback) => {
-    details.requestHeaders['Referer'] = 'https://www.youtube.com/'
-    details.requestHeaders['Origin'] = 'https://www.youtube.com'
-    callback({ requestHeaders: details.requestHeaders })
-  })
-  ytSession.webRequest.onHeadersReceived({ urls: ytUrlFilters }, (details, callback) => {
-    const headers = { ...details.responseHeaders }
-    delete headers['X-Frame-Options']
-    delete headers['x-frame-options']
-    delete headers['Content-Security-Policy']
-    delete headers['content-security-policy']
-    callback({ responseHeaders: headers })
-  })
 
   // Explicitly set minimum size to ensure constraint is enforced.
   // Sized for ~1366x768 laptops (typical small-screen target) with the OS
@@ -218,8 +181,7 @@ function createWindow(): void {
   })
 
   // Crash recovery: Snagit and other screen-capture tools can crash the GPU /
-  // renderer process when the window has a YouTube webview playing. Without
-  // these handlers Electron silently terminates the entire app.
+  // renderer process. Keep crash recovery available.
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
     console.error('[Main] Renderer process gone:', details.reason, details.exitCode)
     if (details.reason !== 'clean-exit' && mainWindow && !mainWindow.isDestroyed()) {
@@ -336,9 +298,26 @@ function createWindow(): void {
   })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
-    shell.openExternal(details.url)
+    if (isExternalWebUrl(details.url)) void shell.openExternal(details.url)
     return { action: 'deny' }
   })
+
+  mainWindow.webContents.on('will-navigate', (event) => event.preventDefault())
+  mainWindow.webContents.on('will-frame-navigate', (event) => event.preventDefault())
+  mainWindow.webContents.on('will-redirect', (event) => event.preventDefault())
+  const rendererUrl =
+    is.dev && process.env.ELECTRON_RENDERER_URL
+      ? process.env.ELECTRON_RENDERER_URL
+      : pathToFileURL(join(__dirname, '../renderer/index.html')).href
+  setIpcSenderValidator((event) =>
+    Boolean(
+      mainWindow &&
+      !mainWindow.isDestroyed() &&
+      event.sender === mainWindow.webContents &&
+      event.senderFrame === mainWindow.webContents.mainFrame &&
+      isTrustedRendererUrl(event.senderFrame.url, rendererUrl)
+    )
+  )
 
   // Intercept window close so the renderer can warn the user when transfers
   // are still in progress. The renderer responds via 'app:confirm-close'.
@@ -420,13 +399,19 @@ app.whenReady().then(async () => {
   electronApp.setAppUserModelId('com.vrcyberdeck')
 
   // Serve local files (thumbnails) through the local-file scheme.
-  protocol.handle('local-file', (request) => {
-    let raw = request.url.split('#')[0].slice('local-file://'.length)
-    raw = decodeURIComponent(raw)
-    const pathname = raw.startsWith('/') ? raw : `/${raw}`
-    const filePath =
-      process.platform === 'win32' && pathname.startsWith('/') ? pathname.slice(1) : pathname
-    return net.fetch(pathToFileURL(filePath).toString())
+  protocol.handle('local-file', async (request) => {
+    try {
+      const url = new URL(request.url)
+      if (!/\.(png|jpe?g|webp|gif|avif)$/i.test(url.pathname))
+        return new Response(null, { status: 403 })
+      const root = join(app.getPath('userData'), 'vrp-data', '.meta', 'thumbnails')
+      let filePath = decodeURIComponent(url.pathname)
+      if (process.platform === 'win32') filePath = filePath.replace(/^\//, '')
+      const allowed = await containedFile(root, filePath)
+      return await net.fetch(pathToFileURL(allowed).href)
+    } catch {
+      return new Response(null, { status: 403 })
+    }
   })
 
   // Default open or close DevTools by F12 in development
@@ -507,7 +492,8 @@ app.whenReady().then(async () => {
     }
   })
 
-  typedIpcMain.on('app:confirm-close', () => {
+  typedIpcMain.on('app:confirm-close', async () => {
+    await downloadService.flushQueue()
     closeConfirmed = true
     // On macOS this is reached after a Cmd+Q that we preventDefault'd, so we
     // need to actually quit the app (closing the window alone isn't enough).
@@ -609,9 +595,6 @@ app.whenReady().then(async () => {
   typedIpcMain.handle('games:get-note', async (_event, releaseName) => {
     return gameService.getNote(releaseName)
   })
-  typedIpcMain.handle('games:get-trailer-url', async (_event, gameName, packageName) => {
-    return metaStoreService.getTrailerUrl(gameName, packageName)
-  })
   typedIpcMain.handle('games:get-description', async (_event, request) => {
     return gameDescriptionService.getDescription(request)
   })
@@ -630,108 +613,9 @@ app.whenReady().then(async () => {
   typedIpcMain.handle('download:delete-files', (_event, releaseName) =>
     downloadService.deleteDownloadedFiles(releaseName)
   )
-  typedIpcMain.handle('download:install-from-completed', (_event, releaseName, deviceId) => {
-    console.log(
-      `[IPC] Received request to install from completed: ${releaseName} on device ${deviceId}`
-    )
-    // No return value needed, fire-and-forget, status updated via queue listener
-    downloadService.installFromCompleted(releaseName, deviceId).catch((err) => {
-      // Log error here as the renderer won't get a rejection for this invoke
-      console.error(
-        `[IPC Handler Error] installFromCompleted failed for ${releaseName} on ${deviceId}:`,
-        err
-      )
-    })
-  })
-
-  // --- Upload Handlers ---
-  typedIpcMain.handle(
-    'upload:prepare',
-    async (_event, packageName, gameName, versionCode, deviceId) => {
-      console.log(
-        `[IPC] Received request to prepare upload for: ${packageName} (${gameName}) version ${versionCode} from device ${deviceId}`
-      )
-      try {
-        return await uploadService.prepareUpload(packageName, gameName, versionCode, deviceId)
-      } catch (err) {
-        console.error(`[IPC Handler Error] Upload preparation failed for ${packageName}:`, err)
-        return null
-      }
-    }
+  typedIpcMain.handle('download:install-from-completed', (_event, releaseName, deviceId) =>
+    downloadService.installFromCompleted(releaseName, deviceId)
   )
-
-  typedIpcMain.handle('upload:get-queue', () => uploadService.getQueue())
-
-  typedIpcMain.handle(
-    'upload:add-to-queue',
-    async (_event, packageName, gameName, versionCode, deviceId) => {
-      console.log(
-        `[IPC] Adding to upload queue: ${packageName} (${gameName}) version ${versionCode} from device ${deviceId}`
-      )
-      return uploadService.addToQueue(packageName, gameName, versionCode, deviceId)
-    }
-  )
-
-  typedIpcMain.on('upload:remove', (_event, packageName) => {
-    console.log(`[IPC] Removing from upload queue: ${packageName}`)
-    uploadService.removeFromQueue(packageName)
-  })
-
-  typedIpcMain.on('upload:cancel', (_event, packageName) => {
-    console.log(`[IPC] Cancelling upload: ${packageName}`)
-    uploadService.cancelUpload(packageName)
-  })
-
-  typedIpcMain.handle('upload:add-local-items', async (_event, paths) => {
-    console.log(`[IPC] Adding local items to upload queue: ${paths.join(', ')}`)
-    return uploadService.addLocalItemsToQueue(paths)
-  })
-
-  typedIpcMain.handle('download:remove', async (_event, releaseName) => {
-    console.log(`[IPC] Removing from download queue: ${releaseName}`)
-    await downloadService.removeFromQueue(releaseName)
-  })
-
-  typedIpcMain.handle('download:remove-only', async (_event, releaseName) => {
-    console.log(`[IPC] Removing from download queue (keep files): ${releaseName}`)
-    await downloadService.removeFromQueueOnly(releaseName)
-  })
-
-  typedIpcMain.handle('download:move-to-front', (_event, releaseName) => {
-    console.log(`[IPC] Bumping to front of queue: ${releaseName}`)
-    return downloadService.moveToFront(releaseName)
-  })
-
-  typedIpcMain.handle('download:move-up', (_event, releaseName) => {
-    console.log(`[IPC] Moving up in queue: ${releaseName}`)
-    return downloadService.moveQueuedUp(releaseName)
-  })
-
-  typedIpcMain.handle('download:move-down', (_event, releaseName) => {
-    console.log(`[IPC] Moving down in queue: ${releaseName}`)
-    return downloadService.moveQueuedDown(releaseName)
-  })
-
-  typedIpcMain.handle('download:scan', async () => {
-    console.log('[IPC] Scanning download folder...')
-    return downloadService.scanDownloadFolder()
-  })
-
-  typedIpcMain.on('download:cancel', (_event, releaseName) =>
-    downloadService.cancelUserRequest(releaseName)
-  )
-
-  typedIpcMain.on('download:retry', (_event, releaseName) =>
-    downloadService.retryDownload(releaseName)
-  )
-
-  typedIpcMain.on('download:pause', (_event, releaseName) =>
-    downloadService.pauseDownload(releaseName)
-  )
-  typedIpcMain.on('download:resume', (_event, releaseName) =>
-    downloadService.resumeDownload(releaseName)
-  )
-
   typedIpcMain.on('download:set-download-path', (_event, path) =>
     downloadService.setDownloadPath(path)
   )
@@ -740,12 +624,15 @@ app.whenReady().then(async () => {
     downloadService.setSideloadingDisabled(disabled)
   )
 
-  ipcMain.on('download:set-app-connection-state', (_event, selectedDevice, isConnected) => {
-    console.log(
-      `[IPC] Setting app connection state - Device: ${selectedDevice}, Connected: ${isConnected}`
-    )
-    downloadService.setAppConnectionState(selectedDevice, isConnected)
-  })
+  typedIpcMain.on(
+    'download:set-app-connection-state',
+    (_event, { selectedDevice, isConnected }) => {
+      console.log(
+        `[IPC] Setting app connection state - Device: ${selectedDevice}, Connected: ${isConnected}`
+      )
+      downloadService.setAppConnectionState(selectedDevice, isConnected)
+    }
+  )
 
   // --- Update Handlers ---
   typedIpcMain.handle('update:check-for-updates', async () => {
@@ -812,6 +699,99 @@ app.whenReady().then(async () => {
       typedWebContentsSend.send(mainWindow, 'update:update-downloaded', updateInfo)
     }
   })
+
+  // --- Upload Handlers ---
+  typedIpcMain.handle(
+    'upload:prepare',
+    async (_event, packageName, gameName, versionCode, deviceId) => {
+      console.log(
+        `[IPC] Received request to prepare upload for: ${packageName} (${gameName}) version ${versionCode} from device ${deviceId}`
+      )
+      try {
+        return await uploadService.prepareUpload(packageName, gameName, versionCode, deviceId)
+      } catch (err) {
+        console.error(`[IPC Handler Error] Upload preparation failed for ${packageName}:`, err)
+        return null
+      }
+    }
+  )
+
+  typedIpcMain.handle('upload:get-queue', () => uploadService.getQueue())
+
+  typedIpcMain.handle(
+    'upload:add-to-queue',
+    async (_event, packageName, gameName, versionCode, deviceId) => {
+      console.log(
+        `[IPC] Adding to upload queue: ${packageName} (${gameName}) version ${versionCode} from device ${deviceId}`
+      )
+      return uploadService.addToQueue(packageName, gameName, versionCode, deviceId)
+    }
+  )
+
+  typedIpcMain.handle('upload:retry', (_event, packageName) => {
+    console.log(`[IPC] Retrying upload: ${packageName}`)
+    return uploadService.retryUpload(packageName)
+  })
+
+  typedIpcMain.on('upload:remove', (_event, packageName) => {
+    console.log(`[IPC] Removing from upload queue: ${packageName}`)
+    uploadService.removeFromQueue(packageName)
+  })
+
+  typedIpcMain.on('upload:cancel', (_event, packageName) => {
+    console.log(`[IPC] Cancelling upload: ${packageName}`)
+    uploadService.cancelUpload(packageName)
+  })
+
+  typedIpcMain.handle('upload:add-local-items', async (_event, paths) => {
+    console.log(`[IPC] Adding local items to upload queue: ${paths.join(', ')}`)
+    return uploadService.addLocalItemsToQueue(paths)
+  })
+
+  typedIpcMain.handle('download:remove', async (_event, releaseName) => {
+    console.log(`[IPC] Removing from download queue: ${releaseName}`)
+    await downloadService.removeFromQueue(releaseName)
+  })
+
+  typedIpcMain.handle('download:remove-only', async (_event, releaseName) => {
+    console.log(`[IPC] Removing from download queue (keep files): ${releaseName}`)
+    await downloadService.removeFromQueueOnly(releaseName)
+  })
+
+  typedIpcMain.handle('download:move-to-front', (_event, releaseName) => {
+    console.log(`[IPC] Bumping to front of queue: ${releaseName}`)
+    return downloadService.moveToFront(releaseName)
+  })
+
+  typedIpcMain.handle('download:move-up', (_event, releaseName) => {
+    console.log(`[IPC] Moving up in queue: ${releaseName}`)
+    return downloadService.moveQueuedUp(releaseName)
+  })
+
+  typedIpcMain.handle('download:move-down', (_event, releaseName) => {
+    console.log(`[IPC] Moving down in queue: ${releaseName}`)
+    return downloadService.moveQueuedDown(releaseName)
+  })
+
+  typedIpcMain.handle('download:scan', async () => {
+    console.log('[IPC] Scanning download folder...')
+    return downloadService.scanDownloadFolder()
+  })
+
+  typedIpcMain.on('download:cancel', (_event, releaseName) =>
+    downloadService.cancelUserRequest(releaseName)
+  )
+
+  typedIpcMain.on('download:retry', (_event, releaseName) =>
+    downloadService.retryDownload(releaseName)
+  )
+
+  typedIpcMain.on('download:pause', (_event, releaseName) =>
+    downloadService.pauseDownload(releaseName)
+  )
+  typedIpcMain.on('download:resume', (_event, releaseName) =>
+    downloadService.resumeDownload(releaseName)
+  )
 
   // --- Settings Handlers ---
   typedIpcMain.handle('settings:get-download-path', () => settingsService.getDownloadPath())
@@ -1139,14 +1119,6 @@ app.whenReady().then(async () => {
       return { kind: 'unknown' as const, name }
     }
   })
-
-  // Validate that all IPC channels have handlers registered
-  const allHandled = typedIpcMain.validateAllHandlersRegistered()
-  if (!allHandled) {
-    console.warn('WARNING: Not all IPC channels have registered handlers!')
-  } else {
-    console.log('All IPC channels have registered handlers.')
-  }
 
   // Create window FIRST
   createWindow()

@@ -341,13 +341,6 @@ export const GamesProvider: React.FC<GamesProviderProps> = ({ children }) => {
     }
   }, [isInitialLoadComplete, primeLibraryDescriptions])
 
-  const getTrailerUrl = useCallback(
-    async (gameName: string, packageName: string | undefined): Promise<string | null> => {
-      return await window.api.games.getTrailerUrl(gameName, packageName)
-    },
-    []
-  )
-
   const refreshGames = useCallback(async (): Promise<void> => {
     try {
       setIsLoading(true)
@@ -467,7 +460,6 @@ export const GamesProvider: React.FC<GamesProviderProps> = ({ children }) => {
       missingGames,
       uploadCandidates,
       uploadCandidatesVersion,
-      getTrailerUrl,
       getDescription,
       descriptionSnapshot,
       addGameToBlacklist,
@@ -493,7 +485,6 @@ export const GamesProvider: React.FC<GamesProviderProps> = ({ children }) => {
       missingGames,
       uploadCandidates,
       uploadCandidatesVersion,
-      getTrailerUrl,
       getDescription,
       descriptionSnapshot,
       addGameToBlacklist,

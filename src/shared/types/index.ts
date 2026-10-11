@@ -137,9 +137,7 @@ export interface GameDescriptionError {
 }
 
 export type GameDescriptionResult =
-  | GameDescriptionFound
-  | GameDescriptionNotFound
-  | GameDescriptionError
+  GameDescriptionFound | GameDescriptionNotFound | GameDescriptionError
 
 export interface GameDescriptionRequest {
   key: string
@@ -178,12 +176,7 @@ export interface UploadPreparationProgress {
 }
 
 export type UploadStatus =
-  | 'Queued'
-  | 'Preparing'
-  | 'Uploading'
-  | 'Completed'
-  | 'Error'
-  | 'Cancelled'
+  'Queued' | 'Preparing' | 'Uploading' | 'Completed' | 'Error' | 'Cancelled'
 
 export interface UploadItem {
   packageName: string
@@ -198,6 +191,7 @@ export interface UploadItem {
   zipPath?: string
   isLocalUpload?: boolean
   sourcePath?: string
+  sourceObbPaths?: string[]
 }
 
 // Download types
@@ -362,7 +356,6 @@ export interface GamesAPI {
   forceSync: () => Promise<GameInfo[]>
   getNote: (releaseName: string) => Promise<string>
   getBlacklistGames: () => Promise<BlacklistEntry[]>
-  getTrailerUrl: (gameName: string, packageName: string | undefined) => Promise<string | null>
   addToBlacklist: (packageName: string, version?: number | 'any') => Promise<boolean>
   removeFromBlacklist: (packageName: string) => Promise<boolean>
   isGameBlacklisted: (packageName: string, version?: number) => boolean
@@ -454,6 +447,7 @@ export interface UploadAPI {
   ) => Promise<boolean>
   removeFromQueue: (packageName: string) => void
   cancelUpload: (packageName: string) => void
+  retryUpload: (packageName: string) => Promise<boolean>
   addLocalItemsToQueue: (paths: string[]) => Promise<{ errors: LocalUploadError[] }>
 }
 

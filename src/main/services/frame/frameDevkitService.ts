@@ -1,6 +1,7 @@
+import { writeJsonAtomic } from '../fileSafety'
 import { app } from 'electron'
 import { promises as fs } from 'fs'
-import { basename, dirname, extname, join, resolve } from 'path'
+import { basename, dirname, extname, join, resolve, sep } from 'path'
 import { execa } from 'execa'
 import type { PackageInfo } from '@shared/types'
 import adbService from '../adbService'
@@ -38,6 +39,7 @@ export interface FrameSourceRecord {
   packageName: string
   versionCode: number
   gameId: string
+  originalObbPaths?: string[]
   originalSourcePath: string
   recordedAt: number
 }
@@ -45,6 +47,8 @@ export interface FrameSourceRecord {
 type ProgressReporter = (step: string, percent?: number) => void
 
 class FrameDevkitService {
+  private deployments: Promise<void> = Promise.resolve()
+  private registryWrites: Promise<void> = Promise.resolve()
   private getSourceRegistryPath(): string {
     return join(app.getPath('userData'), 'frame-source-registry.json')
   }
@@ -60,9 +64,13 @@ class FrameDevkitService {
   }
 
   private async saveSourceRecord(record: FrameSourceRecord): Promise<void> {
-    const registry = await this.readSourceRegistry()
-    registry[record.packageName] = record
-    await fs.writeFile(this.getSourceRegistryPath(), JSON.stringify(registry, null, 2), 'utf-8')
+    const write = this.registryWrites.then(async () => {
+      const registry = await this.readSourceRegistry()
+      registry[record.packageName] = record
+      await writeJsonAtomic(this.getSourceRegistryPath(), registry)
+    })
+    this.registryWrites = write.catch(() => {})
+    await write
     console.log(
       `[Frame Devkit] Recorded original source for ${record.packageName}: ${record.originalSourcePath}`
     )
@@ -90,11 +98,9 @@ class FrameDevkitService {
   }
 
   private async resolvePython(): Promise<string> {
-    const candidates = [
-      process.env.FRAME_CYBERDECK_PYTHON?.trim(),
-      'python3',
-      'python'
-    ].filter((value): value is string => Boolean(value))
+    const candidates = [process.env.FRAME_CYBERDECK_PYTHON?.trim(), 'python3', 'python'].filter(
+      (value): value is string => Boolean(value)
+    )
 
     const failures: string[] = []
     for (const python of [...new Set(candidates)]) {
@@ -102,9 +108,7 @@ class FrameDevkitService {
         await execa(python, ['--version'])
         return python
       } catch (error) {
-        failures.push(
-          `${python}: ${error instanceof Error ? error.message : String(error)}`
-        )
+        failures.push(`${python}: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
 
@@ -120,8 +124,10 @@ class FrameDevkitService {
    * Successful detections are sticky for five minutes: re-detecting per call
    * made a transient device-list blip fall back to hostname mid-pipeline.
    */
-  private usbEndpointCache: { endpoint: { host: string; port: number; sshPort: number }; at: number } | null =
-    null
+  private usbEndpointCache: {
+    endpoint: { host: string; port: number; sshPort: number }
+    at: number
+  } | null = null
 
   private async usbDevkitEndpoint(): Promise<{
     host: string
@@ -192,14 +198,7 @@ class FrameDevkitService {
     let stdout = ''
     let stderr = ''
     try {
-      const child = execa(python, [
-        helper,
-        '--host',
-        bridgeHost,
-        ...bridgeArgs,
-        command,
-        ...args
-      ])
+      const child = execa(python, [helper, '--host', bridgeHost, ...bridgeArgs, command, ...args])
       // The bridge emits {"ok":true,"deployProgress":N} lines while rsync
       // runs; forward them for live progress. The final line is the result.
       if (onDeployProgress && child.stdout) {
@@ -238,11 +237,7 @@ class FrameDevkitService {
       stdout = candidate.stdout ?? ''
       stderr = candidate.stderr ?? ''
 
-      const failedLine = stdout
-        .trim()
-        .split(/\r?\n/)
-        .filter(Boolean)
-        .at(-1)
+      const failedLine = stdout.trim().split(/\r?\n/).filter(Boolean).at(-1)
 
       if (failedLine) {
         try {
@@ -270,11 +265,7 @@ class FrameDevkitService {
     }
 
     if (stderr.trim()) console.log(`[Frame Devkit] ${stderr.trim()}`)
-    const line = stdout
-      .trim()
-      .split(/\r?\n/)
-      .filter(Boolean)
-      .at(-1)
+    const line = stdout.trim().split(/\r?\n/).filter(Boolean).at(-1)
     if (!line) throw new Error('SteamOS Devkit bridge returned no result')
 
     let parsed: T
@@ -321,7 +312,9 @@ class FrameDevkitService {
 
     if (stat.isFile()) {
       if (!source.toLowerCase().endsWith('.apk')) {
-        throw new Error(`Frame Devkit deploy currently accepts an APK or extracted game folder: ${source}`)
+        throw new Error(
+          `Frame Devkit deploy currently accepts an APK or extracted game folder: ${source}`
+        )
       }
       searchRoot = dirname(source)
       apkCandidates = [source]
@@ -347,8 +340,24 @@ class FrameDevkitService {
 
     const apk = preferred ?? apkCandidates[0]
     const allFiles = await this.walkFiles(searchRoot, 4)
-    const obbs = allFiles.filter((file) => file.toLowerCase().endsWith('.obb'))
+    // Game data: everything under an obb/ directory (converter output holds
+    // non-OBB data there too, e.g. raw Unity bundles) plus classic .obb files.
+    const obbs = allFiles.filter(
+      (file) =>
+        file.toLowerCase().endsWith('.obb') ||
+        file.split(sep).some((part) => part.toLowerCase() === 'obb')
+    )
     return { apk, obbs, root: searchRoot }
+  }
+
+  /** Path of `file` relative to its top-level obb/ directory (flat name otherwise). */
+  private obbRelativePath(file: string): string {
+    const parts = file.split(sep)
+    let index = -1
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i].toLowerCase() === 'obb') index = i
+    }
+    return index === -1 ? basename(file) : parts.slice(index + 1).join(sep)
   }
 
   private async readConversionMetadata(root: string): Promise<{
@@ -385,15 +394,6 @@ class FrameDevkitService {
     }
   }
 
-  private safeDevkitName(title: string): string {
-    const safe = title
-      .normalize('NFKD')
-      .replace(/[^A-Za-z0-9._]+/g, '_')
-      .replace(/^_+|_+$/g, '')
-      .slice(0, 80)
-    return safe || `frame_game_${Date.now()}`
-  }
-
   private async createStagingDirectory(
     sourcePath: string,
     title: string,
@@ -407,73 +407,86 @@ class FrameDevkitService {
   }> {
     onProgress?.('Analyzing Android package…', 5)
     const payload = await this.resolveAndroidPayload(sourcePath)
-    const devkitName = this.safeDevkitName(title)
+    const conversion = await this.readConversionMetadata(payload.root)
+    const packageName = conversion.packageName
+    if (!packageName || !/^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$/.test(packageName)) {
+      throw new Error(
+        'Converted APK has no valid package identity. Convert the original Quest APK again.'
+      )
+    }
+    const devkitName = packageName
+    const versionCode = conversion.versionCode ?? 0
     // Stage on the real disk, not the OS temp dir: /tmp is a small tmpfs on
     // many Linux distros, and a large game's OBBs overflow it mid-copy.
     const base = join(app.getPath('userData'), 'frame-cyberdeck')
     await fs.mkdir(base, { recursive: true })
     const directory = await fs.mkdtemp(join(base, `${devkitName}-`))
 
-    onProgress?.('Preparing Frame title…', 15)
-    await fs.copyFile(payload.apk, join(directory, 'game.apk'))
+    try {
+      onProgress?.('Preparing Frame title…', 15)
+      await fs.copyFile(payload.apk, join(directory, 'game.apk'))
 
-    // Library artwork for the Steam shortcut; the devkit-side polish step
-    // installs it as grid/<appid>p/_hero on the Frame.
-    if (thumbnailPath) {
-      try {
-        await fs.copyFile(thumbnailPath, join(directory, `library${extname(thumbnailPath)}`))
-      } catch (error) {
-        console.warn(
-          '[Frame Devkit] Could not stage library artwork:',
-          error instanceof Error ? error.message : String(error)
-        )
-      }
-    }
-
-    const conversion = await this.readConversionMetadata(payload.root)
-    const packageName = conversion.packageName ?? devkitName
-    const versionCode = conversion.versionCode ?? 0
-    await fs.writeFile(
-      join(directory, 'frame-cyberdeck.json'),
-      JSON.stringify(
-        {
-          schemaVersion: 1,
-          gameId: devkitName,
-          // The caller's game name (the catalog title) is the name the user
-          // knows; the APK's own label is often an internal codename.
-          title: title || conversion.applicationLabel || devkitName,
-          packageName,
-          versionCode,
-          versionName: conversion.versionName ?? '',
-          applicationLabel: title || conversion.applicationLabel || devkitName
-        },
-        null,
-        2
-      ),
-      'utf-8'
-    )
-
-    if (payload.obbs.length > 0) {
-      const obbDir = join(directory, 'obb')
-      await fs.mkdir(obbDir, { recursive: true })
-      const names = new Set<string>()
-      let copied = 0
-      for (const obb of payload.obbs) {
-        const name = basename(obb)
-        if (names.has(name)) {
-          throw new Error(`Two OBB files have the same filename (${name}); refusing an ambiguous upload.`)
+      // Library artwork for the Steam shortcut; the devkit-side polish step
+      // installs it as grid/<appid>p/_hero on the Frame.
+      if (thumbnailPath) {
+        try {
+          await fs.copyFile(thumbnailPath, join(directory, `library${extname(thumbnailPath)}`))
+        } catch (error) {
+          console.warn(
+            '[Frame Devkit] Could not stage library artwork:',
+            error instanceof Error ? error.message : String(error)
+          )
         }
-        names.add(name)
-        await fs.copyFile(obb, join(obbDir, name))
-        copied++
-        onProgress?.(
-          `Preparing OBB data (${copied}/${payload.obbs.length})…`,
-          15 + Math.round((copied / payload.obbs.length) * 20)
-        )
       }
-    }
 
-    return { directory, devkitName, packageName, versionCode }
+      await fs.writeFile(
+        join(directory, 'frame-cyberdeck.json'),
+        JSON.stringify(
+          {
+            schemaVersion: 1,
+            gameId: devkitName,
+            // The caller's game name (the catalog title) is the name the user
+            // knows; the APK's own label is often an internal codename.
+            title: title || conversion.applicationLabel || devkitName,
+            packageName,
+            versionCode,
+            versionName: conversion.versionName ?? '',
+            applicationLabel: title || conversion.applicationLabel || devkitName
+          },
+          null,
+          2
+        ),
+        'utf-8'
+      )
+
+      if (payload.obbs.length > 0) {
+        const obbDir = join(directory, 'obb')
+        await fs.mkdir(obbDir, { recursive: true })
+        const names = new Set<string>()
+        let copied = 0
+        for (const obb of payload.obbs) {
+          const name = this.obbRelativePath(obb)
+          if (names.has(name)) {
+            throw new Error(
+              `Two OBB files have the same filename (${name}); refusing an ambiguous upload.`
+            )
+          }
+          names.add(name)
+          await fs.mkdir(join(obbDir, dirname(name)), { recursive: true })
+          await fs.copyFile(obb, join(obbDir, name))
+          copied++
+          onProgress?.(
+            `Preparing OBB data (${copied}/${payload.obbs.length})…`,
+            15 + Math.round((copied / payload.obbs.length) * 20)
+          )
+        }
+      }
+
+      return { directory, devkitName, packageName, versionCode }
+    } catch (error) {
+      await fs.rm(directory, { recursive: true, force: true }).catch(() => {})
+      throw error
+    }
   }
 
   async listGames(host?: string): Promise<FrameInstalledGame[]> {
@@ -485,7 +498,10 @@ class FrameDevkitService {
     return result.games
   }
 
-  private selectGame(games: FrameInstalledGame[], packageName: string): FrameInstalledGame | undefined {
+  private selectGame(
+    games: FrameInstalledGame[],
+    packageName: string
+  ): FrameInstalledGame | undefined {
     const exactGameId = games.find((entry) => entry.gameid === packageName)
     if (exactGameId) return exactGameId
 
@@ -571,7 +587,25 @@ class FrameDevkitService {
     return await this.runGame(game.gameid, host)
   }
 
-  async deploy(
+  deploy(
+    sourcePath: string,
+    title: string,
+    onProgress?: ProgressReporter,
+    host?: string,
+    originalSourcePath?: string,
+    thumbnailPath?: string
+  ): Promise<boolean> {
+    const deployment = this.deployments.then(() =>
+      this.deployNow(sourcePath, title, onProgress, host, originalSourcePath, thumbnailPath)
+    )
+    this.deployments = deployment.then(
+      () => {},
+      () => {}
+    )
+    return deployment
+  }
+
+  private async deployNow(
     sourcePath: string,
     title: string,
     onProgress?: ProgressReporter,
@@ -595,6 +629,31 @@ class FrameDevkitService {
         thumbnailPath
       )
       staging = prepared.directory
+      const installed = await this.listGames(host)
+      const previous = installed.find(
+        (game) =>
+          game.managed &&
+          game.packageName === prepared.packageName &&
+          game.gameid !== '.' &&
+          game.gameid !== '..' &&
+          /^[A-Za-z0-9._]+$/.test(game.gameid)
+      )
+      if (previous && previous.gameid !== prepared.devkitName) {
+        // Keep existing Steam shortcut settings when upgrading a verified legacy install.
+        prepared.devkitName = previous.gameid
+        const metadataPath = join(staging, 'frame-cyberdeck.json')
+        const metadata = JSON.parse(await fs.readFile(metadataPath, 'utf-8'))
+        await writeJsonAtomic(metadataPath, { ...metadata, gameId: prepared.devkitName })
+      }
+      const occupied = installed.find((game) => game.gameid === prepared.devkitName)
+      // An unmanaged title with the same package is the same game (for
+      // example an older hand-registered install) — updating it is fine.
+      // A different package holding this ID would lose its data; refuse.
+      if (occupied && occupied.packageName !== prepared.packageName) {
+        throw new Error(
+          `Devkit ID ${prepared.devkitName} is already used by another title; refusing to overwrite it.`
+        )
+      }
       onProgress?.('Uploading to Steam Frame with SteamOS Devkit…', 40)
 
       const result = await this.bridge<FrameDeployResult>(
@@ -609,7 +668,10 @@ class FrameDevkitService {
         ],
         host,
         (percent) =>
-          onProgress?.('Uploading to Steam Frame with SteamOS Devkit…', 40 + Math.round(percent * 0.6))
+          onProgress?.(
+            'Uploading to Steam Frame with SteamOS Devkit…',
+            40 + Math.round(percent * 0.6)
+          )
       )
 
       console.log(
@@ -617,11 +679,21 @@ class FrameDevkitService {
       )
 
       if (originalSourcePath) {
+        const original = originalSourcePath.toLowerCase().endsWith('.zip')
+          ? null
+          : await this.resolveAndroidPayload(originalSourcePath)
         await this.saveSourceRecord({
           packageName: prepared.packageName,
           versionCode: prepared.versionCode,
           gameId: prepared.devkitName,
           originalSourcePath: resolve(originalSourcePath),
+          originalObbPaths: [
+            ...new Map(
+              (original?.obbs ?? [])
+                .filter((path) => basename(path).endsWith(`.${prepared.packageName}.obb`))
+                .map((path) => [basename(path), path])
+            ).values()
+          ],
           recordedAt: Date.now()
         })
       }

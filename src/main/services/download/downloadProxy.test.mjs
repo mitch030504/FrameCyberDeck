@@ -79,16 +79,34 @@ test('normalizes valid DNS, IPv4, and IPv6 proxy addresses', () => {
 
 test('rejects proxy values that cannot identify a supported proxy', () => {
   for (const [value, message] of [
-    [{ enabled: true, protocol: 'socks4', host: 'proxy.example.com', port: 1080 }, /HTTP, HTTPS, or SOCKS5/],
-    [{ enabled: true, protocol: 'http', host: 'proxy.example.com', port: 8080, password: 'p' }, /password requires a username/],
-    [{ enabled: true, protocol: 'http', host: 'https://proxy.example.com', port: 8080 }, /host only/],
+    [
+      { enabled: true, protocol: 'socks4', host: 'proxy.example.com', port: 1080 },
+      /HTTP, HTTPS, or SOCKS5/
+    ],
+    [
+      { enabled: true, protocol: 'http', host: 'proxy.example.com', port: 8080, password: 'p' },
+      /password requires a username/
+    ],
+    [
+      { enabled: true, protocol: 'http', host: 'https://proxy.example.com', port: 8080 },
+      /host only/
+    ],
     [{ enabled: true, protocol: 'http', host: 'proxy.example.com/path', port: 8080 }, /host only/],
     [{ enabled: true, protocol: 'http', host: 'name@example.com', port: 8080 }, /host only/],
     [{ enabled: true, protocol: 'http', host: 'bad_host', port: 8080 }, /DNS name/],
     [{ enabled: true, protocol: 'http', host: '999.0.0.1', port: 8080 }, /DNS name/],
-    [{ enabled: true, protocol: 'http', host: 'proxy.example.com', port: 0 }, /integer from 1 through 65535/],
-    [{ enabled: true, protocol: 'http', host: 'proxy.example.com', port: 1.5 }, /integer from 1 through 65535/],
-    [{ enabled: true, protocol: 'http', host: 'proxy.example.com', port: '8080' }, /integer from 1 through 65535/]
+    [
+      { enabled: true, protocol: 'http', host: 'proxy.example.com', port: 0 },
+      /integer from 1 through 65535/
+    ],
+    [
+      { enabled: true, protocol: 'http', host: 'proxy.example.com', port: 1.5 },
+      /integer from 1 through 65535/
+    ],
+    [
+      { enabled: true, protocol: 'http', host: 'proxy.example.com', port: '8080' },
+      /integer from 1 through 65535/
+    ]
   ]) {
     assert.throws(() => proxy.normalizeDownloadProxySettings?.(value), message)
   }
@@ -110,15 +128,9 @@ test('prevents a custom proxy download from entering an active mirror path', () 
     host: 'proxy.example.com',
     port: 8080
   })
-  assert.equal(
-    proxy.selectGameArchiveMirror?.(enabledRoute, activeMirror),
-    undefined
-  )
+  assert.equal(proxy.selectGameArchiveMirror?.(enabledRoute, activeMirror), undefined)
   const disabledRoute = proxy.captureGameArchiveRouting?.({ ...DEFAULT_PROXY })
-  assert.deepEqual(
-    proxy.selectGameArchiveMirror?.(disabledRoute, activeMirror),
-    activeMirror
-  )
+  assert.deepEqual(proxy.selectGameArchiveMirror?.(disabledRoute, activeMirror), activeMirror)
 })
 
 test('gives fresh and resumed game archive launches the same proxy environment', () => {
@@ -150,12 +162,9 @@ test('keeps resume mirror selection and proxy environment on one routing snapsho
   settingsAtSelection.host = 'later-proxy.example.com'
 
   const activeMirror = { configFilePath: '/tmp/mirror.conf', remoteName: 'ftp-mirror' }
-  const environment = proxy.buildGameArchiveRcloneEnvironment?.(
-    true,
-    route,
-    'api-key',
-    { HTTP_PROXY: 'http://system.example:3128' }
-  )
+  const environment = proxy.buildGameArchiveRcloneEnvironment?.(true, route, 'api-key', {
+    HTTP_PROXY: 'http://system.example:3128'
+  })
 
   assert.deepEqual(route?.proxySettings, DEFAULT_PROXY)
   assert.deepEqual(proxy.selectGameArchiveMirror?.(route, activeMirror), activeMirror)
@@ -211,4 +220,17 @@ test('omits credentials from the proxy URL when no username is set', () => {
     { PATH: '/usr/bin' }
   )
   assert.equal(environment?.HTTP_PROXY, 'http://proxy.example.com:8080')
+})
+
+test('mirror routing strips inherited catalog credentials', () => {
+  const routing = proxy.captureGameArchiveRouting({
+    enabled: false,
+    protocol: 'http',
+    host: '',
+    port: 8080
+  })
+  const environment = proxy.buildGameArchiveRcloneEnvironment(false, routing, null, {
+    RCLONE_HEADER: 'X-API-Key: secret'
+  })
+  assert.equal(environment.RCLONE_HEADER, undefined)
 })

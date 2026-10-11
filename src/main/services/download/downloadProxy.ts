@@ -77,7 +77,9 @@ export function persistDownloadProxySettings(
   try {
     writeSettingsFile(settingsPath, JSON.stringify(savedSettings, null, 2))
   } catch {
-    throw new Error('Could not save custom proxy settings. Check that the settings folder is writable.')
+    throw new Error(
+      'Could not save custom proxy settings. Check that the settings folder is writable.'
+    )
   }
   return savedSettings
 }
@@ -118,6 +120,7 @@ export function buildGameArchiveRcloneEnvironment(
   inheritedEnvironment: NodeJS.ProcessEnv = process.env
 ): NodeJS.ProcessEnv {
   const environment = buildRcloneDownloadEnvironment(routing.proxySettings, inheritedEnvironment)
+  delete environment.RCLONE_HEADER
   if (apiKey) environment.RCLONE_HEADER = `X-API-Key: ${apiKey}`
   return environment
 }

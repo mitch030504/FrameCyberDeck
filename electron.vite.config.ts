@@ -42,7 +42,15 @@ export default defineConfig(() => {
           '@shared': resolve('src/shared')
         }
       },
-      plugins: [react()]
+      plugins: [
+        react(),
+        {
+          name: 'development-csp',
+          apply: 'serve',
+          transformIndexHtml: (html) =>
+            html.replace(/\s*<meta http-equiv="Content-Security-Policy"[^>]+>/, '')
+        }
+      ]
     }
   }
 })

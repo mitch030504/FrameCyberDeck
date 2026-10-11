@@ -1,4 +1,5 @@
 import { app, BrowserWindow } from 'electron'
+import { childPath } from './fileSafety'
 import { promises as fs, existsSync } from 'fs'
 import { join, dirname, basename, parse } from 'path'
 import { hostname, userInfo } from 'os'
@@ -40,6 +41,8 @@ class UploadService extends EventEmitter {
   private activeUpload: ReturnType<typeof execa> | null = null
   private activeCompression: SevenZip.ZipStream | null = null
   private isProcessing = false
+  private activePackage: string | null = null
+  private cancelled = new Set<string>()
   private uploadQueue: UploadItem[] = []
 
   constructor() {
@@ -118,6 +121,7 @@ class UploadService extends EventEmitter {
   }
 
   private emitProgress(packageName: string, stage: string, progress: number): void {
+    if (this.cancelled.has(packageName) && stage !== 'Cancelled') return
     const mainWindow = BrowserWindow.getAllWindows()[0]
     if (mainWindow && !mainWindow.isDestroyed()) {
       const progressData: UploadPreparationProgress = {
@@ -185,6 +189,7 @@ class UploadService extends EventEmitter {
     error?: string,
     zipPath?: string
   ): void {
+    if (this.cancelled.has(packageName) && status !== 'Cancelled') return
     const index = this.findItemIndex(packageName)
     if (index === -1) {
       console.warn(`[UploadService] Cannot update status for non-existent item: ${packageName}`)
@@ -217,6 +222,8 @@ class UploadService extends EventEmitter {
     versionCode: number,
     deviceId: string
   ): Promise<boolean> {
+    if (this.activePackage === packageName) return false
+    this.cancelled.delete(packageName)
     // Check if item is in the blacklist with this or lower version.
     if (gameService.isGameBlacklisted(packageName, versionCode)) {
       console.log(
@@ -246,11 +253,12 @@ class UploadService extends EventEmitter {
     // records the original source used for each managed install and contributes
     // that source instead of the converted/re-signed Frame APK.
     let frameSourcePath: string | undefined
+    let sourceObbPaths: string[] | undefined
     try {
       const device = (await adbService.listDevices()).find((entry) => entry.id === deviceId)
       if (device?.isSteamFrame) {
         const source = await frameDevkitService.getOriginalSource(packageName)
-        if (!source) {
+        if (!source || source.versionCode !== versionCode) {
           console.warn(
             `[UploadService] Cannot contribute ${packageName} from Steam Frame: original source provenance is unavailable. Reinstall the original APK/folder with this FrameCyberDeck build first.`
           )
@@ -263,6 +271,12 @@ class UploadService extends EventEmitter {
           return false
         }
         frameSourcePath = source.originalSourcePath
+        sourceObbPaths = source.originalObbPaths
+        if (frameSourcePath.toLowerCase().endsWith('.apk') && !sourceObbPaths) {
+          throw new Error(
+            'Original OBB provenance is missing. Reinstall the original APK before contributing it.'
+          )
+        }
       }
     } catch (error) {
       console.error('[UploadService] Failed to resolve Steam Frame source provenance:', error)
@@ -280,11 +294,13 @@ class UploadService extends EventEmitter {
       ...(frameSourcePath
         ? {
             isLocalUpload: true,
-            sourcePath: frameSourcePath
+            sourcePath: frameSourcePath,
+            sourceObbPaths
           }
         : {})
     }
 
+    if (this.activePackage === packageName || this.findItem(packageName)) return false
     this.uploadQueue.push(newItem)
     console.log(
       `[UploadService] Added ${packageName} v${versionCode} to upload queue${frameSourcePath ? ' using original Frame source provenance' : ''}.`
@@ -296,6 +312,32 @@ class UploadService extends EventEmitter {
     }
 
     return true
+  }
+
+  public retryUpload(packageName: string): boolean {
+    const item = this.findItem(packageName)
+    if (
+      !item ||
+      !['Error', 'Cancelled'].includes(item.status) ||
+      this.activePackage === packageName
+    )
+      return false
+    this.cancelled.delete(packageName)
+    Object.assign(item, {
+      status: 'Queued',
+      progress: 0,
+      stage: undefined,
+      error: undefined,
+      zipPath: undefined
+    })
+    this.emitQueueUpdated()
+    void this.processQueue()
+    return true
+  }
+
+  // shortcut: active ADB pulls and file copies finish before cancellation is checked; add cancellable streams if immediate abort is needed.
+  private assertNotCancelled(packageName: string): void {
+    if (this.cancelled.has(packageName)) throw new Error('Upload cancelled')
   }
 
   public removeFromQueue(packageName: string): void {
@@ -322,6 +364,7 @@ class UploadService extends EventEmitter {
     }
 
     this.isProcessing = true
+    this.activePackage = nextItem.packageName
     console.log(`[UploadService] Processing next upload: ${nextItem.packageName}`)
 
     try {
@@ -374,6 +417,7 @@ class UploadService extends EventEmitter {
             : 'Unknown error'
       )
     } finally {
+      this.activePackage = null
       this.isProcessing = false
       this.processQueue()
     }
@@ -496,6 +540,7 @@ class UploadService extends EventEmitter {
 
   private async processLocalUpload(item: UploadItem): Promise<boolean> {
     if (!item.sourcePath) return false
+    this.assertNotCancelled(item.packageName)
 
     try {
       const isZip = item.sourcePath.toLowerCase().endsWith('.zip')
@@ -524,9 +569,11 @@ class UploadService extends EventEmitter {
           // Copy the original source into staging. Frame provenance may be
           // either an extracted game folder or a single original Quest APK.
           const sourceStat = await fs.stat(item.sourcePath!)
+          this.assertNotCancelled(item.packageName)
           if (sourceStat.isDirectory()) {
             const entries = await fs.readdir(item.sourcePath!, { withFileTypes: true })
             for (const entry of entries) {
+              this.assertNotCancelled(item.packageName)
               const src = join(item.sourcePath!, entry.name)
               const dst = join(stagingDir, entry.name)
               if (entry.isDirectory()) {
@@ -537,8 +584,24 @@ class UploadService extends EventEmitter {
             }
           } else if (sourceStat.isFile() && item.sourcePath!.toLowerCase().endsWith('.apk')) {
             await fs.copyFile(item.sourcePath!, join(stagingDir, basename(item.sourcePath!)))
+            if (item.sourceObbPaths?.length) {
+              const obbDirectory = join(stagingDir, item.packageName)
+              await fs.mkdir(obbDirectory, { recursive: true })
+              const names = new Set<string>()
+              for (const obb of item.sourceObbPaths) {
+                this.assertNotCancelled(item.packageName)
+                const name = basename(obb)
+                if (!name.endsWith(`.${item.packageName}.obb`) || names.has(name)) {
+                  throw new Error('Invalid or duplicate original OBB provenance')
+                }
+                names.add(name)
+                await fs.copyFile(obb, join(obbDirectory, name))
+              }
+            }
           } else {
-            throw new Error('Original Frame contribution source must be an APK or extracted game folder')
+            throw new Error(
+              'Original Frame contribution source must be an APK or extracted game folder'
+            )
           }
 
           // Add HWID.txt
@@ -554,6 +617,7 @@ class UploadService extends EventEmitter {
             await fs.unlink(zipFilePath)
           }
 
+          this.assertNotCancelled(item.packageName)
           const compressStream = SevenZip.add(zipFilePath, `${stagingDir}/*`, {
             $bin: sevenZipPath,
             $progress: true
@@ -576,12 +640,17 @@ class UploadService extends EventEmitter {
             this.activeCompression = null
           }
 
+          this.assertNotCancelled(item.packageName)
           this.updateProgress(item.packageName, UploadStage.Compressing, 100)
 
           this.updateItemStatus(item.packageName, 'Uploading', 0, 'Uploading to server')
           this.updateProgress(item.packageName, UploadStage.Uploading, 0)
           const success = await this.uploadToServer(item.packageName, zipFilePath)
           if (!success) throw new Error('Upload failed')
+          this.assertNotCancelled(item.packageName)
+          await fs
+            .unlink(zipFilePath)
+            .catch((error) => console.warn('Could not remove generated upload archive:', error))
           this.updateItemStatus(item.packageName, 'Completed', 100, 'Complete')
           return true
         } finally {
@@ -664,6 +733,7 @@ class UploadService extends EventEmitter {
       }
 
       // Skip if already actively queued
+      if (this.activePackage === pkgName) continue
       const existing = this.findItem(pkgName)
       if (
         existing &&
@@ -674,6 +744,8 @@ class UploadService extends EventEmitter {
         console.log(`[UploadService] ${pkgName} already in queue, skipping`)
         continue
       }
+
+      this.uploadQueue = this.uploadQueue.filter((item) => item.packageName !== pkgName)
 
       const newItem: UploadItem = {
         packageName: pkgName,
@@ -713,6 +785,7 @@ class UploadService extends EventEmitter {
     }
 
     try {
+      this.assertNotCancelled(packageName)
       // --- SETUP STAGE ---
       this.updateProgress(packageName, UploadStage.Setup, 0)
 
@@ -733,7 +806,7 @@ class UploadService extends EventEmitter {
 
       // Create folder path for the app
       const packageFolderName = packageName
-      const packageFolderPath = join(this.uploadsBasePath, packageFolderName)
+      const packageFolderPath = childPath(this.uploadsBasePath, packageFolderName)
 
       // Clean up any existing folder
       if (existsSync(packageFolderPath)) {
@@ -744,6 +817,7 @@ class UploadService extends EventEmitter {
       await fs.mkdir(packageFolderPath, { recursive: true })
       this.updateProgress(packageName, UploadStage.Setup, 100)
 
+      this.assertNotCancelled(packageName)
       // --- PULLING APK STAGE ---
       this.updateProgress(packageName, UploadStage.PullingApk, 0)
 
@@ -763,9 +837,11 @@ class UploadService extends EventEmitter {
       // Pull the APK file
       this.updateProgress(packageName, UploadStage.PullingApk, 50)
       console.log(`Pulling APK from ${apkPath} to ${localApkPath}...`)
+      this.assertNotCancelled(packageName)
       await adbService.pullFile(deviceId, apkPath, localApkPath)
       this.updateProgress(packageName, UploadStage.PullingApk, 100)
 
+      this.assertNotCancelled(packageName)
       // --- ANALYZING OBB STAGE ---
       this.updateProgress(packageName, UploadStage.AnalyzingObb, 0)
 
@@ -775,6 +851,7 @@ class UploadService extends EventEmitter {
       const obbExists = await adbService.runShellCommand(deviceId, obbCheckCmd)
       this.updateProgress(packageName, UploadStage.AnalyzingObb, 50)
 
+      this.assertNotCancelled(packageName)
       // --- PULLING OBB STAGE ---
       this.updateProgress(packageName, UploadStage.PullingObb, 0)
 
@@ -821,6 +898,7 @@ class UploadService extends EventEmitter {
 
           // Pull each file one by one, maintaining directory structure
           for (let i = 0; i < fileEntries.length; i++) {
+            this.assertNotCancelled(packageName)
             const { path: remotePath, size } = fileEntries[i]
 
             // Create relative path from OBB folder root
@@ -834,6 +912,7 @@ class UploadService extends EventEmitter {
             console.log(
               `Pulling file ${i + 1}/${fileEntries.length}: ${remotePath} (${size} bytes)`
             )
+            this.assertNotCancelled(packageName)
             await adbService.pullFile(deviceId, remotePath, localPath)
 
             // Update progress
@@ -849,6 +928,7 @@ class UploadService extends EventEmitter {
         this.updateProgress(packageName, UploadStage.PullingObb, 100)
       }
 
+      this.assertNotCancelled(packageName)
       // --- CREATING METADATA STAGE ---
       this.updateProgress(packageName, UploadStage.CreatingMetadata, 0)
 
@@ -856,11 +936,12 @@ class UploadService extends EventEmitter {
       await fs.writeFile(join(packageFolderPath, 'HWID.txt'), hwid, 'utf-8')
       this.updateProgress(packageName, UploadStage.CreatingMetadata, 100)
 
+      this.assertNotCancelled(packageName)
       // --- COMPRESSING STAGE ---
       this.updateProgress(packageName, UploadStage.Compressing, 0)
 
       // Create the zip file
-      const zipFileName = `${gameName} v${versionCode} ${packageName} ${hwidPrefix} ${deviceCodename}.zip`
+      const zipFileName = `${gameName.replace(/[<>:"/\\|?*]/g, '_')} v${versionCode} ${packageName} ${hwidPrefix} ${deviceCodename}.zip`
       const zipFilePath = join(this.uploadsBasePath, zipFileName)
 
       // Delete existing zip file if it exists
@@ -876,6 +957,7 @@ class UploadService extends EventEmitter {
 
       console.log(`Creating zip archive at ${zipFilePath}...`)
 
+      this.assertNotCancelled(packageName)
       const compressStream = SevenZip.add(zipFilePath, `${packageFolderPath}/*`, {
         $bin: sevenZipPath,
         $progress: true
@@ -904,6 +986,7 @@ class UploadService extends EventEmitter {
 
       await fs.rm(packageFolderPath, { recursive: true, force: true })
 
+      this.assertNotCancelled(packageName)
       // --- UPLOADING STAGE ---
       this.updateProgress(packageName, UploadStage.Uploading, 0)
 
@@ -923,12 +1006,17 @@ class UploadService extends EventEmitter {
           throw new Error('Failed to upload to server')
         }
 
+        this.assertNotCancelled(packageName)
+        await fs
+          .unlink(zipFilePath)
+          .catch((error) => console.warn('Could not remove generated upload archive:', error))
         this.updateProgress(packageName, UploadStage.Uploading, 100)
       } catch (uploadError) {
         console.error(`Error uploading ${zipFilePath} to server:`, uploadError)
         throw uploadError
       }
 
+      this.assertNotCancelled(packageName)
       // --- COMPLETE STAGE ---
       this.updateProgress(packageName, UploadStage.Complete, 100)
       console.log(`Upload completed: ${zipFilePath}`)
@@ -948,6 +1036,7 @@ class UploadService extends EventEmitter {
    * @returns true if upload was successful, false otherwise
    */
   private async uploadToServer(packageName: string, zipFilePath: string): Promise<boolean> {
+    this.assertNotCancelled(packageName)
     console.log(`[UploadService] Starting upload of ${zipFilePath} to server`)
 
     if (!existsSync(this.configFilePath)) {
@@ -1018,16 +1107,9 @@ class UploadService extends EventEmitter {
 
       // Wait for the upload to complete
       await this.activeUpload
+      this.assertNotCancelled(packageName)
 
       console.log(`[UploadService] Zip file uploaded successfully`)
-
-      // Clean up
-
-      try {
-        await fs.unlink(zipFilePath)
-      } catch (error) {
-        console.warn(`[UploadService] Failed to delete zip file: ${zipFilePath}`, error)
-      }
 
       this.activeUpload = null
       return true
@@ -1046,38 +1128,18 @@ class UploadService extends EventEmitter {
   }
 
   public cancelUpload(packageName: string): void {
-    let cancelled = false
-
-    // Cancel active compression if running
-    if (this.activeCompression) {
-      console.log(`[UploadService] Cancelling active compression`)
-      try {
-        this.activeCompression.destroy()
-        this.activeCompression = null
-        cancelled = true
-      } catch (error) {
-        console.error(`[UploadService] Error cancelling compression:`, error)
-      }
-    }
-
-    // Cancel active upload if running
-    if (this.activeUpload) {
-      console.log(`[UploadService] Cancelling active upload`)
-      try {
-        this.activeUpload.kill('SIGTERM')
-        this.activeUpload = null
-        cancelled = true
-      } catch (error) {
-        console.error(`[UploadService] Error cancelling upload:`, error)
-      }
-    }
-
-    if (cancelled) {
-      this.emitProgress(packageName, 'Cancelled', 0)
-      this.updateItemStatus(packageName, 'Cancelled', 0, 'Cancelled')
-    } else {
-      console.log(`[UploadService] No active upload or compression to cancel`)
-    }
+    const item = this.findItem(packageName)
+    if (!item || !['Queued', 'Preparing', 'Uploading'].includes(item.status)) return
+    this.cancelled.add(packageName)
+    this.updateItemStatus(packageName, 'Cancelled', 0, 'Cancelled')
+    this.emitProgress(packageName, 'Cancelled', 0)
+    if (this.activePackage !== packageName) return
+    // Stop the child, then let the awaiting operation settle before another upload starts.
+    ;(
+      this.activeCompression as
+        (SevenZip.ZipStream & { _childProcess: import('child_process').ChildProcess }) | null
+    )?._childProcess.kill('SIGTERM')
+    this.activeUpload?.kill('SIGTERM')
   }
 }
 

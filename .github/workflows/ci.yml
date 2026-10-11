@@ -34,7 +34,7 @@ jobs:
       # --ignore-scripts skips Electron's binary download and native rebuilds:
       # none of the checks below launch Electron, so we don't pay for it.
       - name: Install dependencies
-        run: npm install --ignore-scripts --no-audit --no-fund
+        run: npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund
 
       - name: Typecheck (main / node)
         run: npm run typecheck:node
@@ -69,7 +69,7 @@ jobs:
           cache: 'npm'
 
       - name: Install dependencies
-        run: npm install --ignore-scripts --no-audit --no-fund
+        run: npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund
 
       - name: Lint
         run: npm run lint

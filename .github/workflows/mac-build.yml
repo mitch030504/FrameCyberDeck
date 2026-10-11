@@ -26,25 +26,28 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ startsWith(inputs.version, 'v') && inputs.version || format('v{0}', inputs.version) }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
+          node-version: '22.x'
           cache: 'npm'
 
       - name: Install dependencies
-        run: npm install --legacy-peer-deps
+        run: npm ci --legacy-peer-deps
 
-      - name: Pin version in package.json
+      - name: Verify version matches the release tag
         shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          VERSION="${{ inputs.version }}"
+          set -euo pipefail
           VERSION="${VERSION#v}"
           export VERSION
-          node -e "const fs=require('fs');const p=require('./package.json');p.version=process.env.VERSION;fs.writeFileSync('./package.json',JSON.stringify(p,null,2)+'\n');"
-          echo "Building version: $VERSION"
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          node -e "if(require('./package.json').version!==process.env.VERSION)process.exit(1)"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Build app directories (no dmg-builder required)
         env:
@@ -99,7 +102,10 @@ jobs:
           TAG="v${VERSION}"
           REPO="${{ github.repository }}"
           echo "Verifying release $TAG exists in $REPO..."
-          gh release view "$TAG" --repo "$REPO"
+          if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft)" != true ]; then
+            echo "ERROR: refusing to replace assets in a published release"
+            exit 1
+          fi
 
           for DMG in dist/vr-cyberdeck-${VERSION}-x64.dmg dist/vr-cyberdeck-${VERSION}-arm64.dmg; do
             if [ ! -f "$DMG" ]; then

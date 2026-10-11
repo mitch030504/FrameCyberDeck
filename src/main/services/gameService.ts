@@ -9,7 +9,6 @@ import mirrorService from './mirrorService'
 import settingsService from './settingsService'
 import { getApiKey, redactApiKey as redactKey } from './apiKey'
 import { GameInfo, ServiceStatus, GamesAPI, BlacklistEntry } from '@shared/types'
-import metaStoreService from './metaStoreService'
 import EventEmitter from 'events'
 import { typedWebContentsSend } from '@shared/ipc-utils'
 import SevenZip from 'node-7z'
@@ -402,17 +401,13 @@ class GameService extends EventEmitter implements GamesAPI {
               '1.0',
               '--tpslimit-burst',
               '3',
-              '--no-check-certificate',
               '--progress'
             ]
-
-            // Pass the API key via env var so it never appears in args or errors
-            const mirrorApiKey = getApiKey()
 
             // Execute rclone using execa with progress reporting
             const rcloneProcess = execa(rclonePath, rcloneArgs, {
               stdio: ['ignore', 'pipe', 'pipe'],
-              env: mirrorApiKey ? { RCLONE_HEADER: `X-API-Key: ${mirrorApiKey}` } : undefined
+              env: { RCLONE_HEADER: undefined }
             })
 
             // Process stdout for progress information
@@ -505,7 +500,6 @@ class GameService extends EventEmitter implements GamesAPI {
         '1.0',
         '--tpslimit-burst',
         '3',
-        '--no-check-certificate',
         '--progress'
       ]
 
@@ -943,14 +937,6 @@ class GameService extends EventEmitter implements GamesAPI {
 
   getLastSyncTime(): Promise<Date | null> {
     return Promise.resolve(this.vrpConfig?.lastSync || null)
-  }
-
-  /**
-   * Resolve the YouTube trailer URL for a game. Delegates to MetaStoreService,
-   * which owns the trailer override registry and the local meta cache.
-   */
-  async getTrailerUrl(gameName: string, packageName: string | undefined): Promise<string | null> {
-    return metaStoreService.getTrailerUrl(gameName, packageName)
   }
 
   /**

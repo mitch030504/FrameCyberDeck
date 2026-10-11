@@ -53,20 +53,22 @@ def sha256(path: pathlib.Path) -> str:
 
 def download(url: str, destination: pathlib.Path, expected_sha256: str | None = None) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temp = destination.with_suffix(destination.suffix + ".tmp")
-    request = urllib.request.Request(url, headers={"User-Agent": "FrameCyberDeck/0.1"})
-    log(f"Downloading {url}")
-    with urllib.request.urlopen(request, timeout=60) as response, temp.open("wb") as out:
-        shutil.copyfileobj(response, out)
-
-    if expected_sha256:
-        actual = sha256(temp)
-        if actual != expected_sha256:
-            temp.unlink(missing_ok=True)
-            raise RuntimeError(
-                f"SHA-256 mismatch for {destination.name}: expected {expected_sha256}, got {actual}"
-            )
-    temp.replace(destination)
+    descriptor, filename = tempfile.mkstemp(prefix=destination.name + ".", suffix=".tmp", dir=destination.parent)
+    temp = pathlib.Path(filename)
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "FrameCyberDeck/0.1"})
+        log(f"Downloading {url}")
+        with os.fdopen(descriptor, "wb") as out, urllib.request.urlopen(request, timeout=60) as response:
+            shutil.copyfileobj(response, out)
+        if expected_sha256:
+            actual = sha256(temp)
+            if actual != expected_sha256:
+                raise RuntimeError(
+                    f"SHA-256 mismatch for {destination.name}: expected {expected_sha256}, got {actual}"
+                )
+        temp.replace(destination)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def run(args: list[str | pathlib.Path], *, cwd: pathlib.Path | None = None) -> str:
@@ -110,6 +112,8 @@ def sdk_candidates() -> list[pathlib.Path]:
             values.append(pathlib.Path(value).expanduser())
     values += [
         pathlib.Path.home() / "Android" / "Sdk",
+        pathlib.Path.home() / "Library" / "Android" / "sdk",
+        pathlib.Path(os.environ.get("LOCALAPPDATA", str(pathlib.Path.home() / "AppData" / "Local"))) / "Android" / "Sdk",
         pathlib.Path.home() / ".local" / "share" / "android-sdk",
         pathlib.Path("/opt/android-sdk"),
         pathlib.Path("/usr/lib/android-sdk"),
@@ -134,6 +138,17 @@ def find_sdk() -> pathlib.Path:
     )
 
 
+def tool_path(build: pathlib.Path, name: str) -> pathlib.Path:
+    suffix = (".bat" if name == "apksigner" else ".exe") if os.name == "nt" else ""
+    return build / (name + suffix)
+
+
+def apksigner_command(build: pathlib.Path, java: pathlib.Path) -> list[pathlib.Path | str]:
+    if os.name == "nt":
+        return [java, "-jar", build / "lib" / "apksigner.jar"]
+    return [tool_path(build, "apksigner")]
+
+
 def find_build_tools(sdk: pathlib.Path) -> pathlib.Path:
     candidates = sorted(
         [p for p in (sdk / "build-tools").iterdir() if p.is_dir()],
@@ -141,7 +156,7 @@ def find_build_tools(sdk: pathlib.Path) -> pathlib.Path:
         reverse=True,
     )
     for build in candidates:
-        if all((build / name).exists() for name in ("aapt", "zipalign", "apksigner")):
+        if all(tool_path(build, name).is_file() for name in ("aapt", "zipalign", "apksigner")):
             return build
     raise RuntimeError(
         f"No Android build-tools directory under {sdk / 'build-tools'} contains aapt, zipalign and apksigner."
@@ -151,7 +166,7 @@ def find_build_tools(sdk: pathlib.Path) -> pathlib.Path:
 def find_java() -> pathlib.Path:
     java_home = os.environ.get("JAVA_HOME")
     if java_home:
-        candidate = pathlib.Path(java_home) / "bin" / "java"
+        candidate = pathlib.Path(java_home) / "bin" / ("java.exe" if os.name == "nt" else "java")
         if candidate.is_file():
             return candidate
     value = shutil.which("java")
@@ -261,26 +276,40 @@ def is_frame_converted(apk: pathlib.Path) -> bool:
         return False
 
 
-def copy_obbs(source_root: pathlib.Path, destination: pathlib.Path) -> int:
-    obbs = [p for p in source_root.rglob("*.obb") if p.is_file()]
-    if not obbs:
+def copy_obbs(source_root: pathlib.Path, destination: pathlib.Path, package: str) -> int:
+    # Two release layouts carry game data: classic OBB files named
+    # *.<package>.obb anywhere in the release, and a folder named after the
+    # package that holds the data files directly (raw Unity bundles, e.g.
+    # Blade & Sorcery). Both land in obb/, mirroring the
+    # /sdcard/Android/obb/<package> push a Quest install performs.
+    files: list[tuple[str, pathlib.Path]] = []
+    for folder in source_root.rglob(package):
+        if not folder.is_dir() or destination in folder.parents:
+            continue
+        for file in folder.rglob("*"):
+            if file.is_file() and destination not in file.parents:
+                files.append((file.relative_to(folder).as_posix(), file))
+    for obb in source_root.rglob("*.obb"):
+        if obb.is_file() and obb.name.endswith(f".{package}.obb") and destination not in obb.parents:
+            files.append((obb.name, obb))
+    if not files:
         return 0
     obb_dir = destination / "obb"
     obb_dir.mkdir(parents=True, exist_ok=True)
-    seen: dict[str, int] = {}
-    for obb in obbs:
-        size = obb.stat().st_size
-        if obb.name in seen:
-            # Downloads can contain the same release nested inside itself
-            # (mirror layout + re-extraction); identical name and size is the
-            # same file, so copy it once. Different sizes are a real conflict.
-            if seen[obb.name] != size:
+    seen: dict[str, str] = {}
+    for name, source in files:
+        digest = sha256(source)
+        if name in seen:
+            # Nested duplicate releases must contain identical data.
+            if seen[name] != digest:
                 raise RuntimeError(
-                    f"Conflicting OBB files with the same name but different sizes: {obb.name}"
+                    f"Conflicting OBB files with the same name but different contents: {name}"
                 )
             continue
-        seen[obb.name] = size
-        shutil.copy2(obb, obb_dir / obb.name)
+        seen[name] = digest
+        target = obb_dir.joinpath(*name.split("/"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
     return len(seen)
 
 
@@ -297,35 +326,14 @@ def convert(
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     game_apk = output_dir / "game.apk"
+    if game_apk == source_apk:
+        raise RuntimeError("Output APK would overwrite the original source; choose another output directory")
 
     refresh_rate = normalize_refresh_rate(refresh_rate)
 
-    if is_frame_converted(source_apk):
-        if refresh_rate:
-            raise RuntimeError(
-                "Custom refresh settings require reconversion from the original Quest APK."
-            )
-        log("APK already contains Frame conversion markers; copying without repatching.")
-        shutil.copy2(source_apk, game_apk)
-        obb_count = copy_obbs(source_root, output_dir)
-        return {
-            "ok": True,
-            "converted": False,
-            "alreadyConverted": True,
-            "gameApk": str(game_apk),
-            "directory": str(output_dir),
-            "obbCount": obb_count,
-            "sha256": sha256(game_apk),
-        }
-
-    root = tools_root()
     sdk = find_sdk()
     build = find_build_tools(sdk)
-    java = find_java()
-    jar = ensure_ovrport(root)
-    adapter = ensure_adapter(root)
-
-    badging = run([build / "aapt", "dump", "badging", source_apk])
+    badging = run([tool_path(build, "aapt"), "dump", "badging", source_apk])
     package_match = re.search(r"package: name='([^']+)'", badging)
     if not package_match:
         raise RuntimeError("Could not determine Android package name with aapt")
@@ -340,6 +348,37 @@ def convert(
     version_name = version_name_match.group(1) if version_name_match else ""
     application_label = label_match.group(1) if label_match else package
 
+
+    if is_frame_converted(source_apk):
+        if refresh_rate:
+            raise RuntimeError(
+                "Custom refresh settings require reconversion from the original Quest APK."
+            )
+        log("APK already contains Frame conversion markers; copying without repatching.")
+        shutil.copy2(source_apk, game_apk)
+        obb_count = copy_obbs(source_root, output_dir, package)
+        result = {
+            "ok": True,
+            "converted": False,
+            "alreadyConverted": True,
+            "package": package,
+            "versionCode": version_code,
+            "versionName": version_name,
+            "applicationLabel": application_label,
+            "gameApk": str(game_apk),
+            "directory": str(output_dir),
+            "obbCount": obb_count,
+            "sha256": sha256(game_apk),
+        }
+
+        (output_dir / "frame-conversion.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+        return result
+
+    root = tools_root()
+    java = find_java()
+    jar = ensure_ovrport(root)
+    adapter = ensure_adapter(root)
+
     with zipfile.ZipFile(source_apk) as source_zip:
         names = source_zip.namelist()
         if not any(name.startswith("lib/arm64-v8a/") for name in names):
@@ -348,7 +387,7 @@ def convert(
     workspace = root / "ovrport-workspace"
     workspace.mkdir(parents=True, exist_ok=True)
 
-    work = pathlib.Path(tempfile.mkdtemp(prefix="frame-cyberdeck-convert-"))
+    work = pathlib.Path(tempfile.mkdtemp(prefix="frame-cyberdeck-convert-", dir=output_dir))
     try:
         patch_dir = work / "ovrport"
         patch_dir.mkdir(parents=True)
@@ -397,7 +436,7 @@ def convert(
             )
 
         aligned = work / "aligned.apk"
-        run([build / "zipalign", "-f", "-P", "16", "4", unsigned, aligned])
+        run([tool_path(build, "zipalign"), "-f", "-P", "16", "4", unsigned, aligned])
 
         key = workspace / "signatures" / f"{package}.keystore"
         if not key.is_file():
@@ -407,7 +446,7 @@ def convert(
 
         run(
             [
-                build / "apksigner",
+                *apksigner_command(build, java),
                 "sign",
                 "--ks",
                 key,
@@ -420,14 +459,14 @@ def convert(
         )
         run(
             [
-                build / "apksigner",
+                *apksigner_command(build, java),
                 "verify",
                 "--verbose",
                 game_apk,
             ]
         )
 
-        obb_count = copy_obbs(source_root, output_dir)
+        obb_count = copy_obbs(source_root, output_dir, package)
         result = {
             "ok": True,
             "converted": True,

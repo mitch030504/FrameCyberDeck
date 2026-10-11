@@ -356,6 +356,14 @@ export function UpdateNotification(): React.ReactElement | null {
                   `}</style>
                   <div
                     className={`avr-rn ${styles.releaseNotes}`}
+                    onClick={(event) => {
+                      const anchor = (event.target as Element).closest('a')
+                      if (anchor) {
+                        event.preventDefault()
+                        if (/^https?:/i.test(anchor.href))
+                          window.api.updates.openDownloadPage(anchor.href)
+                      }
+                    }}
                     dangerouslySetInnerHTML={{ __html: releaseNotesHtml }}
                   />
                 </>

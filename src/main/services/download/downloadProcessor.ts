@@ -1,4 +1,4 @@
-import { join } from 'path'
+import { join, basename } from 'path'
 import { promises as fs, promises as fsPromises } from 'fs'
 import { execa, ExecaError } from 'execa'
 import crypto from 'crypto'
@@ -60,9 +60,7 @@ export class DownloadProcessor {
     downloadPath: string
   ): Promise<{ success: boolean; startExtraction: boolean; finalState?: DownloadItem } | null> {
     if (!(await verifyReleaseTree(downloadPath))) return null
-    console.log(
-      `[DownProc] ${item.releaseName} is already complete on disk; skipping download.`
-    )
+    console.log(`[DownProc] ${item.releaseName} is already complete on disk; skipping download.`)
     this.updateItemStatus(item.releaseName, 'Downloading', 100)
     return {
       success: true,
@@ -162,9 +160,10 @@ export class DownloadProcessor {
       return { success: false, startExtraction: false }
     }
 
-    const downloadPath = item.downloadPath.endsWith(item.releaseName)
-      ? item.downloadPath
-      : join(item.downloadPath, item.releaseName)
+    const downloadPath =
+      basename(item.downloadPath) === item.releaseName
+        ? item.downloadPath
+        : join(item.downloadPath, item.releaseName)
     this.queueManager.updateItem(item.releaseName, { downloadPath: downloadPath })
 
     // A previous run may have left the complete release on disk. Verify it
@@ -286,9 +285,10 @@ export class DownloadProcessor {
       return { success: false, startExtraction: false }
     }
 
-    const downloadPath = item.downloadPath.endsWith(item.releaseName)
-      ? item.downloadPath
-      : join(item.downloadPath, item.releaseName)
+    const downloadPath =
+      basename(item.downloadPath) === item.releaseName
+        ? item.downloadPath
+        : join(item.downloadPath, item.releaseName)
     this.queueManager.updateItem(item.releaseName, { downloadPath: downloadPath })
 
     // Declared outside `try` so the catch block can inspect transfer state
@@ -358,7 +358,6 @@ export class DownloadProcessor {
           downloadPath,
           '--config',
           mirrorConfig.configFilePath,
-          '--no-check-certificate',
           '--stats',
           '1s',
           '--stats-log-level',
@@ -404,7 +403,6 @@ export class DownloadProcessor {
           nullConfigPath,
           '--http-url',
           this.vrpConfig.baseUri!,
-          '--no-check-certificate',
           '--stats',
           '1s',
           '--stats-log-level',
@@ -451,14 +449,15 @@ export class DownloadProcessor {
       const env = buildGameArchiveRcloneEnvironment(
         isResume,
         routing,
-        apiKey,
+        mirrorConfig ? null : apiKey,
         process.env
       )
       const rcloneProcess = execa(rclonePath, copyArgs, {
         all: true,
         buffer: false,
         windowsHide: true,
-        env
+        env,
+        extendEnv: false
       })
 
       // Store download controller for cancel/pause
@@ -476,6 +475,7 @@ export class DownloadProcessor {
       if (rcloneProcess.all) {
         let lineBuffer = ''
         rcloneProcess.all.on('data', (chunk: Buffer) => {
+          if (this.queueManager.findItem(item.releaseName)?.status !== 'Downloading') return
           lineBuffer += chunk.toString()
           // Split on both \n and \r — rclone may emit \r-terminated lines
           // alongside \n-terminated JSON when --progress leaks through
@@ -681,6 +681,7 @@ export class DownloadProcessor {
       // code differs, so also check if the item was intentionally paused/cancelled.
       if (
         (isExecaError(error) && (error.exitCode === 143 || error.isCanceled)) ||
+        statusBeforeCatch === 'Queued' ||
         statusBeforeCatch === 'Paused' ||
         statusBeforeCatch === 'Cancelled'
       ) {
@@ -788,9 +789,10 @@ export class DownloadProcessor {
 
     // The interrupted run may have actually finished writing every file; if the
     // release verifies complete against its manifest, skip the transfer.
-    const downloadPath = item.downloadPath.endsWith(item.releaseName)
-      ? item.downloadPath
-      : join(item.downloadPath, item.releaseName)
+    const downloadPath =
+      basename(item.downloadPath) === item.releaseName
+        ? item.downloadPath
+        : join(item.downloadPath, item.releaseName)
     const skip = await this.alreadyCompleteResult(item, downloadPath)
     if (skip) return skip
 

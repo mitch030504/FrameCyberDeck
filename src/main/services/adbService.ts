@@ -1,3 +1,4 @@
+import { childPath } from './fileSafety'
 import { Adb, DeviceClient } from '@devicefarmer/adbkit'
 import Tracker from '@devicefarmer/adbkit/dist/src/adb/tracker'
 import { BrowserWindow } from 'electron'
@@ -162,7 +163,10 @@ class AdbService extends EventEmitter implements AdbAPI {
         }
       }
     } catch (frameProbeError) {
-      console.debug(`[ADB Service] ${serial} is not a native Steam Frame endpoint:`, frameProbeError)
+      console.debug(
+        `[ADB Service] ${serial} is not a native Steam Frame endpoint:`,
+        frameProbeError
+      )
     }
 
     try {
@@ -1372,23 +1376,11 @@ class AdbService extends EventEmitter implements AdbAPI {
     error?: string
   }> {
     const downloadPath = path.resolve(settingsService.getDownloadPath())
-    const gamePath = path.resolve(downloadPath, releaseName)
-    // releaseName arrives from the renderer and can name anything on disk;
-    // never delete outside the downloads folder.
-    if (gamePath !== downloadPath && !gamePath.startsWith(downloadPath + path.sep)) {
-      console.error(`[ADB Service] deleteGameFiles - refusing to delete outside downloads: ${releaseName}`)
-      return {
-        deleted: false,
-        path: gamePath,
-        error: 'Refusing to delete outside the downloads folder'
-      }
-    }
-    if (!releaseName) {
-      return {
-        deleted: false,
-        path: gamePath,
-        error: 'No game folder specified'
-      }
+    let gamePath: string
+    try {
+      gamePath = childPath(downloadPath, releaseName)
+    } catch {
+      return { deleted: false, path: downloadPath, error: 'Invalid game folder name' }
     }
     console.log(`[ADB Service] deleteGameFiles - Deleting ${gamePath}`)
     try {

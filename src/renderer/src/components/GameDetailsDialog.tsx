@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import { GameInfo, isSignatureMismatchError } from '@shared/types'
 import {
   Dialog,
@@ -81,8 +81,6 @@ interface GameDetailsDialogProps {
   onToggleStarred: () => void
 }
 
-const ALLOW_THIRD_PARTY_TRAILERS = false
-
 const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
   game,
   open,
@@ -105,77 +103,12 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
   isStarred,
   onToggleStarred
 }) => {
-  const { getTrailerUrl, getDescription, descriptionSnapshot } = useGames()
+  const { getDescription, descriptionSnapshot } = useGames()
   const { selectedDevice, selectedDeviceDetails } = useAdb()
   const [currentGameNote, setCurrentGameNote] = useState<string | null>(null)
   const [loadingNote, setLoadingNote] = useState(false)
-  const [trailerUrl, setTrailerUrl] = useState<string | null>(null)
-  const [loadingVideo, setLoadingVideo] = useState(false)
-  const [trailerOpen, setTrailerOpen] = useState(false)
   const [errorDetailOpen, setErrorDetailOpen] = useState(false)
   const [loadingDescription, setLoadingDescription] = useState(false)
-  const webviewRef = useRef<HTMLElement>(null)
-
-  // The trailer is loaded as the actual youtube.com/watch page (not /embed/,
-  // which gets rejected with error 152 for many trailers). On dom-ready we
-  // strip out everything except the player so the result looks like an
-  // embed. Same approach as ApprenticeVRSrc.
-  const handleWebviewReady = useCallback(() => {
-    const wv = webviewRef.current as
-      | (HTMLElement & {
-          insertCSS: (css: string) => Promise<string>
-          executeJavaScript: (code: string) => Promise<unknown>
-        })
-      | null
-    if (!wv) return
-    void wv.insertCSS(`
-      #masthead-container, #top-row, #bottom-row,
-      ytd-watch-metadata, #related, #comments,
-      #secondary, #below, ytd-masthead,
-      #guide-button, ytd-mini-guide-renderer,
-      #chat-container, .ytp-chrome-top,
-      #info-contents, #meta-contents,
-      ytd-merch-shelf-renderer, #offer-module,
-      tp-yt-app-drawer, #guide-wrapper,
-      .ytd-watch-flexy #menu, #subscribe-button,
-      .ytd-watch-flexy #actions, #notification-preference-button,
-      ytd-watch-next-secondary-results-renderer,
-      #description, #header, #content-header,
-      ytd-engagement-panel-section-list-renderer,
-      #panels, ytd-watch-flexy #cinematics,
-      ytd-compact-video-renderer, .ytp-endscreen-content,
-      .ytp-ce-element, .ytp-pause-overlay,
-      ytd-clarification-renderer, ytd-info-panel-content-renderer {
-        display: none !important;
-      }
-      body { overflow: hidden !important; background: #000 !important; }
-      #page-manager, ytd-watch-flexy, #player-container-outer,
-      #player-container-inner, #player, #ytd-player,
-      .html5-video-player, video {
-        position: fixed !important;
-        top: 0 !important; left: 0 !important;
-        width: 100vw !important; height: 100vh !important;
-        max-width: 100vw !important; max-height: 100vh !important;
-        margin: 0 !important; padding: 0 !important;
-      }
-      ytd-watch-flexy[theater], ytd-watch-flexy[fullscreen] {
-        max-height: 100vh !important;
-      }
-      .html5-video-container { width: 100% !important; height: 100% !important; }
-    `)
-    void wv.executeJavaScript(`
-      const v = document.querySelector('video');
-      if (v && v.paused) v.play();
-    `)
-  }, [])
-
-  useEffect(() => {
-    const wv = webviewRef.current
-    if (!wv || !trailerUrl) return
-    wv.addEventListener('dom-ready', handleWebviewReady)
-    return () => wv.removeEventListener('dom-ready', handleWebviewReady)
-  }, [trailerUrl, trailerOpen, handleWebviewReady])
-
   useEffect(() => {
     let alive = true
     if (open && game?.releaseName) {
@@ -196,28 +129,6 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
       alive = false
     }
   }, [open, game, getNote])
-
-  useEffect(() => {
-    let alive = true
-    if (ALLOW_THIRD_PARTY_TRAILERS && open && game?.name) {
-      setLoadingVideo(true)
-      setTrailerUrl(null)
-      setTrailerOpen(false)
-      getTrailerUrl(game.name, game.packageName)
-        .then((url) => {
-          if (alive && url) setTrailerUrl(url)
-        })
-        .catch(() => {
-          /* no trailer */
-        })
-        .finally(() => {
-          if (alive) setLoadingVideo(false)
-        })
-    }
-    return () => {
-      alive = false
-    }
-  }, [open, game, getTrailerUrl])
 
   const descriptionResult = game
     ? (descriptionSnapshot[gameDescriptionKey(game, 'en')] ?? null)
@@ -778,110 +689,6 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
               appLabel={game.name}
               isInstalled={!!game.isInstalled}
             />
-          )}
-
-          {ALLOW_THIRD_PARTY_TRAILERS && (
-            <>
-              {/* ── Collapsible Trailer ── */}
-          <div style={{ borderTop: '1px solid rgba(var(--vrcd-neon-raw),0.12)', paddingTop: 12 }}>
-            <button
-              onClick={() => setTrailerOpen(!trailerOpen)}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                width: '100%',
-                background: 'transparent',
-                border: 'none',
-                cursor: 'pointer',
-                color: 'rgba(var(--vrcd-neon-raw),0.8)',
-                fontFamily: 'monospace',
-                fontSize: 12,
-                letterSpacing: '0.1em',
-                textAlign: 'left',
-                padding: '2px 0'
-              }}
-            >
-              <span style={{ fontSize: 10 }}>{trailerOpen ? '▼' : '▶'}</span>
-              <span>TRAILER</span>
-              {loadingVideo && <Spinner size="tiny" style={{ marginLeft: 4 }} />}
-              {!trailerUrl && !loadingVideo && (
-                <span
-                  style={{
-                    marginLeft: 'auto',
-                    fontSize: 10,
-                    color: 'rgba(var(--vrcd-neon-raw),0.35)'
-                  }}
-                >
-                  no trailer found
-                </span>
-              )}
-            </button>
-
-            {trailerOpen && trailerUrl && (
-              <div
-                style={{
-                  position: 'relative',
-                  width: '100%',
-                  paddingTop: '56.25%',
-                  marginTop: 10,
-                  borderRadius: 6,
-                  overflow: 'hidden',
-                  border: '1px solid rgba(var(--vrcd-neon-raw),0.2)',
-                  background: '#000'
-                }}
-              >
-                {/youtube(?:-nocookie)?\.com|youtu\.be/.test(trailerUrl) ? (
-                  <webview
-                    ref={webviewRef}
-                    key={trailerUrl}
-                    src={trailerUrl}
-                    // eslint-disable-next-line react/no-unknown-property
-                    partition="persist:youtube"
-                    style={{
-                      position: 'absolute',
-                      top: 0,
-                      left: 0,
-                      width: '100%',
-                      height: '100%',
-                      border: 'none'
-                    }}
-                  />
-                ) : (
-                  <video
-                    key={trailerUrl}
-                    src={trailerUrl}
-                    controls
-                    autoPlay
-                    playsInline
-                    preload="metadata"
-                    style={{
-                      position: 'absolute',
-                      top: 0,
-                      left: 0,
-                      width: '100%',
-                      height: '100%',
-                      objectFit: 'contain'
-                    }}
-                  />
-                )}
-              </div>
-            )}
-            {trailerOpen && !trailerUrl && !loadingVideo && (
-              <p
-                style={{
-                  color: 'rgba(var(--vrcd-neon-raw),0.4)',
-                  fontFamily: 'monospace',
-                  fontSize: 12,
-                  margin: '8px 0 0'
-                }}
-              >
-                No trailer available.
-              </p>
-            )}
-          </div>
-
-            </>
           )}
 
           {/* ── Note section (bottom) ── */}

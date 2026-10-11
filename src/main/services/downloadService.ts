@@ -1,6 +1,7 @@
 import { app, BrowserWindow } from 'electron'
 import { promises as fs, existsSync } from 'fs'
-import { join, basename } from 'path'
+import { join, basename, resolve } from 'path'
+import { childPath } from './fileSafety'
 import { execFile } from 'child_process'
 import SevenZip from 'node-7z'
 import { awaitSevenZipStream } from './sevenZipUtils'
@@ -36,6 +37,8 @@ class DownloadService extends EventEmitter implements DownloadAPI {
   private downloadsPath: string
   private isInitialized = false
   private activeCount = 0
+  private activePipelines = new Map<string, Promise<void>>()
+  private pendingResumes = new Set<string>()
   private debouncedEmitUpdate: () => void
   private queueManager: QueueManager
   private downloadProcessor: DownloadProcessor
@@ -77,12 +80,20 @@ class DownloadService extends EventEmitter implements DownloadAPI {
     const previousPath = this.downloadsPath
     this.downloadsPath = path
     if (this.isInitialized && previousPath !== path) {
-      const changed = this.queueManager.updateAllItems((item) => item.status === 'Queued', {
-        downloadPath: path
-      })
-      if (changed) this.emitUpdate()
+      for (const item of this.queueManager.getQueue()) {
+        if (item.status === 'Queued') {
+          this.queueManager.updateItem(item.releaseName, {
+            downloadPath: childPath(path, item.releaseName)
+          })
+        }
+      }
+      this.emitUpdate()
     }
     void this.refreshStorageStatus(true)
+  }
+
+  public flushQueue(): Promise<void> {
+    return this.queueManager.saveQueue()
   }
 
   public getStorageStatus(): Promise<DownloadStorageStatus> {
@@ -238,7 +249,7 @@ class DownloadService extends EventEmitter implements DownloadAPI {
   public async checkOnDiskCompletion(
     releaseName: string
   ): Promise<'absent' | 'partial' | 'completed'> {
-    const folderPath = join(this.downloadsPath, releaseName)
+    const folderPath = childPath(this.downloadsPath, releaseName)
     if (!existsSync(folderPath)) return 'absent'
     let entries: string[]
     try {
@@ -277,13 +288,14 @@ class DownloadService extends EventEmitter implements DownloadAPI {
     action: 'reinstall' | 'redownload'
   ): Promise<AddToQueueResult> {
     if (!this.isInitialized || !game.releaseName) return 'duplicate'
+    childPath(this.downloadsPath, game.releaseName)
     if (this.storageStatus.state !== 'available') return 'storage-unavailable'
     if (action === 'reinstall') {
       this.importExistingAsCompleted(game)
       return 'imported'
     }
     // redownload: wipe the existing folder so rclone copies into a clean dest
-    const folderPath = join(this.downloadsPath, game.releaseName)
+    const folderPath = childPath(this.downloadsPath, game.releaseName)
     try {
       await fs.rm(folderPath, { recursive: true, force: true })
     } catch (err) {
@@ -293,7 +305,7 @@ class DownloadService extends EventEmitter implements DownloadAPI {
   }
 
   private importExistingAsCompleted(game: GameInfo): void {
-    const folderPath = join(this.downloadsPath, game.releaseName)
+    const folderPath = childPath(this.downloadsPath, game.releaseName)
     const existing = this.queueManager.findItem(game.releaseName)
     if (existing) {
       this.queueManager.updateItem(game.releaseName, {
@@ -331,6 +343,7 @@ class DownloadService extends EventEmitter implements DownloadAPI {
     game: GameInfo,
     opts: { skipOnDiskCheck?: boolean } = {}
   ): Promise<AddToQueueResult> {
+    childPath(this.downloadsPath, game.releaseName)
     if (this.storageStatus.state !== 'available') return 'storage-unavailable'
     const existing = this.queueManager.findItem(game.releaseName)
 
@@ -360,7 +373,7 @@ class DownloadService extends EventEmitter implements DownloadAPI {
           return 'imported'
         }
         if (action === 'redownload') {
-          const folderPath = join(this.downloadsPath, game.releaseName)
+          const folderPath = childPath(this.downloadsPath, game.releaseName)
           try {
             await fs.rm(folderPath, { recursive: true, force: true })
           } catch (err) {
@@ -385,7 +398,7 @@ class DownloadService extends EventEmitter implements DownloadAPI {
       progress: 0,
       addedDate: Date.now(),
       thumbnailPath: game.thumbnailPath,
-      downloadPath: this.downloadsPath,
+      downloadPath: childPath(this.downloadsPath, game.releaseName),
       size: game.size
     }
     this.queueManager.addItem(newItem)
@@ -416,7 +429,7 @@ class DownloadService extends EventEmitter implements DownloadAPI {
     const item = this.queueManager.findItem(releaseName)
     if (!item) return
     this.cancelActiveItem(releaseName, item)
-    await this.deleteDownloadedFiles(releaseName)
+    if (!(await this.deleteDownloadedFiles(releaseName))) return
     const removed = this.queueManager.removeItem(releaseName)
     if (removed) {
       console.log(`[Service] Removed ${releaseName} from queue (status: ${item.status}).`)
@@ -472,7 +485,9 @@ class DownloadService extends EventEmitter implements DownloadAPI {
     const maxConcurrent = settingsService.getMaxConcurrentDownloads()
     // Launch as many concurrent pipelines as allowed
     while (this.activeCount < maxConcurrent) {
-      const nextItem = this.queueManager.findNextQueuedItem()
+      const nextItem = this.queueManager
+        .getQueue()
+        .find((item) => item.status === 'Queued' && !this.activePipelines.has(item.releaseName))
       if (!nextItem) {
         if (this.activeCount === 0) {
           console.log('[Service ProcessQueue] No queued items and no active operations')
@@ -484,7 +499,7 @@ class DownloadService extends EventEmitter implements DownloadAPI {
       // so the next loop iteration of findNextQueuedItem() won't pick the same item again.
       this.queueManager.updateItem(nextItem.releaseName, {
         status: 'Downloading',
-        progress: 0
+        progress: this.pendingResumes.has(nextItem.releaseName) ? nextItem.progress : 0
       })
 
       // Mark as active immediately so the next loop iteration won't pick it again
@@ -494,7 +509,11 @@ class DownloadService extends EventEmitter implements DownloadAPI {
       )
 
       // Fire off the pipeline without awaiting — runs concurrently
-      this.runPipeline(nextItem).finally(() => {
+      const resume = this.pendingResumes.delete(nextItem.releaseName)
+      const pipeline = resume ? this.runResumePipeline(nextItem) : this.runPipeline(nextItem)
+      this.activePipelines.set(nextItem.releaseName, pipeline)
+      pipeline.finally(() => {
+        this.activePipelines.delete(nextItem.releaseName)
         this.activeCount--
         console.log(
           `[Service ProcessQueue] Finished pipeline for ${nextItem.releaseName} (active: ${this.activeCount})`
@@ -548,11 +567,13 @@ class DownloadService extends EventEmitter implements DownloadAPI {
         return
       }
 
-      // Re-check connection state before installation (device might have disconnected during extraction)
-      const finalTargetDeviceId = this.getTargetDeviceForInstallation()
+      // Re-check connection state before installation (device might have disconnected during extraction).
+      // On startup the queue pipeline can run before the renderer has connected
+      // to a device, so wait briefly instead of skipping the installation.
+      const finalTargetDeviceId = await this.waitForTargetDevice(15_000)
       if (!finalTargetDeviceId) {
         console.warn(
-          `[Service ProcessQueue] Extraction successful for ${itemAfterExtraction.releaseName}, but app is no longer connected to a device. Skipping installation.`
+          `[Service ProcessQueue] Extraction successful for ${itemAfterExtraction.releaseName}, but no device is connected. Skipping installation.`
         )
         return
       }
@@ -616,6 +637,22 @@ class DownloadService extends EventEmitter implements DownloadAPI {
     }
   }
 
+  /**
+   * Bounded wait for a connected device: the renderer usually selects the
+   * Frame a moment after startup, but the queue pipeline can already be done
+   * by then, silently skipping installs of queued items.
+   */
+  private async waitForTargetDevice(timeoutMs: number): Promise<string | null> {
+    const deadline = Date.now() + timeoutMs
+    let deviceId: string | null = null
+    while (Date.now() < deadline) {
+      deviceId = this.getTargetDeviceForInstallation()
+      if (deviceId) return deviceId
+      await new Promise((resolve) => setTimeout(resolve, 500))
+    }
+    return this.getTargetDeviceForInstallation()
+  }
+
   // Resume pipeline: same as runPipeline but uses resumeDownload instead of startDownload
   private async runResumePipeline(nextItem: DownloadItem): Promise<void> {
     const targetDeviceId = this.getTargetDeviceForInstallation()
@@ -654,7 +691,7 @@ class DownloadService extends EventEmitter implements DownloadAPI {
         return
       }
 
-      const finalTargetDeviceId = this.getTargetDeviceForInstallation()
+      const finalTargetDeviceId = await this.waitForTargetDevice(15_000)
       if (!finalTargetDeviceId) {
         console.warn(
           `[Service ResumeQueue] No connected device after extraction for ${itemAfterExtraction.releaseName}. Skipping installation.`
@@ -769,7 +806,9 @@ class DownloadService extends EventEmitter implements DownloadAPI {
         item.gameName || item.releaseName,
         report,
         undefined,
-        frameOriginalSourcePath ?? item.downloadPath,
+        converted.result.alreadyConverted
+          ? undefined
+          : (frameOriginalSourcePath ?? item.downloadPath),
         item.thumbnailPath
       )
       if (tracked) {
@@ -899,10 +938,14 @@ class DownloadService extends EventEmitter implements DownloadAPI {
    * downloads folder, so fall back to joining the release name.
    */
   private resolveReleaseFolder(item: DownloadItem): string {
-    if (item.downloadPath && item.downloadPath.endsWith(item.releaseName)) {
-      return item.downloadPath
+    childPath(this.downloadsPath, item.releaseName)
+    if (item.downloadPath && resolve(item.downloadPath) !== resolve(this.downloadsPath)) {
+      if (basename(item.downloadPath) !== item.releaseName) {
+        throw new Error('Download path does not identify the release folder')
+      }
+      return resolve(item.downloadPath)
     }
-    return join(this.downloadsPath, item.releaseName)
+    return childPath(this.downloadsPath, item.releaseName)
   }
 
   public async retryDownload(releaseName: string): Promise<void> {
@@ -972,7 +1015,7 @@ class DownloadService extends EventEmitter implements DownloadAPI {
 
       const updated = this.queueManager.updateItem(releaseName, {
         status: 'Queued',
-        downloadPath: this.downloadsPath,
+        downloadPath: childPath(this.downloadsPath, releaseName),
         progress: 0,
         extractProgress: undefined,
         error: undefined,
@@ -994,29 +1037,18 @@ class DownloadService extends EventEmitter implements DownloadAPI {
 
   public pauseDownload(releaseName: string): void {
     const item = this.queueManager.findItem(releaseName)
-    if (item) {
+    if (item?.status === 'Downloading') {
       this.downloadProcessor.pauseDownload(releaseName)
     }
   }
 
   public resumeDownload(releaseName: string): void {
     const item = this.queueManager.findItem(releaseName)
-    if (!item) return
-
-    // Track as active pipeline so concurrent limits are respected
-    this.activeCount++
-    console.log(
-      `[Service] Resuming pipeline for ${releaseName} (active: ${this.activeCount}/${settingsService.getMaxConcurrentDownloads()})`
-    )
-
-    // Run the full pipeline (download → extraction → installation) via resume path
-    this.runResumePipeline(item).finally(() => {
-      this.activeCount--
-      console.log(
-        `[Service] Finished resume pipeline for ${releaseName} (active: ${this.activeCount}/${settingsService.getMaxConcurrentDownloads()})`
-      )
-      this.processQueue()
-    })
+    if (!item || item.status !== 'Paused') return
+    this.pendingResumes.add(releaseName)
+    this.queueManager.updateItem(releaseName, { status: 'Queued', error: undefined })
+    this.emitUpdate()
+    void this.processQueue()
   }
 
   public async deleteDownloadedFiles(releaseName: string): Promise<boolean> {
@@ -1026,13 +1058,17 @@ class DownloadService extends EventEmitter implements DownloadAPI {
       return Promise.resolve(false)
     }
 
-    const downloadPath = item.downloadPath
+    if (item.status === 'Installing') return false
+    this.cancelActiveItem(releaseName, item)
+    await this.activePipelines.get(releaseName)
 
-    if (!downloadPath) {
-      console.log(`No download path for ${releaseName}, removing item.`)
-      const removed = this.queueManager.removeItem(releaseName)
-      if (removed) this.emitUpdate()
-      return Promise.resolve(true)
+    let downloadPath: string
+    try {
+      downloadPath = this.resolveReleaseFolder(item)
+    } catch (error) {
+      this.queueManager.updateItem(releaseName, { error: String(error) })
+      this.emitUpdate()
+      return false
     }
 
     if (!existsSync(downloadPath)) {
@@ -1298,18 +1334,6 @@ class DownloadService extends EventEmitter implements DownloadAPI {
       throw new Error(`Item ${releaseName} is not in 'Completed' state.`)
     }
 
-    if (this.activeCount >= settingsService.getMaxConcurrentDownloads()) {
-      console.warn(
-        `[Service installFromCompleted] Queue is at max concurrency (${this.activeCount}/${settingsService.getMaxConcurrentDownloads()}). Installation for ${releaseName} will be handled when a slot opens.`
-      )
-      // Optionally, we could queue this specific action, but for now, let the main loop handle it
-      // Or force a status change back to Queued? Seems counter-intuitive.
-      // Let's just rely on the check within startInstallation to set status to Installing
-      // and proceed if not already processing.
-      // throw new Error('Queue is busy') // Maybe throw error?
-      return // Don't throw, just log and return. Main loop might pick it up later?
-    }
-
     // Check if the app is connected to the target device
     const targetDeviceForInstall = this.getTargetDeviceForInstallation()
     if (!targetDeviceForInstall) {
@@ -1344,6 +1368,10 @@ class DownloadService extends EventEmitter implements DownloadAPI {
       throw new Error(`Failed to verify target device ${deviceId}.`)
     }
 
+    if (item.status !== 'Completed') throw new Error('Installation is already queued')
+    this.queueManager.updateItem(releaseName, { status: 'Installing' })
+    this.emitUpdate()
+
     console.log(
       `[Service installFromCompleted] Triggering installation processor for ${releaseName} on ${deviceId}...`
     )
@@ -1360,12 +1388,8 @@ class DownloadService extends EventEmitter implements DownloadAPI {
         // Emit event on successful installation
         this.emit('installation:success', deviceId)
       } else {
-        console.warn(
-          `[Service installFromCompleted] Installation process initiated for ${releaseName} but reported failure.`
-        )
+        throw new Error(this.queueManager.findItem(releaseName)?.error || 'Installation failed')
       }
-      // Note: We don't await the full completion here, just the initiation.
-      // The status updates will come via the processor and emitUpdate.
     } catch (error) {
       console.error(
         `[Service installFromCompleted] Error initiating installation for ${releaseName}:`,
@@ -1421,11 +1445,7 @@ class DownloadService extends EventEmitter implements DownloadAPI {
       downloadPath: folderPath
     }
 
-    const success = await this.installItemToTarget(
-      tempItem,
-      deviceId,
-      onProgress
-    )
+    const success = await this.installItemToTarget(tempItem, deviceId, onProgress)
     if (success) {
       console.log(`[Service installManualFile] Successfully installed folder: ${folderPath}`)
       this.emit('installation:success', deviceId)
@@ -1503,7 +1523,7 @@ class DownloadService extends EventEmitter implements DownloadAPI {
               basename(filePath, '.apk'),
               onProgress,
               undefined,
-              filePath
+              converted.result.alreadyConverted ? undefined : filePath
             )
           } finally {
             await converted.cleanup()
@@ -1614,12 +1634,7 @@ class DownloadService extends EventEmitter implements DownloadAPI {
             downloadPath: tmpDir
           }
 
-          const success = await this.installItemToTarget(
-            tempItem,
-            deviceId,
-            onProgress,
-            filePath
-          )
+          const success = await this.installItemToTarget(tempItem, deviceId, onProgress, filePath)
           if (success) {
             console.log(`[Service installManualFile] Successfully installed from ZIP: ${filePath}`)
             this.emit('installation:success', deviceId)

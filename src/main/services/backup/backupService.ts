@@ -1,4 +1,5 @@
 import { app, shell } from 'electron'
+import { childPath, writeJsonAtomic } from '../fileSafety'
 import { join } from 'path'
 import { promises as fs, existsSync } from 'fs'
 import adbService from '../adbService'
@@ -63,7 +64,7 @@ class BackupService {
   }
 
   private backupDir(id: string): string {
-    return join(this.backupsRoot(), id)
+    return childPath(this.backupsRoot(), id)
   }
 
   private manifestPath(id: string): string {
@@ -88,7 +89,9 @@ class BackupService {
   private async readManifest(id: string): Promise<BackupEntry | null> {
     try {
       const raw = await fs.readFile(this.manifestPath(id), 'utf-8')
-      return JSON.parse(raw) as BackupEntry
+      const entry = JSON.parse(raw) as BackupEntry
+      if (entry.id !== id) throw new Error('Backup manifest ID does not match its directory')
+      return entry
     } catch {
       return null
     }
@@ -96,7 +99,7 @@ class BackupService {
 
   private async writeManifest(entry: BackupEntry): Promise<void> {
     await fs.mkdir(this.backupDir(entry.id), { recursive: true })
-    await fs.writeFile(this.manifestPath(entry.id), JSON.stringify(entry, null, 2), 'utf-8')
+    await writeJsonAtomic(this.manifestPath(entry.id), entry)
   }
 
   private sanitize(pkg: string): string {
