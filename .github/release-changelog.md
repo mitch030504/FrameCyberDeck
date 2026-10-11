@@ -10,6 +10,16 @@
 - Prefer a browsable library? You can add your own server under **Manage Remotes** — either a server config or your own rclone config. Add one and the full library view (search, sort, card/table, update badges) comes right back. Don't have one? Just use it as a sideloader — that's the whole point.
 - The old always-on bundled server has been removed. A server is now entirely opt-in: either you know one, or you don't need one.
 
+**Meta owned-title sync**
+
+- Sign in to your Meta account from the uploads view (in-app browser login with 2FA, or paste a user token). The token is stored encrypted through the OS keychain; passwords never touch the app.
+- "Sync Meta Library" compares your owned Quest titles against the server catalog: updates for anything the server already carries, plus new titles you actually paid for (purchases, preorders, cross-buy, and Horizon+ subscription claims — free downloads stay off the server).
+- Selected titles download their APK and OBB files from Meta's entitled CDN and go through the regular contribution pipeline. Downloaded versions are cached and never re-fetched.
+
+**Steam Frame fixes**
+
+- Raw-bundle (non-OBB) game data — Unity asset-bundle releases such as Blade & Sorcery Nomad — now installs with its full payload instead of an APK-only install.
+
 **Cleanup**
 
 - Removed the donation banner and the extra community links.

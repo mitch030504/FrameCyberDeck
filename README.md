@@ -97,6 +97,18 @@ fish scripts/frame-contribution-dry-run.fish com.Icosa.OpenBrush
 
 It validates package/version identity, provenance, HWID metadata, and archive creation without performing a network upload.
 
+### Meta owned-title sync
+
+Frame CyberDeck can sign in to your Meta account and contribute owned Quest titles that the server does not have yet.
+
+- **Sign-in:** an in-app browser window handles the Meta login (including 2FA); the password is never stored, only the resulting session token. If the embedded login is blocked, paste a user token instead. The token is validated against Meta and stored encrypted through the OS keychain.
+- **Check:** a single entitlement query lists everything the account owns, with each title's latest Android binary (id, version code, package name). These are compared against the server catalog.
+- **What becomes a candidate:**
+  - Updates — any owned title the server already carries where Meta has a newer version.
+  - New titles — only entitlements that were **paid**: purchases, preorders, cross-buy grants, and subscription (Horizon+) claims. Free downloads, demos obtained for free, promo keys, and trial grants never contribute a title the server does not already have.
+- **Download & contribute:** selected titles download their APK and OBB files from Meta's entitled CDN into the uploads cache and enter the normal contribution pipeline (HWID metadata, archive creation, `upload.config` upload) unchanged. Downloaded versions are cached, so re-checks never re-download.
+- Tokens are never written to logs, and download URLs carrying the token are not logged either.
+
 ---
 
 ## `// LOCAL_SIDELOADING`
@@ -128,6 +140,7 @@ When authorized catalog access is configured, Frame CyberDeck can:
 - Detect packages that are missing or newer
 - Prepare eligible contributions using the provided `upload.config`
 - Use the recorded original source for Steam Frame contributions
+- Contribute owned Meta titles that are new or newer on the account than on the server (see Meta owned-title sync above)
 
 The public/catalog download path is intentionally conservative:
 

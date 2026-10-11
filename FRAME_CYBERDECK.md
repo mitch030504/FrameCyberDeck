@@ -12,8 +12,17 @@ Frame CyberDeck is the Steam Frame-focused fork of VR CyberDeck.
 - Invalidates cached adapters that do not match the pinned SHA-256.
 - Supports optional per-game refresh-rate requests: runtime default, 72, 80, 90, 96, 108, 120 or 144 Hz.
 - Deploys converted titles through SteamOS Devkit and the `fauxdroid` runtime. When the Frame is attached over USB, devkit traffic (HTTP, SSH, rsync) is tunneled through ADB port forwards on the cable instead of Wi-Fi.
+- Copies release data from both Quest layouts: classic `*.<package>.obb` files and raw bundle files inside a package-named folder; staging preserves the folder structure, so raw-bundle games (e.g. Unity asset-bundle releases) install with their full data.
 - Tracks managed package/version/title metadata.
 - Preserves original-source provenance for contribution workflows.
+
+## Meta owned-title sync
+
+- The Meta sign-in window captures the `oc_ac_at` session cookie after a normal browser login (2FA included); the password never reaches the application. A user-token paste is the fallback. Tokens are stored via `safeStorage` (OS keychain) and never logged.
+- A single entitlement query provides each owned title's latest Android binary (binary id, version code, package name) directly on the entitlement item; no per-app version lookups are made, which also keeps the check well inside Meta's rate limits.
+- Candidates: updates for any title the server already carries, and new titles only when the entitlement was paid (PAID_OFFER, PREORDER, XBUY, SUBSCRIPTION — Horizon+ claimed titles included; a grant reason containing `SUBSCRIPTION` counts). Free downloads (NUX, UNKNOWN, promo keys, trials) never start a new upload.
+- APK and OBB files download from Meta's entitled CDN into `downloads/uploads/meta/<package>/<versionCode>/`, marked with a `.complete` marker so re-checks skip them, and are enqueued through the existing local upload pipeline (HWID + archive + `upload.config` rclone) unchanged.
+- All Meta responses are read defensively; a shape drift surfaces as a clear "Meta returned no …" error instead of a crash.
 
 ## Packaging and IPC hardening
 
