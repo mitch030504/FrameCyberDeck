@@ -7,11 +7,13 @@ import pathlib
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import urllib.request
 
 DEFAULT_PORT = 32000
 REQUEST_TIMEOUT = 5
+QUERY_ATTEMPTS = 3
 
 
 def emit(value: dict) -> None:
@@ -27,17 +29,35 @@ def private_key_path() -> pathlib.Path:
     return pathlib.Path.home() / ".config" / "steamos-devkit" / "devkit_rsa"
 
 
-def properties(host: str, port: int) -> dict:
-    try:
-        with urllib.request.urlopen(
-            f"http://{host}:{port}/properties.json", timeout=REQUEST_TIMEOUT
-        ) as response:
-            value = json.load(response)
-    except Exception as exc:
-        fail(f"Could not query SteamOS Devkit service at {host}:{port}: {exc}")
-    if not isinstance(value, dict):
-        fail("SteamOS Devkit properties response was not a JSON object")
-    return value
+def devkit_endpoint(host: str, port: int) -> tuple[str, dict]:
+    """Resolve `host` to an address that answers the devkit service.
+
+    The hostname can resolve differently between lookups (e.g. LAN/mDNS and a
+    stale tailscale entry alternate as the resolver round-robins its sources),
+    so retry resolution and probe each address until one answers. Callers
+    reuse the working address for SSH/rsync instead of the ambiguous name.
+    """
+    last_error: Exception | None = None
+    for _ in range(QUERY_ATTEMPTS):
+        try:
+            infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        except socket.gaierror:
+            infos = []
+        addresses = [info[4][0] for info in infos] or [host]
+        for address in dict.fromkeys(addresses):
+            url_host = f"[{address}]" if ":" in address else address
+            try:
+                with urllib.request.urlopen(
+                    f"http://{url_host}:{port}/properties.json", timeout=REQUEST_TIMEOUT
+                ) as response:
+                    value = json.load(response)
+            except Exception as exc:
+                last_error = exc
+                continue
+            if not isinstance(value, dict):
+                fail("SteamOS Devkit properties response was not a JSON object")
+            return address, value
+    fail(f"Could not query SteamOS Devkit service at {host}:{port}: {last_error}")
 
 
 def ssh_command(
@@ -79,7 +99,7 @@ def ssh_command(
 
 
 def status(host: str, port: int) -> dict:
-    props = properties(host, port)
+    address, props = devkit_endpoint(host, port)
     login = str(props.get("login") or "steamos")
     key = private_key_path()
     paired = False
@@ -94,7 +114,7 @@ def status(host: str, port: int) -> dict:
         pair_error = "ssh is not installed on the host"
     else:
         try:
-            result = ssh_command(host, login, "true", check=False)
+            result = ssh_command(address, login, "true", check=False)
             paired = result.returncode == 0
             if not paired:
                 pair_error = (result.stderr or result.stdout or "SSH authentication failed").strip()
@@ -104,7 +124,7 @@ def status(host: str, port: int) -> dict:
     return {
         "ok": True,
         "host": host,
-        "address": host,
+        "address": address,
         "login": login,
         "paired": paired,
         "pairError": pair_error,
@@ -144,6 +164,7 @@ def deploy(
         )
 
     login = str(current["login"])
+    address = str(current["address"])
     source = pathlib.Path(directory).expanduser().resolve()
     if not source.is_dir():
         fail(f"Upload directory does not exist: {source}")
@@ -152,7 +173,7 @@ def deploy(
 
     try:
         prep = ssh_command(
-            host,
+            address,
             login,
             "python3 ~/devkit-utils/steamos-prepare-upload "
             f"--gameid {shlex.quote(name)} --restart-steam 0",
@@ -189,7 +210,7 @@ def deploy(
                 "-e",
                 ssh_transport,
                 f"{str(source).rstrip('/')}/",
-                f"{remote_user}@{host}:{remote_directory.rstrip('/')}/",
+                f"{remote_user}@{address}:{remote_directory.rstrip('/')}/",
             ],
             check=True,
         )
@@ -206,7 +227,7 @@ def deploy(
         }
         shortcut_json = shlex.quote(json.dumps(shortcut, separators=(",", ":")))
         created = ssh_command(
-            host,
+            address,
             login,
             "python3 ~/devkit-utils/steam-client-create-shortcut "
             f"--parms {shortcut_json}",
@@ -217,7 +238,7 @@ def deploy(
 
         if start:
             ssh_command(
-                host,
+                address,
                 login,
                 "python3 ~/devkit-utils/steam-devkit-rpc run-game "
                 f"gameid={shlex.quote(name)}",
@@ -256,8 +277,9 @@ def list_games_data(host: str, port: int) -> tuple[dict, list[dict]]:
         )
 
     login = str(current["login"])
+    address = str(current["address"])
     result = ssh_command(
-        host,
+        address,
         login,
         "python3 ~/devkit-utils/steamos-list-games",
     )
@@ -271,7 +293,7 @@ def list_games_data(host: str, port: int) -> tuple[dict, list[dict]]:
 
         quoted_gameid = shlex.quote(gameid)
         metadata_result = ssh_command(
-            host,
+            address,
             login,
             'cat "$HOME"/devkit-game/'
             + quoted_gameid
@@ -327,15 +349,16 @@ def delete_game(host: str, port: int, name: str) -> None:
         fail(f"Devkit title not found: {name}")
 
     login = str(current["login"])
+    address = str(current["address"])
     try:
         ssh_command(
-            host,
+            address,
             login,
             "python3 ~/devkit-utils/steamos-delete --delete-title " + shlex.quote(name),
         )
         quoted_name = shlex.quote(name)
         ssh_command(
-            host,
+            address,
             login,
             'rm -f "$HOME"/devkit-game/'
             + quoted_name
@@ -363,7 +386,7 @@ def run_game(host: str, port: int, name: str) -> None:
 
     try:
         ssh_command(
-            host,
+            str(current["address"]),
             str(current["login"]),
             "python3 ~/devkit-utils/steam-devkit-rpc run-game "
             f"gameid={shlex.quote(name)}",
