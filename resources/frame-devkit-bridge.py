@@ -134,6 +134,14 @@ def status(host: str, port: int, ssh_port: int = 22) -> dict:
     }
 
 
+def rsync_percent(text: str) -> int | None:
+    """Overall percentage from an rsync --info=progress2 update line, e.g.
+    '  12,345,678  45%  12.34MB/s    0:01:23'. Returns the last percentage
+    found, or None when the line carries no progress."""
+    percents = re.findall(r"(\d+)%", text)
+    return int(percents[-1]) if percents else None
+
+
 def validate_gameid(value: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9._]+", value):
         raise RuntimeError(
@@ -205,28 +213,59 @@ def deploy(
             ]
         )
 
-        subprocess.run(
-            [
-                "rsync",
-                "-av",
-                "--chmod=Du=rwx,Dgo=rx,Fu=rwx,Fog=rx",
-                "--delete",
-                "--delete-excluded",
-                "--delete-delay",
-                "--checksum",
-                "-e",
-                ssh_transport,
-                f"{str(source).rstrip('/')}/",
-                f"{remote_user}@{address}:{remote_directory.rstrip('/')}/",
-            ],
-            check=True,
+        rsync_args = [
+            "rsync",
+            "-av",
+            "--info=progress2",
+            "--chmod=Du=rwx,Dgo=rx,Fu=rwx,Fog=rx",
+            "--delete",
+            "--delete-excluded",
+            "--delete-delay",
+            "--checksum",
+            "-e",
+            ssh_transport,
+            f"{str(source).rstrip('/')}/",
+            f"{remote_user}@{address}:{remote_directory.rstrip('/')}/",
+        ]
+
+        # Stream rsync's single overall-progress line and emit each new
+        # percentage as a JSON progress line; the host app forwards them to
+        # the UI. The deploy result remains the final line on stdout.
+        process = subprocess.Popen(
+            rsync_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
         )
+        assert process.stdout is not None
+        last_percent: int | None = None
+        line = ""
+        tail = ""
+        while True:
+            char = process.stdout.read(1)
+            if not char:
+                break
+            tail = (tail + char)[-2000:]
+            if char in "\r\n":
+                percent = rsync_percent(line)
+                if percent is not None and percent != last_percent:
+                    last_percent = percent
+                    emit({"ok": True, "deployProgress": percent})
+                line = ""
+            else:
+                line += char
+                if len(line) > 512:
+                    line = ""
+        returncode = process.wait()
+        if returncode != 0:
+            raise subprocess.CalledProcessError(returncode, rsync_args, output=tail)
 
         shortcut = {
             "gameid": name,
             "directory": remote_directory,
             "argv": [start_command],
             "env": {},
+            # The Frame's steam-client-create-shortcut requires force_appid
+            # (a non-empty value writes steam_appid.txt); empty matches the
+            # known-working title configuration (fauxdroid, no forced appid).
+            "force_appid": "",
             "settings": {
                 "steam_play": "0",
                 "compat_tool": "fauxdroid",

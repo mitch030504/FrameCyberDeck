@@ -117,30 +117,48 @@ class FrameDevkitService {
    * Devkit endpoint forwarded over the Frame's USB ADB connection, so
    * deploys ride the USB cable instead of Wi-Fi. Fixed local ports keep the
    * forward list from growing; adb silently rebinds an existing forward.
+   * Successful detections are sticky for five minutes: re-detecting per call
+   * made a transient device-list blip fall back to hostname mid-pipeline.
    */
+  private usbEndpointCache: { endpoint: { host: string; port: number; sshPort: number }; at: number } | null =
+    null
+
   private async usbDevkitEndpoint(): Promise<{
     host: string
     port: number
     sshPort: number
   } | null> {
+    if (this.usbEndpointCache && Date.now() - this.usbEndpointCache.at < 300_000) {
+      return this.usbEndpointCache.endpoint
+    }
     try {
       const devices = await adbService.listDevices()
       // USB serials contain no ':' — network adb devices are 'host:port'.
       const frame = devices.find(
         (device) => device.isSteamFrame && device.type === 'device' && !device.id.includes(':')
       )
-      if (!frame) return null
+      if (!frame) {
+        console.warn('[Frame Devkit] No USB-attached Steam Frame found; using hostname access.')
+        return null
+      }
       const httpPort = (
         await adbService.runLocalAdbCommand(`-s ${frame.id} forward tcp:43200 tcp:32000`)
       ).trim()
       const sshPort = (
         await adbService.runLocalAdbCommand(`-s ${frame.id} forward tcp:43222 tcp:22`)
       ).trim()
-      if (!/^\d+$/.test(httpPort) || !/^\d+$/.test(sshPort)) return null
+      if (!/^\d+$/.test(httpPort) || !/^\d+$/.test(sshPort)) {
+        console.warn(
+          `[Frame Devkit] ADB port forward failed (http="${httpPort}", ssh="${sshPort}"); using hostname access.`
+        )
+        return null
+      }
       console.log(
         `[Frame Devkit] Using USB ADB forwards for ${frame.id}: devkit=:${httpPort}, ssh=:${sshPort}`
       )
-      return { host: '127.0.0.1', port: Number(httpPort), sshPort: Number(sshPort) }
+      const endpoint = { host: '127.0.0.1', port: Number(httpPort), sshPort: Number(sshPort) }
+      this.usbEndpointCache = { endpoint, at: Date.now() }
+      return endpoint
     } catch (error) {
       console.warn(
         '[Frame Devkit] USB devkit endpoint unavailable, falling back to hostname:',
@@ -153,7 +171,8 @@ class FrameDevkitService {
   private async bridge<T extends { ok: boolean; error?: string }>(
     command: string,
     args: string[] = [],
-    host = process.env.FRAME_CYBERDECK_HOST?.trim() || 'frame'
+    host = process.env.FRAME_CYBERDECK_HOST?.trim() || 'frame',
+    onDeployProgress?: (percent: number) => void
   ): Promise<T> {
     const python = await this.resolvePython()
     const helper = this.getHelperPath()
@@ -173,7 +192,7 @@ class FrameDevkitService {
     let stdout = ''
     let stderr = ''
     try {
-      const result = await execa(python, [
+      const child = execa(python, [
         helper,
         '--host',
         bridgeHost,
@@ -181,6 +200,32 @@ class FrameDevkitService {
         command,
         ...args
       ])
+      // The bridge emits {"ok":true,"deployProgress":N} lines while rsync
+      // runs; forward them for live progress. The final line is the result.
+      if (onDeployProgress && child.stdout) {
+        child.stdout.setEncoding('utf-8')
+        let pending = ''
+        child.stdout.on('data', (chunk: string) => {
+          pending += chunk
+          let newline = pending.indexOf('\n')
+          while (newline >= 0) {
+            const line = pending.slice(0, newline).trim()
+            pending = pending.slice(newline + 1)
+            if (line) {
+              try {
+                const parsed = JSON.parse(line) as { deployProgress?: number }
+                if (typeof parsed.deployProgress === 'number') {
+                  onDeployProgress(parsed.deployProgress)
+                }
+              } catch {
+                // not a JSON progress line
+              }
+            }
+            newline = pending.indexOf('\n')
+          }
+        })
+      }
+      const result = await child
       stdout = result.stdout
       stderr = result.stderr
     } catch (error) {
@@ -540,7 +585,9 @@ class FrameDevkitService {
           '--start-command',
           'game.apk'
         ],
-        host
+        host,
+        (percent) =>
+          onProgress?.('Uploading to Steam Frame with SteamOS Devkit…', 40 + Math.round(percent * 0.6))
       )
 
       console.log(

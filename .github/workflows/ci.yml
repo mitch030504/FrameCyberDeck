@@ -51,6 +51,9 @@ jobs:
       - name: Unit tests (frame converter)
         run: python3 tests/frame_convert_test.py
 
+      - name: Unit tests (frame devkit bridge)
+        run: python3 tests/frame_devkit_bridge_test.py
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

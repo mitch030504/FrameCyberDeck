@@ -745,7 +745,7 @@ class DownloadService extends EventEmitter implements DownloadAPI {
         this.updateItemStatus(
           item.releaseName,
           'Installing',
-          100,
+          percent ?? 100,
           undefined,
           undefined,
           undefined,

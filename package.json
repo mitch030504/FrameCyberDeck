@@ -7,7 +7,7 @@
   "homepage": "https://github.com/mitch030504/FrameCyberDeck",
   "scripts": {
     "test:node": "node --test src/main/services/download/*.test.mjs src/main/services/backup/*.test.mjs",
-    "test:python": "python3 tests/frame_convert_test.py",
+    "test:python": "python3 tests/frame_convert_test.py && python3 tests/frame_devkit_bridge_test.py",
     "format": "prettier --write .",
     "lint": "eslint --cache .",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
