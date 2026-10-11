@@ -11,7 +11,7 @@ import {
 import { sanitizeBaseUri } from '@shared/serverConfig'
 import { app, nativeTheme } from 'electron'
 import { join } from 'path'
-import { existsSync, readFileSync, writeFileSync } from 'fs'
+import { existsSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import EventEmitter from 'events'
 import {
   DEFAULT_DOWNLOAD_PROXY_SETTINGS,
@@ -40,8 +40,7 @@ class SettingsService extends EventEmitter implements SettingsAPI {
       existingDownloadAction: 'ask',
       downloadProxy: { ...DEFAULT_DOWNLOAD_PROXY_SETTINGS },
       frameConversion: {
-        refreshRate: 0,
-        extendedCompat: false
+        refreshRate: 0
       }
     }
 
@@ -146,22 +145,20 @@ class SettingsService extends EventEmitter implements SettingsAPI {
   }
 
   getFrameConversionSettings(): FrameConversionSettings {
-    const raw = this.settings.frameConversion ?? { refreshRate: 0, extendedCompat: false }
-    const allowed: FrameRefreshRate[] = [0, 72, 80, 90, 120, 144]
+    const raw = this.settings.frameConversion ?? { refreshRate: 0 }
+    const allowed: FrameRefreshRate[] = [0, 72, 80, 90, 96, 108, 120, 144]
     const refreshRate = allowed.includes(raw.refreshRate as FrameRefreshRate)
       ? (raw.refreshRate as FrameRefreshRate)
       : 0
     return {
-      refreshRate,
-      extendedCompat: Boolean(raw.extendedCompat)
+      refreshRate
     }
   }
 
   setFrameConversionSettings(settings: FrameConversionSettings): FrameConversionSettings {
-    const allowed: FrameRefreshRate[] = [0, 72, 80, 90, 120, 144]
+    const allowed: FrameRefreshRate[] = [0, 72, 80, 90, 96, 108, 120, 144]
     const normalized: FrameConversionSettings = {
-      refreshRate: allowed.includes(settings.refreshRate) ? settings.refreshRate : 0,
-      extendedCompat: Boolean(settings.extendedCompat)
+      refreshRate: allowed.includes(settings.refreshRate) ? settings.refreshRate : 0
     }
     this.settings.frameConversion = normalized
     this.saveSettings()
@@ -195,12 +192,23 @@ class SettingsService extends EventEmitter implements SettingsAPI {
       }
     } catch (error) {
       console.error('Error loading settings:', error)
+      // Keep the unreadable file for manual recovery instead of letting the
+      // next save overwrite it with defaults.
+      try {
+        renameSync(this.settingsPath, `${this.settingsPath}.corrupt`)
+        console.warn(`Saved unreadable settings to ${this.settingsPath}.corrupt`)
+      } catch {
+        /* file did not exist; nothing to preserve */
+      }
     }
   }
 
   private saveSettings(): void {
     try {
-      writeFileSync(this.settingsPath, JSON.stringify(this.settings, null, 2), 'utf-8')
+      // Write-then-rename so a crash mid-write cannot truncate the file.
+      const tempPath = `${this.settingsPath}.tmp`
+      writeFileSync(tempPath, JSON.stringify(this.settings, null, 2), 'utf-8')
+      renameSync(tempPath, this.settingsPath)
       console.log('Settings saved successfully')
     } catch (error) {
       console.error('Error saving settings:', error)

@@ -51,24 +51,20 @@ Frame CyberDeck can convert a compatible Quest APK before deployment:
 5. Verify the resulting APK
 6. Stage it for SteamOS Devkit deployment
 
-The converter is currently pinned to Quest2Frame commit `c9f1e4d9a705575e103c136d865b869e3d87b256`.
-The normal path uses the updated native bridge with per-game OpenXR display-refresh support while keeping the runtime default unless explicitly requested.
+The converter uses the prebuilt FrameBridge OpenXR adapter from [FramePort](https://github.com/spoopyghosty0/frameport), pinned to commit `5424e429e46e53fe51497babac124dd91dbb73bf` and verified against its SHA256SUMS manifest.
+The normal path keeps the runtime default refresh rate unless explicitly requested.
 
 The original source APK is never overwritten.
 
 Frame conversion options are available under **Other Settings → Steam Frame Conversion**:
 
-- **Requested display refresh rate:** Runtime default, 72, 80, 90, 120 or 144 Hz.
-- **Extended compatibility adapter:** opt-in Quest2Frame passthrough-underlay → alpha-blend translation plus the validated 1–2 px swapchain rectangle-overflow correction.
+- **Requested display refresh rate:** Runtime default, 72, 80, 90, 96, 108, 120 or 144 Hz.
 
 For development/testing, environment variables can override the saved UI settings:
 
 ```fish
 set -x FRAME_CYBERDECK_REFRESH_RATE 90
-set -x FRAME_CYBERDECK_EXTENDED_COMPAT 1
 ```
-
-The extended compatibility adapter is opt-in because it changes the OpenXR call path. It is intended for specific titles that need the upstream passthrough or swapchain-rectangle workarounds; normal conversions leave it disabled.
 
 ### SteamOS Devkit deployment
 
@@ -178,6 +174,8 @@ Frame CyberDeck is designed to build without a vrSrc API key.
 npm install --legacy-peer-deps
 npm run typecheck
 npm test
+npm run test:node
+npm run test:python
 npm run build
 ```
 

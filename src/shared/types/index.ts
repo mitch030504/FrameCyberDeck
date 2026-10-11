@@ -507,11 +507,10 @@ export interface WindowBounds {
   maximized?: boolean
 }
 
-export type FrameRefreshRate = 0 | 72 | 80 | 90 | 120 | 144
+export type FrameRefreshRate = 0 | 72 | 80 | 90 | 96 | 108 | 120 | 144
 
 export interface FrameConversionSettings {
   refreshRate: FrameRefreshRate
-  extendedCompat: boolean
 }
 
 export interface Settings {

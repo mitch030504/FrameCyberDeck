@@ -1,6 +1,7 @@
 import { app } from 'electron'
 import { join } from 'path'
 import { execSync } from 'child_process'
+import { createHash } from 'crypto'
 import { promises as fsPromises, existsSync, createWriteStream, chmodSync, copyFileSync } from 'fs'
 import axios, { AxiosProgressEvent } from 'axios'
 import SevenZip from 'node-7z'
@@ -9,6 +10,23 @@ import { awaitSevenZipStream } from './sevenZipUtils'
 
 // Pinned rclone version. See getRcloneDownloadUrl for the rationale.
 const RCLONE_PINNED_VERSION = 'v1.72.1'
+
+// Pinned Android platform-tools release; URL and SHA-256 recorded at pin time
+// (Google publishes only SHA-1 in its repository index). Bump both together.
+const PLATFORM_TOOLS_PIN: Partial<Record<NodeJS.Platform, { url: string; sha256: string }>> = {
+  win32: {
+    url: 'https://dl.google.com/android/repository/platform-tools_r37.0.1-win.zip',
+    sha256: '45f4d63113e895ebde0c90f194099a4676b6ac653bd28d54314a9e022bbc1a99'
+  },
+  darwin: {
+    url: 'https://dl.google.com/android/repository/platform-tools_r37.0.1-darwin.zip',
+    sha256: 'ee39ad5967e95c2a07f04dbcbde96b1a0c916ba376096db5d2f498b7727a5d1d'
+  },
+  linux: {
+    url: 'https://dl.google.com/android/repository/platform-tools_r37.0.1-linux.zip',
+    sha256: 'd230f13842f60f782a8645f9c813f8f845bf36089ea7289f28c48f17979313f1'
+  }
+}
 
 type ProgressCallback = (
   status: DependencyStatus,
@@ -122,8 +140,13 @@ class DependencyService {
     for (const { url, name } of criticalUrls) {
       try {
         console.log(`Testing connectivity to ${name}: ${url}`)
+        // A 301 from raw.githubusercontent.com to github.com would make the
+        // check test github.com instead — and github.com is IPv4-only, so it
+        // fails on networks that can only reach GitHub over IPv6. A redirect
+        // already proves the host is reachable; don't follow it.
         await axios.get(url, {
           timeout: 10000, // 10 second timeout
+          maxRedirects: 0,
           validateStatus: (status) => status < 500, // Accept any non-server-error status
           headers: {
             'User-Agent': 'VRCyberDeck/2.0'
@@ -369,15 +392,15 @@ class DependencyService {
     let tempExtractDir: string | null = null
 
     try {
-      const downloadUrl = await this.getRcloneDownloadUrl()
-      if (!downloadUrl) {
+      const download = await this.getRcloneDownloadUrl()
+      if (!download) {
         throw new Error('Could not find suitable rclone download URL.')
       }
 
       tempArchivePath = join(app.getPath('temp'), `rclone-download-${Date.now()}.zip`)
-      console.log(`Downloading rclone from ${downloadUrl} to ${tempArchivePath}`)
+      console.log(`Downloading rclone from ${download.url} to ${tempArchivePath}`)
 
-      const response = await axios.get(downloadUrl, {
+      const response = await axios.get(download.url, {
         responseType: 'stream',
         onDownloadProgress: (progressEvent: AxiosProgressEvent) => {
           if (progressEvent.total) {
@@ -396,6 +419,7 @@ class DependencyService {
       })
 
       console.log(`rclone download complete: ${tempArchivePath}`)
+      await this.verifySha256(tempArchivePath, download.sha256, 'rclone')
       progressCallback?.(this.status, { name: 'rclone', percentage: 100 })
 
       // --- Extraction Step ---
@@ -496,7 +520,20 @@ class DependencyService {
     }
   }
 
-  private async getRcloneDownloadUrl(): Promise<string | null> {
+  /** Verify a downloaded archive against an expected SHA-256 before it is run. */
+  private async verifySha256(filePath: string, expected: string, label: string): Promise<void> {
+    const data = await fsPromises.readFile(filePath)
+    const actual = createHash('sha256').update(data).digest('hex')
+    if (actual !== expected) {
+      throw new Error(
+        `${label} SHA-256 mismatch: expected ${expected}, got ${actual}. ` +
+          'The download may be corrupt or tampered with; refusing to use it.'
+      )
+    }
+    console.log(`${label} SHA-256 verified: ${actual}`)
+  }
+
+  private async getRcloneDownloadUrl(): Promise<{ url: string; sha256: string } | null> {
     const repo = 'rclone/rclone'
     // Pinned to match the version Rookie sideloader ships against the same
     // public VRP endpoint. Newer rclone releases tightened HTTP backend URL
@@ -547,8 +584,25 @@ class DependencyService {
         return null
       }
 
+      // Verify the archive against the release's own SHA256SUMS manifest;
+      // never run an unverified download.
+      const sumsAsset = assets.find((a) => a.name === 'SHA256SUMS')
+      if (!sumsAsset?.browser_download_url) {
+        console.error('rclone release has no SHA256SUMS asset; refusing unverified download.')
+        return null
+      }
+      const sumsResponse = await axios.get(sumsAsset.browser_download_url, { timeout: 15000 })
+      const sumsLine = String(sumsResponse.data)
+        .split('\n')
+        .find((line) => line.trim().endsWith(targetAsset.name))
+      const expectedSha = sumsLine?.trim().split(/\s+/)[0]
+      if (!expectedSha || !/^[0-9a-f]{64}$/i.test(expectedSha)) {
+        console.error(`SHA256SUMS has no entry for ${targetAsset.name}; refusing download.`)
+        return null
+      }
+
       console.log(`Selected rclone asset: ${targetAsset.name}`)
-      return targetAsset.browser_download_url
+      return { url: targetAsset.browser_download_url, sha256: expectedSha.toLowerCase() }
     } catch (error) {
       console.error(
         `Error fetching rclone release info from GitHub:`,
@@ -635,16 +689,11 @@ class DependencyService {
 
     try {
       const platform = process.platform
-      let downloadUrl: string
-      if (platform === 'win32') {
-        downloadUrl = 'https://dl.google.com/android/repository/platform-tools-latest-windows.zip'
-      } else if (platform === 'darwin') {
-        downloadUrl = 'https://dl.google.com/android/repository/platform-tools-latest-darwin.zip'
-      } else if (platform === 'linux') {
-        downloadUrl = 'https://dl.google.com/android/repository/platform-tools-latest-linux.zip'
-      } else {
+      const pin = PLATFORM_TOOLS_PIN[platform]
+      if (!pin) {
         throw new Error(`Unsupported platform for adb download: ${platform}`)
       }
+      const downloadUrl = pin.url
 
       tempArchivePath = join(app.getPath('temp'), `platform-tools-download-${Date.now()}.zip`)
       console.log(`Downloading adb platform-tools from ${downloadUrl} to ${tempArchivePath}`)
@@ -684,6 +733,7 @@ class DependencyService {
         )
       }
       console.log(`Downloaded archive size: ${downloadedStat.size} bytes`)
+      await this.verifySha256(tempArchivePath!, pin.sha256, 'adb platform-tools')
 
       // --- Extraction Step using SevenZip ---
       tempExtractDir = join(app.getPath('temp'), `adb-extract-${Date.now()}`)

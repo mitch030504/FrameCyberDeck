@@ -7,6 +7,7 @@ import {
   dialog,
   ipcMain,
   session,
+  net,
   Notification
 } from 'electron'
 import { promises as fsPromises, existsSync } from 'fs'
@@ -16,6 +17,7 @@ import { promises as fsPromises, existsSync } from 'fs'
 import './services/portableSetup'
 import os from 'os'
 import { join } from 'path'
+import { pathToFileURL } from 'node:url'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import adbService from './services/adbService'
@@ -49,6 +51,14 @@ Object.assign(console, log.functions)
 // Fix for certain Linux distributions - force GTK version 3
 // https://github.com/electron/electron/issues/46538
 app.commandLine.appendSwitch('gtk-version', '3')
+
+// Must run before app ready: lets the renderer load local thumbnails through
+// the local-file scheme without disabling the same-origin policy (webSecurity).
+// Not registered as "standard": standard schemes parse the first path
+// component as a hostname, which mangles absolute filesystem paths.
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'local-file', privileges: { secure: true, supportFetchAPI: true } }
+])
 
 let mainWindow: BrowserWindow | null = null
 let closeConfirmed = false
@@ -126,7 +136,6 @@ function createWindow(): void {
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
-      webSecurity: false, // Allow loading local resources (thumbnails)
       webviewTag: true // Enable <webview> for YouTube trailer embedding
     }
   })
@@ -410,10 +419,14 @@ app.whenReady().then(async () => {
   // Set app user model id for windows
   electronApp.setAppUserModelId('com.vrcyberdeck')
 
-  // Setup file protocol handler for local resources
-  protocol.registerFileProtocol('file', (request, callback) => {
-    const pathname = decodeURI(request.url.replace('file:///', ''))
-    callback(pathname)
+  // Serve local files (thumbnails) through the local-file scheme.
+  protocol.handle('local-file', (request) => {
+    let raw = request.url.split('#')[0].slice('local-file://'.length)
+    raw = decodeURIComponent(raw)
+    const pathname = raw.startsWith('/') ? raw : `/${raw}`
+    const filePath =
+      process.platform === 'win32' && pathname.startsWith('/') ? pathname.slice(1) : pathname
+    return net.fetch(pathToFileURL(filePath).toString())
   })
 
   // Default open or close DevTools by F12 in development
@@ -537,30 +550,8 @@ app.whenReady().then(async () => {
     return await adbService.uninstallPackage(serial, packageName)
   })
   typedIpcMain.handle('adb:deleteGameFiles', async (_event, releaseName) => {
-    const downloadPath = settingsService.getDownloadPath()
-    const gamePath = join(downloadPath, releaseName)
-    console.log(`[IPC] adb:deleteGameFiles - Deleting ${gamePath}`)
-    try {
-      await fs.stat(gamePath)
-      await fs.rm(gamePath, { recursive: true, force: true })
-      console.log(`[IPC] adb:deleteGameFiles - Deleted ${gamePath}`)
-      return { deleted: true, path: gamePath }
-    } catch (error) {
-      if (
-        error instanceof Error &&
-        'code' in error &&
-        (error as NodeJS.ErrnoException).code === 'ENOENT'
-      ) {
-        console.log(`[IPC] adb:deleteGameFiles - Path not found: ${gamePath}`)
-        return {
-          deleted: false,
-          path: gamePath,
-          error: 'Game files not found in current download folder'
-        }
-      }
-      console.error(`[IPC] adb:deleteGameFiles - Error deleting ${gamePath}:`, error)
-      return { deleted: false, path: gamePath, error: String(error) }
-    }
+    console.log(`[IPC] adb:deleteGameFiles - Deleting ${releaseName}`)
+    return adbService.deleteGameFiles(releaseName)
   })
   typedIpcMain.on('adb:start-tracking-devices', () => {
     if (mainWindow) adbService.startTrackingDevices(mainWindow)

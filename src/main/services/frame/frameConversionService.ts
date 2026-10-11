@@ -21,9 +21,8 @@ export interface FrameConversionResult {
   sha256: string
   ovrportAppVersion?: string
   ovrportRuntimeVersion?: string
-  quest2FrameCommit?: string
+  frameportCommit?: string
   refreshRate?: number
-  extendedCompat?: boolean
   error?: string
 }
 
@@ -107,7 +106,7 @@ class FrameConversionService {
       const stored = settingsService.getFrameConversionSettings()
       const envRefresh = process.env.FRAME_CYBERDECK_REFRESH_RATE
       const requestedRefresh = envRefresh === undefined ? stored.refreshRate : Number(envRefresh)
-      const refreshRate = [0, 72, 80, 90, 120, 144].includes(requestedRefresh)
+      const refreshRate = [0, 72, 80, 90, 96, 108, 120, 144].includes(requestedRefresh)
         ? requestedRefresh
         : 0
       if (requestedRefresh !== refreshRate) {
@@ -115,11 +114,6 @@ class FrameConversionService {
           `[Frame Convert] Ignoring unsupported FRAME_CYBERDECK_REFRESH_RATE=${envRefresh}; using runtime default.`
         )
       }
-      const envExtended = process.env.FRAME_CYBERDECK_EXTENDED_COMPAT
-      const extendedCompat =
-        envExtended === undefined
-          ? stored.extendedCompat
-          : /^(1|true|yes|on)$/i.test(envExtended)
 
       const convertArgs = [
         helper,
@@ -131,11 +125,8 @@ class FrameConversionService {
         '--refresh-rate',
         String(refreshRate)
       ]
-      if (extendedCompat) convertArgs.push('--extended-compat')
 
-      console.log(
-        `[Frame Convert] Options: refresh=${refreshRate || 'default'}, extendedCompat=${extendedCompat}`
-      )
+      console.log(`[Frame Convert] Options: refresh=${refreshRate || 'default'}`)
 
       try {
         const execution = await execa(

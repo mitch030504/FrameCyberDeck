@@ -7,6 +7,7 @@
   "homepage": "https://github.com/mitch030504/FrameCyberDeck",
   "scripts": {
     "test:node": "node --test src/main/services/download/*.test.mjs src/main/services/backup/*.test.mjs",
+    "test:python": "python3 tests/frame_convert_test.py",
     "format": "prettier --write .",
     "lint": "eslint --cache .",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
@@ -40,6 +41,7 @@
     "@electron-toolkit/utils": "^4.0.0",
     "axios": "^1.9.0",
     "compare-versions": "^6.1.1",
+    "dompurify": "^3.4.16",
     "electron-log": "^5.4.1",
     "execa": "^9.6.0",
     "ini": "^5.0.0",

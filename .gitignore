@@ -9,3 +9,4 @@ out
 !.env.example
 pkg/
 *.tsbuildinfo
+__pycache__/

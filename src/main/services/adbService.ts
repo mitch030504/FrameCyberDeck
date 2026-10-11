@@ -2,7 +2,7 @@ import { Adb, DeviceClient } from '@devicefarmer/adbkit'
 import Tracker from '@devicefarmer/adbkit/dist/src/adb/tracker'
 import { BrowserWindow } from 'electron'
 import { EventEmitter } from 'events'
-import { exec } from 'child_process'
+import { execFile } from 'child_process'
 import dependencyService from './dependencyService'
 import settingsService from './settingsService'
 import fs, { Dirent } from 'fs'
@@ -11,6 +11,31 @@ import path from 'path'
 import ping from 'pingman'
 import { AdbAPI, DeviceInfo, PackageInfo, ServiceStatus } from '@shared/types'
 import { typedWebContentsSend } from '@shared/ipc-utils'
+
+/**
+ * Splits an adb argument string the way a shell would, honoring double and
+ * single quotes, without invoking a shell.
+ */
+function splitArgs(input: string): string[] {
+  const out: string[] = []
+  let current = ''
+  let quote: string | null = null
+  for (const ch of input) {
+    if (quote) {
+      if (ch === quote) quote = null
+      else current += ch
+    } else if (ch === '"' || ch === "'") {
+      quote = ch
+    } else if (/\s/.test(ch)) {
+      if (current) out.push(current)
+      current = ''
+    } else {
+      current += ch
+    }
+  }
+  if (current) out.push(current)
+  return out
+}
 
 /**
  * Thrown by installPackage when ADB reports INSTALL_FAILED_UPDATE_INCOMPATIBLE,
@@ -762,7 +787,7 @@ class AdbService extends EventEmitter implements AdbAPI {
   async runLocalAdbCommand(args: string): Promise<string> {
     const adbPath = dependencyService.getAdbPath()
     return new Promise<string>((resolve) => {
-      exec(`"${adbPath}" ${args}`, { timeout: 15000 }, (err, stdout, stderr) => {
+      execFile(adbPath, splitArgs(args), { timeout: 15000 }, (err, stdout, stderr) => {
         resolve((stdout || '') + (stderr || '') || (err?.message ?? '(no output)'))
       })
     })
@@ -1254,6 +1279,14 @@ class AdbService extends EventEmitter implements AdbAPI {
     packageName: string,
     localDir: string
   ): Promise<boolean> {
+    // The package name is interpolated into device-side shell commands below;
+    // refuse anything outside the character set Android package names use.
+    if (!/^[a-zA-Z0-9._-]+$/.test(packageName)) {
+      console.warn(
+        `[ADB Service] run-as restore: refusing unsafe package name ${JSON.stringify(packageName)}`
+      )
+      return false
+    }
     if (!(await this.isPackageDebuggable(serial, packageName))) {
       console.warn(
         `[ADB Service] run-as restore: ${packageName} is not debuggable — cannot restore internal data.`
@@ -1338,8 +1371,25 @@ class AdbService extends EventEmitter implements AdbAPI {
     path: string
     error?: string
   }> {
-    const downloadPath = settingsService.getDownloadPath()
-    const gamePath = path.join(downloadPath, releaseName)
+    const downloadPath = path.resolve(settingsService.getDownloadPath())
+    const gamePath = path.resolve(downloadPath, releaseName)
+    // releaseName arrives from the renderer and can name anything on disk;
+    // never delete outside the downloads folder.
+    if (gamePath !== downloadPath && !gamePath.startsWith(downloadPath + path.sep)) {
+      console.error(`[ADB Service] deleteGameFiles - refusing to delete outside downloads: ${releaseName}`)
+      return {
+        deleted: false,
+        path: gamePath,
+        error: 'Refusing to delete outside the downloads folder'
+      }
+    }
+    if (!releaseName) {
+      return {
+        deleted: false,
+        path: gamePath,
+        error: 'No game folder specified'
+      }
+    }
     console.log(`[ADB Service] deleteGameFiles - Deleting ${gamePath}`)
     try {
       await fsPromises.stat(gamePath)
@@ -1518,7 +1568,7 @@ class AdbService extends EventEmitter implements AdbAPI {
   killServer(): void {
     try {
       const adbPath = dependencyService.getAdbPath()
-      exec(`"${adbPath}" kill-server`, { timeout: 5000 }, (err) => {
+      execFile(adbPath, ['kill-server'], { timeout: 5000 }, (err) => {
         if (err) console.warn('[ADB Service] kill-server error:', err.message)
         else console.log('[ADB Service] kill-server OK')
       })
@@ -1566,7 +1616,7 @@ class AdbService extends EventEmitter implements AdbAPI {
     const adbPath = dependencyService.getAdbPath()
     const run = (args: string): Promise<void> =>
       new Promise((resolve) => {
-        exec(`"${adbPath}" ${args}`, { timeout: 10000 }, (err) => {
+        execFile(adbPath, splitArgs(args), { timeout: 10000 }, (err) => {
           if (err) console.warn(`[ADB Service] "adb ${args}" reported:`, err.message)
           else console.log(`[ADB Service] "adb ${args}" OK`)
           resolve()

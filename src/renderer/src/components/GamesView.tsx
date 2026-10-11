@@ -84,6 +84,7 @@ import { useSettings } from '../hooks/useSettings'
 import { useMirrors } from '../hooks/useMirrors'
 import { useStarredGames } from '../hooks/useStarredGames'
 import { playSound } from '../hooks/useSoundEffects'
+import { localFileUrl } from '../utils/localFileUrl'
 
 // Column width constants
 const COLUMN_WIDTHS = {
@@ -880,7 +881,7 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
           return (
             <div className="game-thumbnail-cell">
               <img
-                src={imagePath ? `file://${imagePath}` : fallback}
+                src={imagePath ? localFileUrl(imagePath) : fallback}
                 alt="Thumbnail"
                 className="game-thumbnail-img"
               />
@@ -3330,7 +3331,7 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
                             <img
                               src={
                                 game.thumbnailPath
-                                  ? `file://${game.thumbnailPath}`
+                                  ? localFileUrl(game.thumbnailPath)
                                   : game.notOnServer
                                     ? notOnServerImage
                                     : placeholderImage

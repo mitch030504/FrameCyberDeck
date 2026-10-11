@@ -36,6 +36,7 @@ import GameSaveBackupControls from './backup/GameSaveBackupControls'
 import GameCoverLightbox from './GameCoverLightbox'
 import GameDescriptionPanel from './GameDescriptionPanel'
 import { gameDescriptionKey, toGameDescriptionRequest } from '@renderer/utils/gameDescription'
+import { localFileUrl } from '../utils/localFileUrl'
 
 const NEON = 'var(--vrcd-neon)'
 const PURPLE = 'var(--vrcd-purple)'
@@ -582,7 +583,7 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
           >
             {/* Cover image */}
             <GameCoverLightbox
-              src={game.thumbnailPath ? `file://${game.thumbnailPath}` : placeholderImage}
+              src={game.thumbnailPath ? localFileUrl(game.thumbnailPath) : placeholderImage}
               alt={game.name}
               isPlaceholder={!game.thumbnailPath}
               loading={loadingDescription}

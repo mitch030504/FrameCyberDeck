@@ -189,12 +189,6 @@ class FrameDevkitService {
     return await this.bridge<FrameDevkitStatus>('status', [], host)
   }
 
-  async register(_host?: string): Promise<void> {
-    throw new Error(
-      'Register the Steam Frame once in the official SteamOS Devkit Client; Frame CyberDeck reuses that Devkit SSH identity.'
-    )
-  }
-
   private async walkFiles(root: string, maxDepth: number): Promise<string[]> {
     if (maxDepth < 0) return []
     const files: string[] = []

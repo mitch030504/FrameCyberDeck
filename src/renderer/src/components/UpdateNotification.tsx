@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { marked } from 'marked'
+import DOMPurify from 'dompurify'
 import {
   Button,
   Text,
@@ -224,9 +225,12 @@ export function UpdateNotification(): React.ReactElement | null {
   const releaseNotesHtml = useMemo(() => {
     if (!updateAvailable?.releaseNotes) return ''
     try {
-      return String(marked.parse(updateAvailable.releaseNotes, { breaks: true }))
+      // Release notes are remote content; never render them as raw HTML.
+      return DOMPurify.sanitize(
+        String(marked.parse(updateAvailable.releaseNotes, { breaks: true }))
+      )
     } catch {
-      return updateAvailable.releaseNotes
+      return DOMPurify.sanitize(updateAvailable.releaseNotes)
     }
   }, [updateAvailable?.releaseNotes])
 

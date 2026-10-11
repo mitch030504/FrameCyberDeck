@@ -1799,6 +1799,8 @@ const FRAME_REFRESH_OPTIONS: Array<{ label: string; value: FrameRefreshRate }> =
   { label: '72 Hz', value: 72 },
   { label: '80 Hz', value: 80 },
   { label: '90 Hz', value: 90 },
+  { label: '96 Hz', value: 96 },
+  { label: '108 Hz', value: 108 },
   { label: '120 Hz', value: 120 },
   { label: '144 Hz', value: 144 }
 ]
@@ -1806,8 +1808,7 @@ const FRAME_REFRESH_OPTIONS: Array<{ label: string; value: FrameRefreshRate }> =
 const FrameConversionSettingsPanel: React.FC = () => {
   const styles = useStyles()
   const [settings, setSettings] = useState<FrameConversionSettings>({
-    refreshRate: 0,
-    extendedCompat: false
+    refreshRate: 0
   })
   const [loaded, setLoaded] = useState(false)
   const [saved, setSaved] = useState(false)
@@ -1881,24 +1882,6 @@ const FrameConversionSettingsPanel: React.FC = () => {
               <InfoRegular />
               Runtime default is safest. A requested rate is only used when the Frame runtime reports
               that mode as supported.
-            </Text>
-          </div>
-
-          <div className={styles.speedControl}>
-            <Text>Extended compatibility adapter</Text>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-              <Switch
-                checked={settings.extendedCompat}
-                onChange={(_, data) =>
-                  setSettings((current) => ({ ...current, extendedCompat: data.checked }))
-                }
-              />
-              <Text>{settings.extendedCompat ? 'Enabled' : 'Disabled'}</Text>
-            </div>
-            <Text className={styles.hint}>
-              <InfoRegular />
-              Experimental Quest2Frame passthrough/alpha-blend translation plus the validated 1–2 px
-              swapchain rectangle correction. Leave disabled unless a title needs it.
             </Text>
           </div>
         </div>
