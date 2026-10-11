@@ -362,7 +362,9 @@ class FrameDevkitService {
     onProgress?.('Analyzing Android package…', 5)
     const payload = await this.resolveAndroidPayload(sourcePath)
     const devkitName = this.safeDevkitName(title)
-    const base = join(app.getPath('temp'), 'frame-cyberdeck')
+    // Stage on the real disk, not the OS temp dir: /tmp is a small tmpfs on
+    // many Linux distros, and a large game's OBBs overflow it mid-copy.
+    const base = join(app.getPath('userData'), 'frame-cyberdeck')
     await fs.mkdir(base, { recursive: true })
     const directory = await fs.mkdtemp(join(base, `${devkitName}-`))
 
