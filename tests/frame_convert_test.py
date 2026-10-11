@@ -253,18 +253,22 @@ class FramePortRecipeTest(unittest.TestCase):
 
 
 def build_test_elf() -> bytes:
-    """A minimal ELF64 with PT_DYNAMIC and a .rodata section, for shim tests."""
+    """A minimal ELF64 with PT_DYNAMIC, .rodata, and .dynsym/.dynstr, for shim tests."""
     import struct
 
-    strtab = b'\0libchild.so\0'
+    strtab = b'\0libchild.so\0xrCreateSwapchain\0'
     rodata = b'libvulkan.so\0libopenxr_loader.so\0name-in-rodata\0'
+    code = struct.pack('<I', 0x7140041F)  # cmp wN, #4096
     ehsize, phentsize, shentsize = 64, 56, 64
     dyn_off = ehsize + 2 * phentsize
     str_off = dyn_off + 4 * 16
-    rodata_off = str_off + len(strtab)
+    sym_off = str_off + len(strtab)
+    code_off = sym_off + 2 * 24
+    rodata_off = code_off + len(code)
     shstr_off = rodata_off + len(rodata)
-    shoff = (shstr_off + len(b'\0.shstrtab\0.rodata\0') + 15) // 16 * 16
-    file_size = shoff + 3 * shentsize
+    shstrtab = b'\0.shstrtab\0.rodata\0.dynsym\0.dynstr\0'
+    shoff = (shstr_off + len(shstrtab) + 15) // 16 * 16
+    file_size = shoff + 5 * shentsize
 
     eh = bytearray(ehsize)
     eh[0:4] = b'\x7fELF'
@@ -277,7 +281,7 @@ def build_test_elf() -> bytes:
     struct.pack_into('<H', eh, 54, phentsize)
     struct.pack_into('<H', eh, 56, 2)        # e_phnum
     struct.pack_into('<H', eh, 58, shentsize)
-    struct.pack_into('<H', eh, 60, 3)        # e_shnum
+    struct.pack_into('<H', eh, 60, 5)        # e_shnum
     struct.pack_into('<H', eh, 62, 1)        # e_shstrndx
 
     def ph(p_type, offset, vaddr, filesz, memsz, flags):
@@ -291,23 +295,29 @@ def build_test_elf() -> bytes:
         struct.pack('<qQ', 10, len(strtab)),  # DT_STRSZ
         struct.pack('<qQ', 0, 0),           # DT_NULL
     ])
+    # Elf64_Sym: st_name st_info st_other st_shndx st_value st_size
+    symtab = (24 * b'\0'
+              + struct.pack('<IBBHQQ', 13, 0x12, 0, 1, code_off, 8))  # xrCreateSwapchain
 
-    shstrtab = b'\0.shstrtab\0.rodata\0'
-    shstr_ndx = {'.shstrtab': 1, '.rodata': 11}
+    shstr_ndx = {'.shstrtab': 1, '.rodata': 11, '.dynsym': 19, '.dynstr': 27}
 
-    def sh(name, sh_type, offset, size):
+    def sh(name, sh_type, offset, size, link=0, entsize=0):
         return struct.pack('<IIQQQQIIQQ', shstr_ndx[name], sh_type, 0, 0,
-                           offset, size, 0, 0, 1, 0)
+                           offset, size, link, 0, 1, entsize)
 
     sections = (shentsize * b'\0'
                + sh('.shstrtab', 3, shstr_off, len(shstrtab))
-               + sh('.rodata', 1, rodata_off, len(rodata)))
+               + sh('.rodata', 1, rodata_off, len(rodata))
+               + sh('.dynsym', 11, sym_off, len(symtab), 4, 24)
+               + sh('.dynstr', 3, str_off, len(strtab)))
 
     blob = bytearray(file_size)
     blob[0:ehsize] = eh
     blob[ehsize:ehsize + 2 * phentsize] = load + dynamic
     blob[dyn_off:dyn_off + len(dyn)] = dyn
     blob[str_off:str_off + len(strtab)] = strtab
+    blob[sym_off:sym_off + len(symtab)] = symtab
+    blob[code_off:code_off + len(code)] = code
     blob[rodata_off:rodata_off + len(rodata)] = rodata
     blob[shstr_off:shstr_off + len(shstrtab)] = shstrtab
     blob[shoff:shoff + len(sections)] = sections
@@ -319,7 +329,7 @@ class ElfSurgeryTest(unittest.TestCase):
         data = build_test_elf()
         patched, count = fc.elf_replace_rodata_string(data, 'libvulkan.so', 'libfp_vk.so')
         self.assertEqual(count, 1)
-        self.assertIn(b'\0libfp_vk.so\0', patched)
+        self.assertIn(b'libfp_vk.so\0', patched)
         self.assertIn(b'libopenxr_loader.so\0', patched)  # untouched
         # a longer replacement is refused
         with self.assertRaises(ValueError):
@@ -334,6 +344,19 @@ class ElfSurgeryTest(unittest.TestCase):
         self.assertIn('libchild.so', needed)
         # idempotent
         self.assertEqual(fc.elf_add_needed(patched, 'libframe_xrshim.so'), patched)
+
+    def test_raise_swapchain_limit(self):
+        data = build_test_elf()
+        fixed, count = fc.raise_swapchain_limit(data)
+        self.assertEqual(count, 1)
+        self.assertIsNotNone(fixed)
+        expected = (0x7140041F & ~(0xFFF << 10)) | (fc.SWAPCHAIN_LIMIT_UNITS << 10)
+        code_off = 176 + 64 + len(b'\0libchild.so\0xrCreateSwapchain\0') + 48
+        self.assertEqual(int.from_bytes(fixed[code_off:code_off + 4], 'little'), expected)
+        # a lib without the swapchain symbols is left alone
+        plain, count = fc.raise_swapchain_limit(b'\x7fELF' + b'\x02\x01' + b'\0' * 200)
+        self.assertIsNone(plain)
+        self.assertEqual(count, 0)
 
 
 if __name__ == '__main__':

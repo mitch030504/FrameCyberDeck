@@ -590,6 +590,86 @@ def elf_add_needed(data: bytes, library: str) -> bytes:
     return result
 
 
+# OVRPort's dispatcher aborts on swapchains larger than 4096 px; raise that
+# guard so the runtime decides (FramePort default patch, by spoopyghosty0).
+SWAPCHAIN_FUNCS = ("xrCreateSwapchain", "xrCreateSwapchainAndroidSurfaceKHR")
+CMP_4096 = 0x7140041F  # cmp wN, #1, lsl #12   (subs wzr, wN, #0x1000)
+CMP_MASK = 0xFFFFFC1F  # everything but Rn
+SWAPCHAIN_LIMIT_UNITS = 4  # 4 << 12 = 16384; the Frame's runtime reports 8192 and rejects larger itself
+
+
+def _elf64_sections(data: bytes) -> dict[str, tuple[int, int, int]]:
+    """name -> (sh_offset, sh_size, sh_entsize) from the section header table."""
+    is64, eh = _elf_header(data)
+    shoff, shentsize, shnum, shstrndx = eh[6], eh[11], eh[12], eh[13]
+    if not shoff or not shnum or shstrndx >= shnum:
+        return {}
+    sh_fmt = "<IIQQQQIIQQ" if is64 else "<IIIIIIIIII"
+
+    def section(i: int):
+        return struct.unpack_from(sh_fmt, data, shoff + i * shentsize)
+
+    names_off = section(shstrndx)[4]
+    out: dict[str, tuple[int, int, int]] = {}
+    for i in range(shnum):
+        header = section(i)
+        start = names_off + header[0]
+        end = data.index(b"\0", start)
+        out[data[start:end].decode("utf-8", "replace")] = (header[4], header[5], header[9])
+    return out
+
+
+def raise_swapchain_limit(data: bytes) -> tuple[bytes | None, int]:
+    """Rewrite the `cmp wN, #4096` size guards at the start of OVRPort's swapchain entry points."""
+    sections = _elf64_sections(data)
+    dynsym = sections.get(".dynsym")
+    dynstr = sections.get(".dynstr")
+    if not dynsym or not dynstr:
+        return None, 0
+    sym_off, sym_size, sym_entsize = dynsym
+    str_off, str_size, _ = dynstr
+    sym_entsize = sym_entsize or 24
+    # Elf64_Sym: st_name(4) st_info(1) st_other(1) st_shndx(2) st_value(8) st_size(8)
+    loads = []
+    is64, eh = _elf_header(data)
+    phoff, phentsize, phnum = eh[5], eh[9], eh[10]
+    ph_fmt = "<IIQQQQQQ" if is64 else "<IIIIIIII"
+    for i in range(phnum):
+        vals = struct.unpack_from(ph_fmt, data, phoff + i * phentsize)
+        if is64:
+            p_type, _, p_offset, p_vaddr, _, p_filesz, _, _ = vals
+        else:
+            p_type, p_offset, p_vaddr, _, p_filesz, _, _, _ = vals
+        if p_type == 1:  # PT_LOAD
+            loads.append((p_vaddr, p_offset, p_filesz))
+
+    def va2off(va: int) -> int | None:
+        return next((va - v + o for v, o, sz in loads if v <= va < v + sz), None)
+
+    out, count = bytearray(data), 0
+    for k in range(sym_size // sym_entsize):
+        st_name, _info, _other, _shndx, st_value, st_size = struct.unpack_from(
+            "<IBBHQQ", data, sym_off + k * sym_entsize
+        )
+        if st_name >= str_size:
+            continue
+        end = data.index(b"\0", str_off + st_name)
+        name = data[str_off + st_name : end].decode("utf-8", "replace")
+        if name not in SWAPCHAIN_FUNCS or not st_value:
+            continue
+        off = va2off(st_value)
+        if off is None:
+            continue
+        for at in range(off, off + min(st_size or 256, 256), 4):  # the guard sits in the prologue
+            word = int.from_bytes(out[at : at + 4], "little")
+            if word & CMP_MASK == CMP_4096:
+                out[at : at + 4] = (
+                    (word & ~(0xFFF << 10)) | (SWAPCHAIN_LIMIT_UNITS << 10)
+                ).to_bytes(4, "little")
+                count += 1
+    return (bytes(out), count) if count else (None, 0)
+
+
 def resolve_apk(source: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
     source = source.expanduser().resolve()
     if source.is_file():
@@ -819,6 +899,27 @@ def convert(
 
         # FramePort shim injection (recipes by spoopyghosty0, GPLv3)
         shims = recipe_shims(recipe or {})
+        if shims["gl"]:
+            log("Recipe requests the GL shim; that flow needs FramePort's VrApi bridge and is not converted here.")
+
+        # Which APK libraries load Vulkan by name: the Vulkan shim applies to every
+        # such engine (FramePort default: it drops invalid render-pass pNext pointers
+        # that crash Lepton's Fossilize layer), not just vk_* recipes.
+        not_engine = ("libopenxr", "libOVR", "libovr", "libvrapi", "libfp_", "libframe", "libVkLayer", "libc++", "libunity")
+        vk_targets: list[str] = []
+        with zipfile.ZipFile(patched) as probe:
+            names = [n for n in probe.namelist() if n.startswith(prefix)]
+            vk_targets = [
+                n
+                for n in names
+                if pathlib.Path(n).name in ("libUE4.so", "libUnreal.so")
+                or (
+                    not pathlib.Path(n).name.startswith(not_engine)
+                    and b"\0libvulkan.so\0" in probe.read(n)
+                )
+            ]
+        if vk_targets:
+            shims["vk"] = True
         shim_bytes = {
             name: ensure_frameport_artifact(root, name).read_bytes()
             for name, needed in (
@@ -828,24 +929,6 @@ def convert(
             )
             if needed
         }
-        if shims["gl"]:
-            log("Recipe requests the GL shim; that flow needs FramePort's VrApi bridge and is not converted here.")
-
-        # Which APK libraries the Vulkan shim rewrites (engines that load libvulkan.so by name).
-        not_engine = ("libopenxr", "libOVR", "libovr", "libvrapi", "libfp_", "libframe", "libVkLayer", "libc++", "libunity")
-        vk_targets: list[str] = []
-        if shims["vk"]:
-            with zipfile.ZipFile(patched) as probe:
-                names = [n for n in probe.namelist() if n.startswith(prefix)]
-                vk_targets = [
-                    n
-                    for n in names
-                    if pathlib.Path(n).name in ("libUE4.so", "libUnreal.so")
-                    or (
-                        not pathlib.Path(n).name.startswith(not_engine)
-                        and b"\0libvulkan.so\0" in probe.read(n)
-                    )
-                ]
 
         def shim_patched_lib(name: str, data: bytes) -> bytes:
             if shims["vk"] and name in vk_targets:
@@ -880,6 +963,11 @@ def convert(
                 data = src.read(item.filename)
                 if item.filename.startswith(prefix):
                     data = shim_patched_lib(pathlib.Path(item.filename).name, data)
+                    if item.filename == prefix + "libopenxr_loader.so":
+                        fixed, count = raise_swapchain_limit(data)
+                        if fixed:
+                            data = fixed
+                            log(f"Swapchain size guard raised to 16384 px ({count} check(s))")
                 dst.writestr(item, data)
             dst.writestr(prefix + "libopenxr_loader_original.so", src.read(loader))
             dst.write(adapter, loader)
