@@ -769,7 +769,8 @@ class DownloadService extends EventEmitter implements DownloadAPI {
         item.gameName || item.releaseName,
         report,
         undefined,
-        frameOriginalSourcePath ?? item.downloadPath
+        frameOriginalSourcePath ?? item.downloadPath,
+        item.thumbnailPath
       )
       if (tracked) {
         this.updateItemStatus(

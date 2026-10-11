@@ -9,6 +9,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import urllib.request
 
 DEFAULT_PORT = 32000
@@ -67,6 +68,7 @@ def ssh_command(
     *,
     check: bool = True,
     port: int = 22,
+    stdin: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     key = private_key_path()
     if not key.is_file():
@@ -96,6 +98,7 @@ def ssh_command(
         ],
         check=check,
         text=True,
+        input=stdin,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -132,6 +135,132 @@ def status(host: str, port: int, ssh_port: int = 22) -> dict:
         "paired": paired,
         "pairError": pair_error,
     }
+
+
+# Self-contained script executed on the Frame after create-shortcut: Steam
+# names devkit titles "Devkit game: <gameid>" with default art. This renames
+# the shortcut to the real title (from the uploaded frame-cyberdeck.json),
+# installs the library artwork (grid/<appid>p + _hero from library.*), and
+# restarts Steam so the edit sticks — Steam caches shortcuts.vdf in memory
+# and would otherwise overwrite the file on its next write.
+POLISH_SHORTCUT_TEMPLATE = '''
+import json, os, struct, shutil, subprocess, glob, time
+
+GAMEID = __GAMEID__
+DIRECTORY = __DIRECTORY__
+
+
+def vdf_decode(data):
+    pos = 0
+
+    def cstring():
+        nonlocal pos
+        end = data.index(b"\\0", pos)
+        value = data[pos:end].decode("utf-8", "surrogateescape")
+        pos = end + 1
+        return value
+
+    def node():
+        nonlocal pos
+        out = {}
+        while True:
+            t = data[pos]
+            pos += 1
+            if t == 8:
+                return out
+            name = cstring()
+            if t == 0:
+                out[name] = node()
+            elif t == 1:
+                out[name] = cstring()
+            elif t == 2:
+                out[name] = struct.unpack_from("<I", data, pos)[0]
+                pos += 4
+            else:
+                raise ValueError("unexpected vdf type %d" % t)
+
+    return node()
+
+
+def vdf_encode(obj):
+    out = bytearray()
+    for key, value in obj.items():
+        name = key.encode("utf-8", "surrogateescape") + b"\\0"
+        if isinstance(value, dict):
+            out += bytes([0]) + name + vdf_encode(value)
+        elif isinstance(value, str):
+            out += bytes([1]) + name + value.encode("utf-8", "surrogateescape") + b"\\0"
+        else:
+            out += bytes([2]) + name + struct.pack("<I", value & 0xFFFFFFFF)
+    return bytes(out) + bytes([8])
+
+
+title = GAMEID
+try:
+    with open(os.path.join(DIRECTORY, "frame-cyberdeck.json")) as f:
+        meta = json.load(f)
+    title = meta.get("title") or meta.get("applicationLabel") or GAMEID
+except Exception:
+    pass
+
+art_paths = sorted(glob.glob(os.path.join(DIRECTORY, "library.*")))
+steam_root = os.path.expanduser("~/.local/share/Steam")
+userdata = os.path.join(steam_root, "userdata")
+patched = []
+if os.path.isdir(userdata):
+    for uid in os.listdir(userdata):
+        config = os.path.join(userdata, uid, "config")
+        vdf_path = os.path.join(config, "shortcuts.vdf")
+        if not os.path.isfile(vdf_path):
+            continue
+        try:
+            with open(vdf_path, "rb") as f:
+                root = vdf_decode(f.read())
+        except Exception:
+            continue
+        entries = root.get("Shortcuts")
+        if not isinstance(entries, dict):
+            continue
+        entry_changed = False
+        for entry in entries.values():
+            if not isinstance(entry, dict) or entry.get("DevkitGameID") != GAMEID:
+                continue
+            for key in ("AppName", "appname"):
+                if key in entry:
+                    entry[key] = title
+                    entry_changed = True
+            appid = entry.get("appid")
+            if art_paths and appid:
+                grid = os.path.join(config, "grid")
+                os.makedirs(grid, exist_ok=True)
+                for art in art_paths:
+                    ext = os.path.splitext(art)[1] or ".png"
+                    for suffix in ("p", "_hero"):
+                        shutil.copyfile(art, os.path.join(grid, "%s%s%s" % (appid, suffix, ext)))
+                entry_changed = True
+        if entry_changed:
+            shutil.copy2(vdf_path, "%s.backup-%s" % (vdf_path, time.strftime("%Y%m%d-%H%M%S")))
+            for old in sorted(glob.glob(vdf_path + ".backup-*"))[:-5]:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+            tmp = vdf_path + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(vdf_encode(root))
+            os.replace(tmp, vdf_path)
+            patched.append(uid)
+
+if patched:
+    subprocess.run(["systemctl", "--user", "restart", "steam.service"], check=False)
+print(json.dumps({"ok": True, "patched": patched, "title": title}))
+'''
+
+
+def build_polish_script(gameid: str, directory: str) -> str:
+    return POLISH_SHORTCUT_TEMPLATE.replace("__GAMEID__", json.dumps(gameid)).replace(
+        "__DIRECTORY__", json.dumps(directory)
+    )
 
 
 def rsync_percent(text: str) -> int | None:
@@ -282,6 +411,23 @@ def deploy(
         create_result = json.loads(created.stdout)
         if "error" in create_result:
             raise RuntimeError(str(create_result["error"]))
+
+        # Rename the shortcut to the real title, install the library artwork,
+        # and reload Steam (before an optional launch, so the game survives).
+        try:
+            ssh_command(
+                address,
+                login,
+                "python3 -",
+                port=ssh_port,
+                stdin=build_polish_script(name, remote_directory),
+            )
+        except Exception as exc:
+            print(
+                f"[Frame Devkit] Steam shortcut polish failed for {name}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
 
         if start:
             ssh_command(

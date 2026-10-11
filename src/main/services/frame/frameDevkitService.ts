@@ -1,6 +1,6 @@
 import { app } from 'electron'
 import { promises as fs } from 'fs'
-import { basename, dirname, join, resolve } from 'path'
+import { basename, dirname, extname, join, resolve } from 'path'
 import { execa } from 'execa'
 import type { PackageInfo } from '@shared/types'
 import adbService from '../adbService'
@@ -397,7 +397,8 @@ class FrameDevkitService {
   private async createStagingDirectory(
     sourcePath: string,
     title: string,
-    onProgress?: ProgressReporter
+    onProgress?: ProgressReporter,
+    thumbnailPath?: string
   ): Promise<{
     directory: string
     devkitName: string
@@ -416,6 +417,19 @@ class FrameDevkitService {
     onProgress?.('Preparing Frame title…', 15)
     await fs.copyFile(payload.apk, join(directory, 'game.apk'))
 
+    // Library artwork for the Steam shortcut; the devkit-side polish step
+    // installs it as grid/<appid>p/_hero on the Frame.
+    if (thumbnailPath) {
+      try {
+        await fs.copyFile(thumbnailPath, join(directory, `library${extname(thumbnailPath)}`))
+      } catch (error) {
+        console.warn(
+          '[Frame Devkit] Could not stage library artwork:',
+          error instanceof Error ? error.message : String(error)
+        )
+      }
+    }
+
     const conversion = await this.readConversionMetadata(payload.root)
     const packageName = conversion.packageName ?? devkitName
     const versionCode = conversion.versionCode ?? 0
@@ -425,11 +439,13 @@ class FrameDevkitService {
         {
           schemaVersion: 1,
           gameId: devkitName,
-          title: conversion.applicationLabel ?? title,
+          // The caller's game name (the catalog title) is the name the user
+          // knows; the APK's own label is often an internal codename.
+          title: title || conversion.applicationLabel || devkitName,
           packageName,
           versionCode,
           versionName: conversion.versionName ?? '',
-          applicationLabel: conversion.applicationLabel ?? title
+          applicationLabel: title || conversion.applicationLabel || devkitName
         },
         null,
         2
@@ -560,7 +576,8 @@ class FrameDevkitService {
     title: string,
     onProgress?: ProgressReporter,
     host?: string,
-    originalSourcePath?: string
+    originalSourcePath?: string,
+    thumbnailPath?: string
   ): Promise<boolean> {
     let staging: string | null = null
     try {
@@ -571,7 +588,12 @@ class FrameDevkitService {
         )
       }
 
-      const prepared = await this.createStagingDirectory(sourcePath, title, onProgress)
+      const prepared = await this.createStagingDirectory(
+        sourcePath,
+        title,
+        onProgress,
+        thumbnailPath
+      )
       staging = prepared.directory
       onProgress?.('Uploading to Steam Frame with SteamOS Devkit…', 40)
 
