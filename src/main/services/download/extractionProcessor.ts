@@ -6,6 +6,7 @@ import dependencyService from '../dependencyService'
 import { DownloadItem, DownloadStatus } from '@shared/types'
 import mirrorService from '../mirrorService'
 import { getAvailableDiskSpace, getDirectorySize, formatBytes } from './utils'
+import { verifyReleaseTree } from './releaseManifest'
 import {
   parseReleaseManifest,
   RELEASE_MANIFEST_FILENAME,
@@ -176,6 +177,19 @@ export class ExtractionProcessor {
         `Invalid download path: ${downloadPath}`
       )
       return false
+    }
+
+    // The download may already be a fully extracted release (a previous
+    // install deleted the split archive, or the mirror serves the tree
+    // directly). Verify against the release manifest and finish without
+    // touching 7-Zip — nothing left to extract.
+    if (await verifyReleaseTree(downloadPath)) {
+      console.log(
+        `[ExtractProc] ${item.releaseName} is already a complete extracted release; skipping extraction.`
+      )
+      this.queueManager.updateItem(item.releaseName, { manifestWarning: undefined })
+      this.updateItemStatus(item.releaseName, 'Completed', 100, undefined, undefined, undefined, 100)
+      return true
     }
     if (!dependencyService.getStatus().sevenZip.ready) {
       console.error(`[ExtractProc] 7zip dependency not ready for ${item.releaseName}.`)
