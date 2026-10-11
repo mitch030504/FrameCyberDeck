@@ -305,6 +305,19 @@ stop() {{
     kill $permfix 2>/dev/null || true
     [[ -n "$child" ]] && kill -TERM -- "-$child" 2>/dev/null || true
     podman kill "lepton-steamlaunch-$SteamAppId" >/dev/null 2>&1 || true
+    # Lepton's teardown can leave the container's init (catatonit) alive; it
+    # reparents to the Steam reaper, which then waits on it forever and the
+    # title stays "running". Poll briefly and clear whatever lands on the
+    # reaper from this launch, then let the launcher exit.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        found=0
+        for pid in $(ps -eo pid,ppid --no-headers 2>/dev/null | awk -v r="$PPID" -v me="$$" '$2==r && $1!=me {{print $1}}'); do
+            kill -9 "$pid" 2>/dev/null || true
+            found=1
+        done
+        [[ "$found" == 0 ]] && break
+        sleep 1
+    done
 }}
 trap stop EXIT
 trap 'exit 130' INT
@@ -312,6 +325,18 @@ trap 'exit 143' TERM
 setsid {lepton_q} start >"$app_dir/launch.log" 2>&1 &
 child=$!
 wait "$child"
+# A fresh APK install is refused while the Lepton Development session is not
+# running ("To install APKs launch Lepton Development on the device"); start
+# it once and retry. An abnormal end also clears the baked install, so this
+# path is how the game recovers by itself.
+if grep -q "To install APKs" "$app_dir/launch.log" 2>/dev/null && command -v steam >/dev/null; then
+    XDG_RUNTIME_DIR="/run/user/$(id -u)" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus" \
+        steam steam://rungameid/3056000 >/dev/null 2>&1 || true
+    sleep 25
+    setsid {lepton_q} start >"$app_dir/launch.log" 2>&1 &
+    child=$!
+    wait "$child"
+fi
 """
 
 
