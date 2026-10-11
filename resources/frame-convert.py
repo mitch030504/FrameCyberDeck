@@ -267,13 +267,21 @@ def copy_obbs(source_root: pathlib.Path, destination: pathlib.Path) -> int:
         return 0
     obb_dir = destination / "obb"
     obb_dir.mkdir(parents=True, exist_ok=True)
-    names: set[str] = set()
+    seen: dict[str, int] = {}
     for obb in obbs:
-        if obb.name in names:
-            raise RuntimeError(f"Duplicate OBB filename found: {obb.name}")
-        names.add(obb.name)
+        size = obb.stat().st_size
+        if obb.name in seen:
+            # Downloads can contain the same release nested inside itself
+            # (mirror layout + re-extraction); identical name and size is the
+            # same file, so copy it once. Different sizes are a real conflict.
+            if seen[obb.name] != size:
+                raise RuntimeError(
+                    f"Conflicting OBB files with the same name but different sizes: {obb.name}"
+                )
+            continue
+        seen[obb.name] = size
         shutil.copy2(obb, obb_dir / obb.name)
-    return len(obbs)
+    return len(seen)
 
 
 def convert(

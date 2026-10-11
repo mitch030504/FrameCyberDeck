@@ -66,6 +66,32 @@ class IsFrameConvertedTest(unittest.TestCase):
             self.assertFalse(fc.is_frame_converted(apk))
 
 
+class CopyObbsTest(unittest.TestCase):
+    def _obb(self, path, data):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+
+    def test_identical_duplicates_are_copied_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = pathlib.Path(tmp) / 'src'
+            data = b'x' * 128
+            self._obb(src / 'game' / 'pkg' / 'main.1.pkg.obb', data)
+            # the same release nested inside itself
+            self._obb(src / 'game' / 'game' / 'pkg' / 'main.1.pkg.obb', data)
+            dest = pathlib.Path(tmp) / 'dest'
+            count = fc.copy_obbs(src, dest)
+            self.assertEqual(count, 1)
+            self.assertEqual((dest / 'obb' / 'main.1.pkg.obb').read_bytes(), data)
+
+    def test_conflicting_sizes_raise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = pathlib.Path(tmp) / 'src'
+            self._obb(src / 'a' / 'main.1.pkg.obb', b'x' * 128)
+            self._obb(src / 'b' / 'main.1.pkg.obb', b'y' * 256)
+            with self.assertRaises(RuntimeError):
+                fc.copy_obbs(src, pathlib.Path(tmp) / 'dest')
+
+
 class AdapterPinTest(unittest.TestCase):
     def test_pin_is_self_consistent(self):
         self.assertEqual(len(fc.FRAMEPORT_ADAPTER_SHA256), 64)
