@@ -68,6 +68,24 @@ it('rejects converted payloads without a package identity', async () => {
   )
 })
 
+it('stages settings.conf from the conversion settings', async () => {
+  const source = join(paths.root, 'converted')
+  await fs.mkdir(source)
+  await fs.writeFile(join(source, 'game.apk'), 'converted')
+  await fs.writeFile(
+    join(source, 'frame-conversion.json'),
+    JSON.stringify({
+      package: 'com.test.game',
+      versionCode: 42,
+      settings: { scale: '1.000', controller_fix: '1', pose_time_fix: '1' }
+    })
+  )
+  const prepared = await devkit['createStagingDirectory'](source, 'game')
+  const conf = await fs.readFile(join(prepared.directory, 'settings.conf'), 'utf-8')
+  expect(conf).toContain('scale=1.000')
+  expect(conf).toContain('pose_time_fix=1')
+})
+
 it('stages non-OBB bundle data from obb/ with its folder structure', async () => {
   const source = join(paths.root, 'converted')
   await fs.mkdir(source)

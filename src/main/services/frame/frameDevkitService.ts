@@ -365,6 +365,7 @@ class FrameDevkitService {
     versionCode?: number
     versionName?: string
     applicationLabel?: string
+    settings?: Record<string, string>
   }> {
     const path = join(root, 'frame-conversion.json')
     try {
@@ -374,6 +375,7 @@ class FrameDevkitService {
         versionCode?: unknown
         versionName?: unknown
         applicationLabel?: unknown
+        settings?: unknown
       }
       const packageName =
         typeof parsed.packageName === 'string'
@@ -388,7 +390,15 @@ class FrameDevkitService {
       const versionName = typeof parsed.versionName === 'string' ? parsed.versionName : undefined
       const applicationLabel =
         typeof parsed.applicationLabel === 'string' ? parsed.applicationLabel : undefined
-      return { packageName, versionCode, versionName, applicationLabel }
+      const settings: Record<string, string> = {}
+      if (parsed.settings && typeof parsed.settings === 'object') {
+        for (const [key, value] of Object.entries(parsed.settings as Record<string, unknown>)) {
+          if (typeof value === 'string' || typeof value === 'number') {
+            settings[key] = String(value)
+          }
+        }
+      }
+      return { packageName, versionCode, versionName, applicationLabel, settings }
     } catch {
       return {}
     }
@@ -458,6 +468,16 @@ class FrameDevkitService {
         ),
         'utf-8'
       )
+
+      // The FrameBridge adapter reads this through LEPTON_ENV_FRAMEBRIDGE_CONFIG
+      // (set by the game's launch.sh), so settings can change without a
+      // reconversion. Mirrors the APK's baked libframe_settings.so.
+      if (conversion.settings && Object.keys(conversion.settings).length > 0) {
+        const conf = Object.entries(conversion.settings)
+          .map(([key, value]) => `${key}=${value}`)
+          .join('\n')
+        await fs.writeFile(join(directory, 'settings.conf'), `${conf}\n`, 'utf-8')
+      }
 
       if (payload.obbs.length > 0) {
         const obbDir = join(directory, 'obb')
@@ -664,7 +684,7 @@ class FrameDevkitService {
           '--directory',
           prepared.directory,
           '--start-command',
-          'game.apk'
+          'launch.sh'
         ],
         host,
         (percent) =>

@@ -3,6 +3,8 @@
 import importlib.util
 import pathlib
 import unittest
+import shutil
+import subprocess
 from unittest import mock
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -185,6 +187,51 @@ class TarStreamTest(unittest.TestCase):
             self.assertEqual(names, ['game.apk', 'sub/data.obb'])
             self.assertEqual(extracted, b'obb-bytes' * 100)
             self.assertEqual(percents[-1], 99)
+
+
+
+class LaunchShTest(unittest.TestCase):
+    def test_launch_sh_is_valid_bash(self):
+        text = bridge.launch_sh_text('com.test.game', '/home/steamos/.steam/steam/steamapps/common/Lepton/lepton')
+        self.assertTrue(text.startswith('#!/usr/bin/env bash'))
+        self.assertIn("SteamAppId=0", text)  # patched with the real appid after registration
+        self.assertIn("com.test.game/files", text)
+        self.assertIn("LEPTON_ENV_FRAMEBRIDGE_CONFIG", text)
+        self.assertIn("lepton-steamlaunch-$SteamAppId", text)
+        self.assertIn("setsid /home/steamos/.steam/steam/steamapps/common/Lepton/lepton start", text)
+        if shutil.which('bash'):
+            proc = subprocess.run(['bash', '-n', '/dev/stdin'], input=text, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_appid_patch_replaces_placeholder_once(self):
+        text = bridge.launch_sh_text('com.test.game', '/usr/bin/lepton')
+        patched = text.replace('SteamAppId=0', 'SteamAppId=1234567', 1)
+        self.assertIn('SteamAppId=1234567', patched)
+        self.assertNotIn('SteamAppId=0', patched)
+        self.assertEqual(patched.count('SteamAppId='), text.count('SteamAppId='))
+
+
+
+class RegisteredCompatToolTest(unittest.TestCase):
+    def _run(self, stdout, code=0):
+        result = mock.Mock(returncode=code, stdout=stdout, stderr="")
+        with mock.patch.object(bridge, "ssh_command", return_value=result) as ssh:
+            tool = bridge.registered_compat_tool("frame", "steamos", 22, "com.test.game")
+        return tool, ssh
+
+    def test_registered_fauxdroid_title_is_legacy(self):
+        tool, ssh = self._run('{"steam_play": "0", "compat_tool": "fauxdroid"}\n')
+        self.assertEqual(tool, "fauxdroid")
+        ssh.assert_called_once()
+
+    def test_unregistered_title_returns_empty(self):
+        for stdout in ("", "\n", "not json"):
+            tool, _ = self._run(stdout)
+            self.assertEqual(tool, "")
+
+    def test_native_registration_returns_empty_tool(self):
+        tool, _ = self._run('{"steam_play": "0", "compat_tool": ""}\n')
+        self.assertEqual(tool, "")
 
 
 if __name__ == '__main__':

@@ -1716,6 +1716,13 @@ def convert(
         )
 
         obb_count = copy_obbs(source_root, output_dir, package)
+        settings_dict = {
+            "scale": f"{scale / 100.0:.3f}",
+            "controller_fix": "1" if controllers else "0",
+            "foveation_fix": "1" if foveation else "0",
+            "refresh_rate": str(refresh_rate),
+        }
+        settings_dict.update(recipe_settings)
         result = {
             "ok": True,
             "converted": True,
@@ -1728,6 +1735,7 @@ def convert(
             "directory": str(output_dir),
             "obbCount": obb_count,
             "sha256": sha256(game_apk),
+            "settings": settings_dict,
             "ovrportAppVersion": OVRPORT_APP_VERSION,
             "ovrportRuntimeVersion": OVRPORT_RUNTIME_VERSION,
             "frameportCommit": FRAMEPORT_COMMIT,
