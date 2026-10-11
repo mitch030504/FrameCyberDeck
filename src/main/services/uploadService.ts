@@ -372,6 +372,10 @@ class UploadService extends EventEmitter {
 
       if (nextItem.isLocalUpload) {
         const success = await this.processLocalUpload(nextItem)
+        if (success) {
+          // Record package + version so later syncs skip re-uploading it.
+          await gameService.addToBlacklist(nextItem.packageName, nextItem.versionCode)
+        }
         // Re-read the item: updateItemStatus replaces the object, so processLocalUpload
         // may have already set a specific Error (e.g. disk full) or Cancelled status
         // that we must not clobber with the generic message.
