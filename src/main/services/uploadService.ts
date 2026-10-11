@@ -774,6 +774,52 @@ class UploadService extends EventEmitter {
     return { errors: [] }
   }
 
+  /**
+   * Queue a fully-resolved local item (Meta owned-title sync): the APK and
+   * OBB paths come from the Meta downloader, so no device or folder scan is
+   * needed — just the same dedup/cleanup rules as other queue entries.
+   */
+  public addMetaItemToQueue(item: {
+    packageName: string
+    gameName: string
+    versionCode: number
+    sourcePath: string
+    sourceObbPaths: string[]
+  }): boolean {
+    if (this.activePackage === item.packageName) return false
+    const existing = this.findItem(item.packageName)
+    if (
+      existing &&
+      existing.status !== 'Error' &&
+      existing.status !== 'Cancelled' &&
+      existing.status !== 'Completed'
+    ) {
+      return false
+    }
+    this.cancelled.delete(item.packageName)
+    this.uploadQueue = this.uploadQueue.filter((queued) => queued.packageName !== item.packageName)
+    this.uploadQueue.push({
+      packageName: item.packageName,
+      gameName: item.gameName,
+      versionCode: item.versionCode,
+      deviceId: 'meta',
+      status: 'Queued',
+      progress: 0,
+      addedDate: Date.now(),
+      isLocalUpload: true,
+      sourcePath: item.sourcePath,
+      sourceObbPaths: item.sourceObbPaths
+    })
+    console.log(
+      `[UploadService] Added Meta item "${item.gameName}" (${item.packageName} v${item.versionCode}) to upload queue.`
+    )
+    this.emitQueueUpdated()
+    if (!this.isProcessing) {
+      void this.processQueue()
+    }
+    return true
+  }
+
   public async prepareUpload(
     packageName: string,
     gameName: string,

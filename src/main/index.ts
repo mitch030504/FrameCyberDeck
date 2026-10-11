@@ -17,6 +17,8 @@ import { createGameDescriptionService } from './services/gameDescription/gameDes
 import downloadService from './services/downloadService'
 import frameDevkitService from './services/frame/frameDevkitService'
 import uploadService from './services/uploadService'
+import metaAccountService from './services/metaAccountService'
+import metaSyncService from './services/metaSyncService'
 import updateService from './services/updateService'
 import logsService from './services/logsService'
 import mirrorService from './services/mirrorService'
@@ -746,6 +748,38 @@ app.whenReady().then(async () => {
   typedIpcMain.handle('upload:add-local-items', async (_event, paths) => {
     console.log(`[IPC] Adding local items to upload queue: ${paths.join(', ')}`)
     return uploadService.addLocalItemsToQueue(paths)
+  })
+
+  // --- Meta account / owned-titles sync handlers ---
+  typedIpcMain.handle('meta-account:get-status', () => metaAccountService.getStatus())
+
+  typedIpcMain.handle('meta-account:login-browser', async () => {
+    console.log('[IPC] Opening Meta sign-in window')
+    return metaAccountService.loginWithBrowser()
+  })
+
+  typedIpcMain.handle('meta-account:login-token', async (_event, token) => {
+    console.log('[IPC] Validating pasted Meta token')
+    return metaAccountService.setToken(token)
+  })
+
+  typedIpcMain.handle('meta-account:logout', () => metaAccountService.logout())
+
+  typedIpcMain.handle('meta-sync:find-updates', async () => {
+    console.log('[IPC] Checking Meta library for new titles/updates')
+    try {
+      return { candidates: await metaSyncService.findUpdates() }
+    } catch (error) {
+      return {
+        candidates: [],
+        error: error instanceof Error ? error.message : String(error)
+      }
+    }
+  })
+
+  typedIpcMain.handle('meta-sync:queue-updates', async (_event, candidates) => {
+    console.log(`[IPC] Queuing ${candidates.length} Meta titles for upload`)
+    return metaSyncService.queueUpdates(candidates)
   })
 
   typedIpcMain.handle('download:remove', async (_event, releaseName) => {

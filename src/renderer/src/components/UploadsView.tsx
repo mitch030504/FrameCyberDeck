@@ -12,6 +12,7 @@ import {
   tokens
 } from '@fluentui/react-components'
 import { useUpload } from '../hooks/useUpload'
+import MetaSyncDialog from './MetaSyncDialog'
 import { UploadItem } from '@shared/types'
 import {
   DismissRegular,
@@ -176,6 +177,7 @@ const UploadsView: React.FC = () => {
   return (
     <div className={styles.wrapper}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
+        <MetaSyncDialog />
         <Button
           size="small"
           appearance="subtle"

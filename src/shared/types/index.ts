@@ -194,6 +194,32 @@ export interface UploadItem {
   sourceObbPaths?: string[]
 }
 
+// Meta account / owned-titles sync types
+export interface MetaAccountStatus {
+  authenticated: boolean
+  name?: string
+}
+
+export interface MetaSyncCandidate {
+  packageName: string
+  appId: string
+  displayName: string
+  versionCode: number
+  version: string
+  binaryId: string
+  /** 'new' = not on the server at all; 'update' = server has an older version. */
+  kind: 'new' | 'update'
+  serverVersionCode?: number
+}
+
+export interface MetaSyncProgress {
+  packageName: string
+  displayName: string
+  stage: string
+  percent: number
+  error?: string
+}
+
 // Download types
 export type DownloadStatus =
   | 'Queued'
@@ -454,6 +480,26 @@ export interface UploadAPI {
 export interface UploadAPIRenderer extends UploadAPI {
   onUploadProgress: (callback: (progress: UploadPreparationProgress) => void) => () => void
   onQueueUpdated: (callback: (queue: UploadItem[]) => void) => () => void
+}
+
+// Meta account / owned-titles sync API
+export interface MetaLoginResult {
+  ok: boolean
+  name?: string
+  error?: string
+}
+
+export interface MetaSyncAPI {
+  getAccountStatus: () => Promise<MetaAccountStatus>
+  loginWithBrowser: () => Promise<MetaLoginResult>
+  loginWithToken: (token: string) => Promise<MetaLoginResult>
+  logout: () => Promise<void>
+  findUpdates: () => Promise<{ candidates: MetaSyncCandidate[]; error?: string }>
+  queueUpdates: (candidates: MetaSyncCandidate[]) => Promise<number>
+}
+
+export interface MetaSyncAPIRenderer extends MetaSyncAPI {
+  onSyncProgress: (callback: (progress: MetaSyncProgress) => void) => () => void
 }
 
 // Update API

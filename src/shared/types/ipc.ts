@@ -15,6 +15,10 @@ import {
   ServerConfigInfo,
   WiFiBookmark,
   LocalUploadError,
+  MetaAccountStatus,
+  MetaLoginResult,
+  MetaSyncCandidate,
+  MetaSyncProgress,
   ExistingDownloadAction,
   AddToQueueResult,
   DownloadStorageStatus,
@@ -120,6 +124,14 @@ export interface IPCChannels {
     boolean
   >
   'upload:add-local-items': DefineChannel<[paths: string[]], { errors: LocalUploadError[] }>
+
+  // Meta account / owned-titles sync
+  'meta-account:get-status': DefineChannel<[], MetaAccountStatus>
+  'meta-account:login-browser': DefineChannel<[], MetaLoginResult>
+  'meta-account:login-token': DefineChannel<[token: string], MetaLoginResult>
+  'meta-account:logout': DefineChannel<[], void>
+  'meta-sync:find-updates': DefineChannel<[], { candidates: MetaSyncCandidate[]; error?: string }>
+  'meta-sync:queue-updates': DefineChannel<[candidates: MetaSyncCandidate[]], number>
 
   // App info
   'app:get-version': DefineChannel<[], string>
@@ -260,6 +272,7 @@ export interface IPCEvents {
   'download:storage-status-changed': [status: DownloadStorageStatus]
   'upload:progress': [progress: UploadPreparationProgress]
   'upload:queue-updated': [queue: UploadItem[]]
+  'meta-sync:progress': [progress: MetaSyncProgress]
   'settings:download-speed-limit-changed': [limit: number]
   'settings:upload-speed-limit-changed': [limit: number]
   'update:checking-for-update': []

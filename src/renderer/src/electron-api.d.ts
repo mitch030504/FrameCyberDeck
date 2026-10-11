@@ -6,6 +6,7 @@ import {
   GameAPIRenderer,
   SettingsAPIRenderer,
   UploadAPIRenderer,
+  MetaSyncAPIRenderer,
   UpdateAPIRenderer,
   DependencyAPIRenderer,
   LogsAPIRenderer,
@@ -37,6 +38,7 @@ declare global {
       downloads: DownloadAPIRenderer
       settings: SettingsAPIRenderer
       uploads: UploadAPIRenderer
+      metaSync: MetaSyncAPIRenderer
       updates: UpdateAPIRenderer
       logs: LogsAPIRenderer
       backup: BackupAPIRenderer

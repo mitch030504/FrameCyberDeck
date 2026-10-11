@@ -14,6 +14,11 @@ import {
   UploadPreparationProgress,
   UploadAPIRenderer,
   UploadItem,
+  MetaAccountStatus,
+  MetaLoginResult,
+  MetaSyncAPIRenderer,
+  MetaSyncCandidate,
+  MetaSyncProgress,
   UpdateInfo,
   UpdateProgressInfo,
   UpdateAPIRenderer,
@@ -251,6 +256,25 @@ const api = {
       return () => typedIpcRenderer.removeListener('upload:queue-updated', listener)
     }
   } satisfies UploadAPIRenderer,
+  // Meta account / owned-titles sync APIs
+  metaSync: {
+    getAccountStatus: (): Promise<MetaAccountStatus> =>
+      typedIpcRenderer.invoke('meta-account:get-status'),
+    loginWithBrowser: (): Promise<MetaLoginResult> =>
+      typedIpcRenderer.invoke('meta-account:login-browser'),
+    loginWithToken: (token: string): Promise<MetaLoginResult> =>
+      typedIpcRenderer.invoke('meta-account:login-token', token),
+    logout: (): Promise<void> => typedIpcRenderer.invoke('meta-account:logout'),
+    findUpdates: (): Promise<{ candidates: MetaSyncCandidate[]; error?: string }> =>
+      typedIpcRenderer.invoke('meta-sync:find-updates'),
+    queueUpdates: (candidates: MetaSyncCandidate[]): Promise<number> =>
+      typedIpcRenderer.invoke('meta-sync:queue-updates', candidates),
+    onSyncProgress: (callback: (progress: MetaSyncProgress) => void): (() => void) => {
+      const listener = (_: IpcRendererEvent, progress: MetaSyncProgress): void => callback(progress)
+      typedIpcRenderer.on('meta-sync:progress', listener)
+      return () => typedIpcRenderer.removeListener('meta-sync:progress', listener)
+    }
+  } satisfies MetaSyncAPIRenderer,
   // Update APIs
   updates: {
     checkForUpdates: (): Promise<void> => typedIpcRenderer.invoke('update:check-for-updates'),
