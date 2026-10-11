@@ -29,40 +29,40 @@ beforeEach(async () => {
 })
 
 describe('selectCandidates', () => {
-  const apps = [
-    { appId: '111', displayName: 'Update Game' },
-    { appId: '222', displayName: 'New Game' },
-    { appId: '333', displayName: 'Up To Date' },
-    { appId: '444', displayName: 'PC Only' }
-  ]
-  const versions = {
-    '111': {
+  const titles = [
+    {
+      appId: '111',
+      displayName: 'Update Game',
+      packageName: 'com.update.game',
       versionCode: 20,
       version: '1.2',
-      binaryId: 'b1',
-      packageName: 'com.update.game'
+      binaryId: 'b1'
     },
-    '222': {
+    {
+      appId: '222',
+      displayName: 'New Game',
+      packageName: 'com.new.game',
       versionCode: 5,
       version: '1.0',
-      binaryId: 'b2',
-      packageName: 'com.new.game'
+      binaryId: 'b2'
     },
-    '333': {
+    {
+      appId: '333',
+      displayName: 'Up To Date',
+      packageName: 'com.current.game',
       versionCode: 7,
       version: '1.1',
-      binaryId: 'b3',
-      packageName: 'com.current.game'
+      binaryId: 'b3'
     }
-  }
+  ]
   const catalog = [
     { packageName: 'com.update.game', versionCode: 10 },
     { packageName: 'com.current.game', versionCode: 7 }
   ]
 
-  it('flags new titles and newer versions, skips up-to-date and non-Android', () => {
+  it('flags new titles and newer versions, skips up-to-date ones', () => {
     const never = (): boolean => false
-    const candidates = selectCandidates(apps, versions, catalog, never)
+    const candidates = selectCandidates(titles, catalog, never)
     expect(candidates).toEqual([
       expect.objectContaining({
         packageName: 'com.update.game',
@@ -77,21 +77,22 @@ describe('selectCandidates', () => {
   it('skips versions already blacklisted (already contributed)', () => {
     const blacklist = (packageName: string, versionCode: number): boolean =>
       packageName === 'com.update.game' && versionCode === 20
-    const candidates = selectCandidates(apps, versions, catalog, blacklist)
+    const candidates = selectCandidates(titles, catalog, blacklist)
     expect(candidates.map((candidate) => candidate.packageName)).toEqual(['com.new.game'])
   })
 
   it('keeps an older owned version when the server is newer', () => {
     const candidates = selectCandidates(
-      [{ appId: '555', displayName: 'Downgrade' }],
-      {
-        '555': {
+      [
+        {
+          appId: '555',
+          displayName: 'Downgrade',
+          packageName: 'com.newer.server',
           versionCode: 3,
           version: '0.9',
-          binaryId: 'b5',
-          packageName: 'com.newer.server'
+          binaryId: 'b5'
         }
-      },
+      ],
       [{ packageName: 'com.newer.server', versionCode: 4 }],
       (): boolean => false
     )
