@@ -26,13 +26,19 @@ export async function graphRequest<T>(
     doc_id: docId,
     variables: JSON.stringify(variables)
   })
-  const response = await fetch(GRAPH_URI, {
-    method: 'POST',
-    headers: { 'User-Agent': USER_AGENT },
-    body
-  })
-  if (!response.ok) {
-    throw new Error(`Meta request failed (${response.status})`)
+  // graph.oculus.com intermittently answers 500 on first request; retry once.
+  let response: Response | undefined
+  for (let attempt = 0; attempt < 2 && !response?.ok; attempt++) {
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 1000))
+    response = await fetch(GRAPH_URI, {
+      method: 'POST',
+      headers: { 'User-Agent': USER_AGENT },
+      body
+    })
+    if (!response.ok && response.status < 500) break
+  }
+  if (!response?.ok) {
+    throw new Error(`Meta request failed (${response?.status})`)
   }
   const data = (await response.json()) as { errors?: { message: string }[] }
   if (data.errors?.length) {

@@ -591,9 +591,11 @@ class UploadService extends EventEmitter {
               for (const obb of item.sourceObbPaths) {
                 this.assertNotCancelled(item.packageName)
                 const name = basename(obb)
-                if (!name.endsWith(`.${item.packageName}.obb`) || names.has(name)) {
-                  throw new Error('Invalid or duplicate original OBB provenance')
+                if (names.has(name)) {
+                  throw new Error('Duplicate original data file provenance')
                 }
+                // Data files keep the names the release ships with (Unity
+                // bundles, .pak chunks), not just the classic .obb form.
                 names.add(name)
                 await fs.copyFile(obb, join(obbDirectory, name))
               }

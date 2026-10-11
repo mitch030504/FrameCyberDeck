@@ -1,5 +1,5 @@
 import { promises as fs, createWriteStream } from 'fs'
-import { join } from 'path'
+import { join, basename } from 'path'
 import { pipeline } from 'stream/promises'
 import { Readable } from 'stream'
 import { BrowserWindow } from 'electron'
@@ -240,18 +240,18 @@ class MetaSyncService {
             const obbs = [
               ...(node.obb_binary ? [node.obb_binary] : []),
               ...(node.asset_files?.nodes ?? [])
-            ].map((file, index) => ({ ...file, name: file.file_name || `data${index}.obb` }))
+            ].map((file, index) => ({
+              ...file,
+              // Releases ship data under their own names (Unity bundles, Unreal
+              // .pak chunks, Sounds.obb), not the classic main.<pkg>.obb form.
+              name: basename(file.file_name || `data${index}.obb`)
+            }))
 
             emit('Downloading APK', 0)
             await this.downloadBinary(candidate.binaryId, apkPath, token)
             emit('Downloading data files', 10)
             let done = 0
             for (const obb of obbs) {
-              if (!obb.name.endsWith(`.${candidate.packageName}.obb`)) {
-                throw new Error(
-                  `Meta data file "${obb.name}" is not a ${candidate.packageName} OBB`
-                )
-              }
               await this.downloadBinary(obb.id, join(stageDir, obb.name), token)
               done++
               emit('Downloading data files', 10 + Math.round((done / obbs.length) * 80))
@@ -259,15 +259,17 @@ class MetaSyncService {
             await fs.writeFile(join(stageDir, '.complete'), new Date().toISOString(), 'utf-8')
           }
 
+          // Data files are everything in the stage dir except the APK and the
+          // hidden completion marker.
+          const dataFiles = (await fs.readdir(stageDir)).filter(
+            (name) => !name.startsWith('.') && name !== `${candidate.packageName}.apk`
+          )
           uploadService.addMetaItemToQueue({
             packageName: candidate.packageName,
             gameName: candidate.displayName,
             versionCode: candidate.versionCode,
             sourcePath: apkPath,
-            sourceObbPaths: (await fs.readdir(stageDir))
-              .filter((name) => name.endsWith(`.${candidate.packageName}.obb`))
-              .sort()
-              .map((name) => join(stageDir, name))
+            sourceObbPaths: dataFiles.map((name) => join(stageDir, name)).sort()
           })
           queued++
           emitProgress({

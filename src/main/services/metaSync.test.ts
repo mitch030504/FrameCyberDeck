@@ -9,7 +9,10 @@ vi.mock('electron', () => ({
   BrowserWindow: { getAllWindows: () => [] },
   safeStorage: { isEncryptionAvailable: () => true }
 }))
-vi.mock('./metaAccountService', () => ({ default: { getToken: vi.fn() } }))
+vi.mock('./metaAccountService', () => ({
+  default: { getToken: vi.fn() },
+  graphRequest: vi.fn()
+}))
 vi.mock('./gameService', () => ({ default: {} }))
 vi.mock('./settingsService', () => ({
   default: { getDownloadPath: () => paths.root, on: vi.fn() }
@@ -20,7 +23,8 @@ vi.mock('./dependencyService', () => ({ default: {} }))
 vi.mock('./frame/frameDevkitService', () => ({ default: {} }))
 vi.mock('./fileSafety', () => ({ childPath: (base: string) => base }))
 
-import { selectCandidates } from './metaSyncService'
+import metaSyncService, { selectCandidates } from './metaSyncService'
+import metaAccountService, { graphRequest } from './metaAccountService'
 import uploadService from './uploadService'
 
 beforeEach(async () => {
@@ -200,5 +204,72 @@ describe('uploadService.addMetaItemToQueue', () => {
       sourcePath: apk,
       sourceObbPaths: [join(paths.root, 'main.42.com.test.game.obb')]
     })
+  })
+})
+
+describe('metaSyncService.queueUpdates', () => {
+  it('downloads data files under their release names and queues them all for upload', async () => {
+    vi.mocked(metaAccountService.getToken).mockResolvedValue('OCmocktoken')
+    const graphMock = graphRequest as unknown as ReturnType<typeof vi.fn>
+    graphMock.mockResolvedValue({
+      data: {
+        node: {
+          obb_binary: { id: 'o1', file_name: 'Sounds.obb' },
+          asset_files: {
+            nodes: [
+              { id: 'a1', file_name: 'pakchunk2100-Android_ASTC.pak' },
+              { id: 'a2', file_name: '../../evil.obb' }
+            ]
+          }
+        }
+      }
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('data'))
+            controller.close()
+          }
+        })
+      }))
+    )
+    const addSpy = vi.spyOn(uploadService, 'addMetaItemToQueue').mockReturnValue(true)
+
+    const queued = await metaSyncService.queueUpdates([
+      {
+        packageName: 'com.mydearest.brazenblaze',
+        appId: '1',
+        displayName: 'Brazen Blaze',
+        versionCode: 42,
+        version: '1.0',
+        binaryId: 'b1',
+        kind: 'new'
+      }
+    ])
+
+    expect(queued).toBe(1)
+    const stageDir = join(paths.root, 'uploads', 'meta', 'com.mydearest.brazenblaze', '42')
+    expect((await fs.readdir(stageDir)).sort()).toEqual(
+      [
+        '.complete',
+        'Sounds.obb',
+        'com.mydearest.brazenblaze.apk',
+        'evil.obb',
+        'pakchunk2100-Android_ASTC.pak'
+      ].sort()
+    )
+    expect(addSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        packageName: 'com.mydearest.brazenblaze',
+        sourceObbPaths: [
+          join(stageDir, 'Sounds.obb'),
+          join(stageDir, 'evil.obb'),
+          join(stageDir, 'pakchunk2100-Android_ASTC.pak')
+        ]
+      })
+    )
   })
 })
