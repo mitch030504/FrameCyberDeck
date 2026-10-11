@@ -36,6 +36,10 @@ FRAMEPORT_ARTIFACTS = {
     "libframe_xrshim.so": "8a8f6b1da8952cb3933a5b53558424a5fc56043b2527a16bb6dd62a00d2de01a",
     "libfp_vk.so": "e8c0965c188665a4e565e4a3af983ef1866d1cf9225665cc90d8df286bc96ef3",
     "libVkLayer_fp_shaderfix.so": "5becb96ee86fbda0ce98c0e0fd064f8ba092314aceaa400e3dcc785705dc3c23",
+    "libfpg.so": "383054f8b3b41dde76d062c71856cd3163655e50009c08454bc1793f393ead65",
+    "libglshim.so": "19ba5ed3c4b780f5ae46251f6958f552acfc5f13c8bb39f995579593fa8990c6",
+    "libovrplatformcompat.so": "1feaeafad467c4cafdf2b018a4d84b0bee200c3f711697b4ce97e66a3ba256ca",
+    "libvrapi.so": "1d83eb94ec1df44f29a5f525dce4d5b608dbbb13a9c7a5efeb80a4b1dc54a721",
 }
 
 
@@ -669,6 +673,562 @@ def raise_swapchain_limit(data: bytes) -> tuple[bytes | None, int]:
                 count += 1
     return (bytes(out), count) if count else (None, 0)
 
+# --- FramePort default patches (vendored from spoopyghosty0/frameport, GPLv3) --
+#
+# The following patches mirror FramePort's default-on and recipe-driven engine
+# fixes: the Android binary XML editor, the no-op stub library generator, the
+# Meta XR Audio telemetry patch (with a word-level ARM64 matcher instead of a
+# disassembler), the Meta platform compat/stub libraries, the LTW depth shim,
+# the VrApi->OpenXR bridge with the GL shim, the avatar stub, and the BlazeRush
+# build-specific edits. All by spoopyghosty0, https://github.com/spoopyghosty0.
+
+OVR_TO_STRING = re.compile(r"^ovr[A-Z][A-Za-z0-9]*_ToString$")
+
+
+def elf_dyn_symbols(data: bytes, defined: bool) -> set[str]:
+    """.dynsym names: defined symbols, or imported (undefined) ones."""
+    sections = _elf64_sections(data)
+    dynsym = sections.get(".dynsym")
+    dynstr = sections.get(".dynstr")
+    if not dynsym or not dynstr:
+        return set()
+    sym_off, sym_size, sym_entsize = dynsym
+    str_off, str_size, _ = dynstr
+    sym_entsize = sym_entsize or 24
+    out: set[str] = set()
+    for k in range(sym_size // sym_entsize):
+        st_name, _info, _other, st_shndx, _value, _size = struct.unpack_from(
+            "<IBBHQQ", data, sym_off + k * sym_entsize
+        )
+        if st_name == 0 or (st_shndx != 0) != defined:
+            continue
+        if st_name >= str_size:
+            continue
+        end = data.index(b"\0", str_off + st_name)
+        out.add(data[str_off + st_name : end].decode("utf-8", "replace"))
+    return out
+
+
+def elf_load_segments_flags(data: bytes) -> list[tuple[int, int, int, int]]:
+    """(vaddr, offset, filesz, flags) of every PT_LOAD."""
+    is64, eh = _elf_header(data)
+    phoff, phentsize, phnum = eh[5], eh[9], eh[10]
+    ph_fmt = "<IIQQQQQQ" if is64 else "<IIIIIIII"
+    out = []
+    for i in range(phnum):
+        vals = struct.unpack_from(ph_fmt, data, phoff + i * phentsize)
+        if is64:
+            p_type, p_flags, p_offset, p_vaddr, _, p_filesz, _, _ = vals
+        else:
+            p_type, p_offset, p_vaddr, _, p_filesz, _, p_flags, _ = vals
+        if p_type == 1:
+            out.append((p_vaddr, p_offset, p_filesz, p_flags))
+    return out
+
+
+# ---- no-op stub library generator (stubgen, verbatim) -----------------------
+
+STUB_PAGE = 16384
+STUB_EMPTY_STRING_AT = 9  # e_ident padding (bytes 9-15 are zero), mapped with the text segment at vaddr 0
+
+
+def _stub_elf_hash(name: bytes) -> int:
+    h = 0
+    for c in name:
+        h = ((h << 4) + c) & 0xFFFFFFFF
+        g = h & 0xF0000000
+        if g:
+            h ^= g >> 24
+        h &= ~g & 0xFFFFFFFF
+    return h
+
+
+def build_stub_library(symbols: list[str], soname: str = "libovrstubs.so", abi: str = "arm64-v8a",
+                       result: int = 0) -> bytes:
+    """Generate a tiny Android shared library whose exported functions all `return 0` (no compiler needed)."""
+    is64 = abi == "arm64-v8a"
+    symbols = sorted(set(symbols))
+    if result and not (is64 and -0x10000 <= result <= 0xFFFF):
+        raise ValueError(f"stub result {result} not supported for {abi}")
+    if is64:
+        machine, ehsize, phentsize, shentsize, symsize, dynsize = 183, 64, 56, 64, 24, 16  # EM_AARCH64
+        body = struct.pack("<II", 0xD2800000, 0xD65F03C0)  # mov x0, #0 ; ret
+        if result > 0:  # movz w0, #result ; ret
+            body = struct.pack("<II", 0x52800000 | result << 5, 0xD65F03C0)
+        elif result < 0:  # movn w0, #~result ; ret  (w0 = result)
+            body = struct.pack("<II", 0x12800000 | (~result & 0xFFFF) << 5, 0xD65F03C0)
+    else:
+        machine, ehsize, phentsize, shentsize, symsize, dynsize = 40, 52, 32, 40, 16, 8  # EM_ARM
+        body = struct.pack("<II", 0xE3A00000, 0xE12FFF1E)  # mov r0, #0 ; bx lr
+
+    # ---- string tables
+    dynstr = bytearray(b"\0")
+
+    def add_str(s: str) -> int:
+        off = len(dynstr)
+        dynstr.extend(s.encode() + b"\0")
+        return off
+
+    soname_off = add_str(soname)
+    name_offs = [add_str(s) for s in symbols]
+    shstr = bytearray(b"\0")
+    sec_names = {}
+    for n in (".dynsym", ".dynstr", ".hash", ".text", ".dynamic", ".shstrtab"):
+        sec_names[n] = len(shstr)
+        shstr.extend(n.encode() + b"\0")
+
+    nsyms = len(symbols) + 1
+    phnum = 4  # LOAD (R+X), LOAD (RW), DYNAMIC, GNU_STACK
+    off = ehsize + phnum * phentsize
+
+    def align(x, a):
+        return (x + a - 1) // a * a
+
+    dynsym_off = align(off, 8)
+    dynstr_off = dynsym_off + nsyms * symsize
+    hash_off = align(dynstr_off + len(dynstr), 4)
+    nbucket = max(1, len(symbols) // 2 + 1)
+    hash_size = 4 * (2 + nbucket + nsyms)
+    text_off = align(hash_off + hash_size, 16)
+    text_size = 8 * len(symbols)
+    seg1_end = text_off + text_size
+    dyn_off = align(seg1_end, STUB_PAGE)  # own page, RW
+    dyn_entries = [(5, dynstr_off), (6, dynsym_off), (10, len(dynstr)), (11, symsize), (4, hash_off),
+                   (14, soname_off), (0, 0)]
+    dyn_bytes = b"".join(struct.pack("<qQ" if is64 else "<iI", t, v) for t, v in dyn_entries)
+    shstr_off = dyn_off + len(dyn_bytes)
+    sh_off = align(shstr_off + len(shstr), 8)
+
+    # ---- symbols
+    SHN_TEXT = 4
+    syms = bytearray(b"\0" * symsize)
+    for i, name_off in enumerate(name_offs):
+        value = text_off + 8 * i
+        info = (1 << 4) | 2  # STB_GLOBAL, STT_FUNC
+        if is64:
+            syms += struct.pack("<IBBHQQ", name_off, info, 0, SHN_TEXT, value, 8)
+        else:
+            syms += struct.pack("<IIIBBH", name_off, value, 8, info, 0, SHN_TEXT)
+    buckets, chains = [0] * nbucket, [0] * nsyms
+    for idx in range(1, nsyms):
+        b = _stub_elf_hash(symbols[idx - 1].encode()) % nbucket
+        chains[idx] = buckets[b]
+        buckets[b] = idx
+    hash_bytes = struct.pack(f"<II{nbucket}I{nsyms}I", nbucket, nsyms, *buckets, *chains)
+
+    # ---- headers
+    PF_R, PF_W, PF_X = 4, 2, 1
+    phdrs = [
+        (1, PF_R | PF_X, 0, 0, seg1_end, seg1_end, STUB_PAGE),
+        (1, PF_R | PF_W, dyn_off, dyn_off, len(dyn_bytes), len(dyn_bytes), STUB_PAGE),
+        (2, PF_R | PF_W, dyn_off, dyn_off, len(dyn_bytes), len(dyn_bytes), 8),
+        (0x6474E551, PF_R | PF_W, 0, 0, 0, 0, 16),  # PT_GNU_STACK
+    ]
+    ph_bytes = b""
+    for typ, flags, o, va, fsz, msz, al in phdrs:
+        if is64:
+            ph_bytes += struct.pack("<IIQQQQQQ", typ, flags, o, va, va, fsz, msz, al)
+        else:
+            ph_bytes += struct.pack("<IIIIIIII", typ, o, va, va, fsz, msz, flags, al)
+    SHT_PROGBITS, SHT_STRTAB, SHT_HASH, SHT_DYNAMIC, SHT_DYNSYM = 1, 3, 5, 6, 11
+    SHF_WRITE, SHF_ALLOC, SHF_EXEC = 1, 2, 4
+    sections = [
+        (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        (sec_names[".dynsym"], SHT_DYNSYM, SHF_ALLOC, dynsym_off, dynsym_off, nsyms * symsize, 2, 1, 8, symsize),
+        (sec_names[".dynstr"], SHT_STRTAB, SHF_ALLOC, dynstr_off, dynstr_off, len(dynstr), 0, 0, 1, 0),
+        (sec_names[".hash"], SHT_HASH, SHF_ALLOC, hash_off, hash_off, hash_size, 1, 0, 4, 4),
+        (sec_names[".text"], SHT_PROGBITS, SHF_ALLOC | SHF_EXEC, text_off, text_off, text_size, 0, 0, 16, 0),
+        (sec_names[".dynamic"], SHT_DYNAMIC, SHF_ALLOC | SHF_WRITE, dyn_off, dyn_off, len(dyn_bytes), 2, 0, 8, dynsize),
+        (sec_names[".shstrtab"], SHT_STRTAB, 0, 0, shstr_off, len(shstr), 0, 0, 1, 0),
+    ]
+    sh_bytes = b""
+    for name, typ, flags, addr, o, size, link, info, al, entsize in sections:
+        if is64:
+            sh_bytes += struct.pack("<IIQQQQIIQQ", name, typ, flags, addr, o, size, link, info, al, entsize)
+        else:
+            sh_bytes += struct.pack("<IIIIIIIIII", name, typ, flags, addr, o, size, link, info, al, entsize)
+    ident = b"\x7fELF" + bytes([2 if is64 else 1, 1, 1, 0]) + b"\0" * 8
+    if is64:
+        eh = ident + struct.pack("<HHIQQQIHHHHHH", 3, machine, 1, 0, ehsize, sh_off, 0, ehsize, phentsize, phnum,
+                                 shentsize, len(sections), 6)
+    else:
+        eh = ident + struct.pack("<HHIIIIIHHHHHH", 3, machine, 1, 0, ehsize, sh_off, 0x05000000, ehsize, phentsize,
+                                 phnum, shentsize, len(sections), 6)  # EF_ARM_EABI_VER5
+
+    out = bytearray(sh_off + len(sh_bytes))
+    out[0:len(eh)] = eh
+    out[ehsize:ehsize + len(ph_bytes)] = ph_bytes
+    out[dynsym_off:dynsym_off + len(syms)] = syms
+    out[dynstr_off:dynstr_off + len(dynstr)] = dynstr
+    out[hash_off:hash_off + len(hash_bytes)] = hash_bytes
+    text = bytearray(body * len(symbols))
+    if is64:  # *_ToString answers "" instead of NULL (a caller may build a string from it)
+        for i, name in enumerate(symbols):
+            if name.endswith("_ToString"):
+                pc = text_off + 8 * i
+                imm = (STUB_EMPTY_STRING_AT - pc) & 0x1FFFFF  # 21-bit signed offset
+                text[8 * i:8 * i + 8] = struct.pack("<II", 0x10000000 | (imm & 3) << 29 | (imm >> 2) << 5, 0xD65F03C0)
+    out[text_off:text_off + text_size] = text
+    out[dyn_off:dyn_off + len(dyn_bytes)] = dyn_bytes
+    out[shstr_off:shstr_off + len(shstr)] = shstr
+    out[sh_off:] = sh_bytes
+    return bytes(out)
+
+
+# ---- Android binary XML editor (axml, verbatim subset) -----------------------
+
+RES_XML = 0x0003
+RES_STRING_POOL = 0x0001
+RES_XML_START_ELEMENT = 0x0102
+TYPE_STRING = 0x03
+TYPE_INT_BOOLEAN = 0x12
+AXML_LAUNCHER = "android.intent.category.LAUNCHER"
+AXML_INFO = "android.intent.category.INFO"
+
+
+class AxmlAttr:
+    def __init__(self, offset: int, ns: int, name: int, raw: int, dtype: int, value: int):
+        self.offset = offset
+        self.ns = ns
+        self.name = name
+        self.raw = raw
+        self.dtype = dtype
+        self.value = value
+
+
+class AxmlElement:
+    def __init__(self, offset: int, size: int, name: str, attrs: list):
+        self.offset = offset
+        self.size = size
+        self.name = name
+        self.attrs = attrs
+
+
+class Axml:
+    def __init__(self, data: bytes):
+        self.data = bytearray(data)
+        typ, hsz, _ = struct.unpack_from("<HHI", self.data, 0)
+        if typ != RES_XML:
+            raise ValueError("not a binary XML file")
+        self.pool_off = hsz
+        ptype, phsz, psize, self.count, self.styles, self.flags, self.sstart, self.ystart = struct.unpack_from(
+            "<HHIIIIII", self.data, self.pool_off
+        )
+        if ptype != RES_STRING_POOL:
+            raise ValueError("string pool not found")
+        self.pool_hsz, self.pool_size = phsz, psize
+        self.utf8 = bool(self.flags & 0x100)
+        base = self.pool_off + phsz
+        self.offsets = list(struct.unpack_from(f"<{self.count}I", self.data, base))
+        self.style_offsets = list(struct.unpack_from(f"<{self.styles}I", self.data, base + 4 * self.count))
+        self._strings: list[str] | None = None
+
+    # ------------------------------------------------------------------ strings
+    def string(self, i: int) -> str:
+        p = self.pool_off + self.sstart + self.offsets[i]
+        d = self.data
+        if self.utf8:
+            n = d[p]
+            p += 2 if n & 0x80 else 1  # char count
+            n = d[p]
+            nb = ((n & 0x7F) << 8 | d[p + 1]) if n & 0x80 else n
+            p += 2 if n & 0x80 else 1
+            return bytes(d[p : p + nb]).decode("utf-8", "replace")
+        n = struct.unpack_from("<H", d, p)[0]
+        p += 2
+        if n & 0x8000:
+            n = ((n & 0x7FFF) << 16) | struct.unpack_from("<H", d, p)[0]
+            p += 2
+        return bytes(d[p : p + 2 * n]).decode("utf-16-le", "replace")
+
+    def strings(self) -> list[str]:
+        if self._strings is None:
+            self._strings = [self.string(i) for i in range(self.count)]
+        return self._strings
+
+    def append_string(self, s: str) -> int:
+        """Append s to the pool; returns its index. Rebuilds the pool chunk and the file size."""
+        if self.utf8:
+            b = s.encode("utf-8")
+            if len(s) >= 0x80 or len(b) >= 0x80:
+                raise ValueError("long UTF-8 strings are not supported")
+            enc = bytes([len(s), len(b)]) + b + b"\0"
+        else:
+            enc = struct.pack("<H", len(s)) + s.encode("utf-16-le") + b"\0\0"
+        d, po = self.data, self.pool_off
+        str_end = po + (self.ystart if self.styles else self.pool_size)
+        str_data = bytes(d[po + self.sstart : str_end])
+        new_off = len(str_data)
+        str_data += enc
+        str_data += b"\0" * (-len(str_data) % 4)
+        style_data = bytes(d[po + self.ystart : po + self.pool_size]) if self.styles else b""
+        offsets = self.offsets + [new_off]
+        sstart = self.pool_hsz + 4 * len(offsets) + 4 * self.styles
+        ystart = sstart + len(str_data) if self.styles else 0
+        body = (
+            struct.pack(f"<{len(offsets)}I", *offsets)
+            + struct.pack(f"<{self.styles}I", *self.style_offsets)
+            + str_data
+            + style_data
+        )
+        header = struct.pack(
+            "<HHIIIIII", RES_STRING_POOL, self.pool_hsz, self.pool_hsz + len(body), len(offsets), self.styles,
+            self.flags, sstart, ystart,
+        )
+        header += bytes(d[po + 28 : po + self.pool_hsz])  # any extra header bytes
+        new = bytes(d[:po]) + header + body + bytes(d[po + self.pool_size :])
+        self.__init__(new)
+        struct.pack_into("<I", self.data, 4, len(self.data))
+        return len(offsets) - 1
+
+    def index(self, s: str) -> int | None:
+        try:
+            return self.strings().index(s)
+        except ValueError:
+            return None
+
+    # ------------------------------------------------------------------ elements
+    def elements(self):
+        names = self.strings()
+        pos = struct.unpack_from("<H", self.data, 2)[0]
+        while pos < len(self.data):
+            typ, hsz, size = struct.unpack_from("<HHI", self.data, pos)
+            if size == 0:
+                break
+            if typ == RES_XML_START_ELEMENT:
+                ext = pos + hsz
+                _, name, astart, asize, acount = struct.unpack_from("<IIHHH", self.data, ext)
+                attrs = []
+                for a in range(acount):
+                    at = ext + astart + a * asize
+                    ns, aname, raw = struct.unpack_from("<III", self.data, at)
+                    dtype = self.data[at + 15]
+                    value = struct.unpack_from("<I", self.data, at + 16)[0]
+                    attrs.append(AxmlAttr(at, ns, aname, raw, dtype, value))
+                yield AxmlElement(pos, size, names[name] if name < len(names) else "", attrs)
+            pos += size
+
+    def attr_str(self, el: AxmlElement, attr: str) -> str | None:
+        names = self.strings()
+        for a in el.attrs:
+            if a.name < len(names) and names[a.name] == attr:
+                if a.raw < len(names):
+                    return names[a.raw]
+                if a.dtype == TYPE_STRING and a.value < len(names):
+                    return names[a.value]
+        return None
+
+    # ------------------------------------------------------------------ edits
+    def retarget(self, element: str, old_index: int, new_index: int) -> int:
+        """In every <element>, point string-valued attributes that reference old_index at new_index."""
+        hits = 0
+        for el in self.elements():
+            if el.name != element:
+                continue
+            for a in el.attrs:
+                if a.raw == old_index or (a.dtype == TYPE_STRING and a.value == old_index):
+                    struct.pack_into("<I", self.data, a.offset + 8, new_index)
+                    if a.dtype == TYPE_STRING:
+                        struct.pack_into("<I", self.data, a.offset + 16, new_index)
+                    hits += 1
+        return hits
+
+    def set_bool(self, element: str, attr: str, value: bool) -> int:
+        names = self.strings()
+        hits = 0
+        for el in self.elements():
+            if el.name != element:
+                continue
+            for a in el.attrs:
+                if a.name < len(names) and names[a.name] == attr and a.dtype == TYPE_INT_BOOLEAN:
+                    struct.pack_into("<I", self.data, a.offset + 16, 0xFFFFFFFF if value else 0)
+                    hits += 1
+        return hits
+
+    def bytes(self) -> bytes:
+        return bytes(self.data)
+
+
+def axml_categories(manifest: bytes) -> set[str]:
+    x = Axml(manifest)
+    return {v for el in x.elements() if el.name == "category" for v in [x.attr_str(el, "name")] if v}
+
+
+def axml_fix_launcher(manifest: bytes) -> bytes | None:
+    """Lepton only launches activities with category LAUNCHER: retarget category INFO to LAUNCHER."""
+    x = Axml(manifest)
+    names = x.strings()
+    if AXML_INFO not in names or AXML_LAUNCHER in names:
+        return None
+    info = names.index(AXML_INFO)
+    launcher = x.append_string(AXML_LAUNCHER)
+    return x.bytes() if x.retarget("category", info, launcher) else None
+
+
+def axml_set_bool_attr(manifest: bytes, element: str, attr: str, value: bool) -> bytes | None:
+    x = Axml(manifest)
+    return x.bytes() if x.set_bool(element, attr, value) else None
+
+
+# ---- Meta XR Audio telemetry patch (word-level ARM64 matcher) --------------
+
+TELEMETRY_CLASS = b"com/oculus/os/AnalyticsEvent\0"
+
+
+def patch_metaxr_telemetry(data: bytes) -> bytes | None:
+    """Replace the JNI FindClass(AnalyticsEvent) call in Meta XR Audio with `mov x0, xzr`, so the
+    pending ClassNotFoundException doesn't abort ART (pattern from FramePort, matched without a
+    disassembler: ldr xN,[xN,#0x30]; blr xN; cbz with an adrp/add pair pointing at the class string)."""
+    if TELEMETRY_CLASS not in data or not elf_is_elf(data) or data[4] != 2 or data[5] != 1:
+        return None
+    segments = elf_load_segments_flags(data)
+    exec_segs = [(v, o, sz) for v, o, sz, fl in segments if fl & 1]
+
+    def va2off(va: int) -> int | None:
+        return next((va - v + o for v, o, sz, _ in segments if v <= va < v + sz), None)
+
+    out = bytearray(data)
+    patched = 0
+    for vaddr, off, size in exec_segs:
+        for at in range(off, off + size - 8, 4):
+            w = int.from_bytes(data[at : at + 4], "little")
+            if (w & 0xFFC00000) != 0xF9400000 or ((w >> 10) & 0xFFF) != 6:  # ldr xN, [xM, #0x30]
+                continue
+            rn = (w >> 5) & 31
+            if rn != (w & 31):
+                continue
+            w2 = int.from_bytes(data[at + 4 : at + 8], "little")
+            if (w2 & 0xFFFFFC00) != 0xD63F0000 or ((w2 >> 5) & 31) != rn:  # blr xN
+                continue
+            w3 = int.from_bytes(data[at + 8 : at + 12], "little")
+            if (w3 & 0x7F000000) != 0x34000000:  # cbz
+                continue
+            page = low = None
+            for back in range(at - 4, max(off - 4, at - 4 * 14) - 4, -4):
+                wb = int.from_bytes(data[back : back + 4], "little")
+                if low is None and (wb & 0xFFC00000) == 0x91000000 and ((wb >> 5) & 31) == 1 and (wb & 31) == 1:
+                    low = (wb >> 10) & 0xFFF
+                if (wb & 0x9F00001F) == 0x90000001:  # adrp x1, ...
+                    immlo = (wb >> 29) & 3
+                    immhi = (wb >> 5) & 0x7FFFF
+                    imm = (immhi << 2) | immlo
+                    if imm & 0x100000:
+                        imm -= 0x200000
+                    pc = vaddr + (back - off)
+                    page = (pc & ~0xFFF) + (imm << 12)
+                    break
+            if page is None or low is None:
+                continue
+            so = va2off(page + low)
+            if so is None or not data[so:].startswith(TELEMETRY_CLASS):
+                continue
+            out[at + 4 : at + 8] = (0xAA1F03E0).to_bytes(4, "little")  # mov x0, xzr
+            patched += 1
+    return bytes(out) if patched else None
+
+
+# ---- Meta platform compat + stubs ------------------------------------------
+
+def missing_ovr_symbols(lib_bytes: dict) -> set[str]:
+    """ovr_* functions the game imports that the platform loader (+compat/stub libs) lacks."""
+    loader = lib_bytes.get("libovrplatformloader.so")
+    if not loader or not elf_is_elf(loader):
+        return set()
+    exported = elf_dyn_symbols(loader, True)
+    linked = set(elf_needed(loader))
+    for extra in ("libovrplatformcompat.so", "libovrstubs.so"):
+        if extra in lib_bytes and extra in linked:
+            exported |= elf_dyn_symbols(lib_bytes[extra], True)
+    wanted = set()
+    for name, blob in lib_bytes.items():
+        if name.startswith(("libovrplatformloader", "libopenxr_loader", "libframe_settings")) or not elf_is_elf(blob):
+            continue
+        wanted |= {
+            s
+            for s in elf_dyn_symbols(blob, False)
+            if s.startswith(("ovr_", "ovrMessageType_")) or OVR_TO_STRING.match(s)
+        }
+    return wanted - exported
+
+
+# ---- BlazeRush (ru.targem.blazerush 1.0.349, from Klownicle's guide) --------
+
+BLAZERUSH_LIB = "libtargemapp.so"
+BLAZERUSH_NOM = 0xD503201F
+BLAZERUSH_RET = 0xD65F03C0
+BLAZERUSH_OLD_CACHE = b"cache/shader_cache\0"
+BLAZERUSH_NEW_CACHE = b"cache/br_shader_v1\0"
+BLAZERUSH_BUILDS = (
+    # (version, text_sha256, sites, cache_va); sites: (va, original word, replacement, what)
+    ("1.0.349", "951bf1d5208ae36603f73990346d164a8523e7d1e60cc3e67d3571c7fc55d5f4",
+     ((0x4B2DBC, 0x36000AE0, BLAZERUSH_NOM, "avatar readiness wait (tbz) -> nop"),
+      (0x4B2ADC, 0xF0002368, BLAZERUSH_RET, "avatar mesh renderer -> ret")),
+     0x13AF70),
+)
+
+
+def _exec_segment(data: bytes, va: int):
+    """(vaddr, file offset, size) of the executable PT_LOAD segment holding `va`."""
+    for vaddr, offset, size, flags in elf_load_segments_flags(data):
+        if flags & 1 and vaddr <= va < vaddr + size:
+            return vaddr, offset, size
+    return None
+
+
+def blazerush_sites(data: bytes):
+    """The edits for a supported build, or None (another build / damaged library). Fingerprint-checked."""
+    if not elf_is_elf(data) or data[4] != 2 or data[5] != 1:
+        return None
+    if struct.unpack_from("<H", data, 18)[0] != 183:  # EM_AARCH64
+        return None
+    segments = elf_load_segments_flags(data)
+    for build in BLAZERUSH_BUILDS:
+        text = _exec_segment(data, build[2][0][0])
+        if not text:
+            continue
+        t_va, t_off, t_size = text
+        code = bytearray(data[t_off : t_off + t_size])
+        edits, ok = [], True
+        for va, old, new, what in build[2]:
+            if not t_va <= va < t_va + t_size - 3:
+                ok = False
+                break
+            at = va - t_va
+            word = struct.unpack_from("<I", code, at)[0]
+            if word not in (old, new):
+                ok = False
+                break
+            struct.pack_into("<I", code, at, old)  # fingerprint over the code as shipped
+            edits.append((t_off + at, old, new, what))
+        if not ok or hashlib.sha256(bytes(code)).hexdigest() != build[1]:
+            continue
+        off = next((build[3] - v + o for v, o, sz, _ in segments if v <= build[3] < v + sz), None)
+        if off is None:
+            continue
+        here = data[off : off + len(BLAZERUSH_OLD_CACHE)]
+        old_n, new_n = data.count(BLAZERUSH_OLD_CACHE), data.count(BLAZERUSH_NEW_CACHE)
+        if not ((here == BLAZERUSH_OLD_CACHE and old_n == 1 and new_n == 0)
+                or (here == BLAZERUSH_NEW_CACHE and old_n == 0 and new_n == 1)):
+            continue
+        return {"edits": edits, "cache_offset": off}
+    return None
+
+
+def patch_blazerush(data: bytes):
+    """(edited library, notes) for a supported build; unchanged and None otherwise."""
+    site = blazerush_sites(data)
+    if not site:
+        return data, []
+    buf = bytearray(data)
+    notes = []
+    for at, old, new, what in site["edits"]:
+        buf[at : at + 4] = new.to_bytes(4, "little")
+        notes.append(what)
+    buf[site["cache_offset"] : site["cache_offset"] + len(BLAZERUSH_NEW_CACHE)] = BLAZERUSH_NEW_CACHE
+    notes.append("shader cache namespace")
+    return bytes(buf), notes
+
+
 
 def resolve_apk(source: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
     source = source.expanduser().resolve()
@@ -897,38 +1457,95 @@ def convert(
         prefix = "lib/arm64-v8a/"
         loader = prefix + "libopenxr_loader_generic.so"
 
-        # FramePort shim injection (recipes by spoopyghosty0, GPLv3)
+        # FramePort default + recipe patches (by spoopyghosty0, GPLv3)
         shims = recipe_shims(recipe or {})
-        if shims["gl"]:
-            log("Recipe requests the GL shim; that flow needs FramePort's VrApi bridge and is not converted here.")
+        prefix_libs: dict[str, bytes] = {}
+        manifest_bytes: bytes | None = None
+        with zipfile.ZipFile(patched) as probe:
+            for n in probe.namelist():
+                if n.startswith(prefix):
+                    prefix_libs[pathlib.Path(n).name] = probe.read(n)
+                elif n == "AndroidManifest.xml":
+                    manifest_bytes = probe.read(n)
+
+        metaxr_libs = [n for n in prefix_libs if n.startswith("libmetaxraudio")]
+        if metaxr_libs:
+            # CheckJNI rejects the pending telemetry exception; clear android:debuggable
+            if manifest_bytes is not None:
+                fixed_manifest = axml_set_bool_attr(manifest_bytes, "application", "debuggable", False)
+                if fixed_manifest:
+                    manifest_bytes = fixed_manifest
+                    log("Cleared android:debuggable (Meta XR Audio build)")
+
+        if manifest_bytes is not None:
+            fixed_manifest = axml_fix_launcher(manifest_bytes)
+            if fixed_manifest:
+                manifest_bytes = fixed_manifest
+                log("Retargeted category INFO to LAUNCHER (Lepton only launches LAUNCHER)")
+
+        platform_missing: set[str] = set()
+        platform_compat = False
+        if "libovrplatformloader.so" in prefix_libs:
+            platform_missing = missing_ovr_symbols(prefix_libs)
+            platform_compat = "ovrMessageType_ToString" in platform_missing
+            if platform_missing:
+                log(f"OVR platform: {len(platform_missing)} missing ovr_* function(s) to cover")
+
+        avatar_stub = None
+        if "libovravatarloader.so" in prefix_libs and elf_is_elf(prefix_libs["libovravatarloader.so"]):
+            exports = sorted(x for x in elf_dyn_symbols(prefix_libs["libovravatarloader.so"], True) if x.startswith("ovr"))
+            if exports:
+                avatar_stub = build_stub_library(exports, soname="libovravatarloader.so")
+                log(f"Stubbed {len(exports)} Meta avatar functions (no Horizon avatar driver on the Frame)")
+
+        ltw = "libltw.so" in prefix_libs  # Minecraft launchers: depth formats
+
+        blazerush = package == "ru.targem.blazerush"
 
         # Which APK libraries load Vulkan by name: the Vulkan shim applies to every
         # such engine (FramePort default: it drops invalid render-pass pNext pointers
         # that crash Lepton's Fossilize layer), not just vk_* recipes.
         not_engine = ("libopenxr", "libOVR", "libovr", "libvrapi", "libfp_", "libframe", "libVkLayer", "libc++", "libunity")
         vk_targets: list[str] = []
-        with zipfile.ZipFile(patched) as probe:
-            names = [n for n in probe.namelist() if n.startswith(prefix)]
-            vk_targets = [
-                n
-                for n in names
-                if pathlib.Path(n).name in ("libUE4.so", "libUnreal.so")
-                or (
-                    not pathlib.Path(n).name.startswith(not_engine)
-                    and b"\0libvulkan.so\0" in probe.read(n)
-                )
-            ]
+        for name, blob in prefix_libs.items():
+            if name in ("libUE4.so", "libUnreal.so") or (
+                not name.startswith(not_engine) and b"\0libvulkan.so\0" in blob
+            ):
+                vk_targets.append(name)
         if vk_targets:
             shims["vk"] = True
+
+        # The recipe's GL flow: the VrApi->OpenXR bridge replaces libvrapi.so, and the
+        # GL shim loads ahead of libEGL in every engine library that resolves GL
+        # through eglGetProcAddress (Mesa rejects Quest-only GLSL leniency).
+        gl_targets: list[str] = []
+        if shims["gl"] and "libvrapi.so" in prefix_libs:
+            for name, blob in prefix_libs.items():
+                if name in ("libvrapi.so", "libOVRPlugin.so", "libglshim.so") or name.startswith("libopenxr_loader"):
+                    continue
+                if "eglGetProcAddress" in elf_dyn_symbols(blob, False):
+                    gl_targets.append(name)
+        elif shims["gl"]:
+            log("Recipe requests the GL shim but the APK has no libvrapi.so to bridge; GL fixes skipped.")
+
+        stub_bytes: dict[str, bytes] = {}
+        if platform_missing:
+            stub_bytes["libovrstubs.so"] = build_stub_library(sorted(platform_missing))
+
         shim_bytes = {
             name: ensure_frameport_artifact(root, name).read_bytes()
             for name, needed in (
                 ("libframe_xrshim.so", shims["xrshim"]),
                 ("libfp_vk.so", shims["vk"]),
                 ("libVkLayer_fp_shaderfix.so", shims["zink"]),
+                ("libfpg.so", ltw),
+                ("libovrplatformcompat.so", platform_compat),
+                ("libglshim.so", shims["gl"] and "libvrapi.so" in prefix_libs),
+                ("libvrapi.so", shims["gl"] and "libvrapi.so" in prefix_libs),
             )
             if needed
         }
+        shim_bytes.update(stub_bytes)
 
         def shim_patched_lib(name: str, data: bytes) -> bytes:
             if shims["vk"] and name in vk_targets:
@@ -940,6 +1557,34 @@ def convert(
             if shims["zink"] and name in ("libUE4.so", "libUnreal.so", "libunity.so"):
                 data = elf_add_needed(data, "libVkLayer_fp_shaderfix.so")
                 log(f"Shader-fix Vulkan layer loaded by {name}")
+            if shims["gl"] and name == "libvrapi.so" and name in prefix_libs:
+                data = shim_bytes["libvrapi.so"]
+                log("libvrapi.so replaced with the VrApi->OpenXR bridge")
+            if name in gl_targets:
+                data = elf_add_needed(data, "libglshim.so")
+                log(f"GL shim loaded by {name}")
+            if ltw and name == "libltw.so":
+                data, count = elf_replace_rodata_string(data, "libEGL.so", "libfpg.so")
+                if count:
+                    log(f"{name} loads OpenGL ES through libfpg.so (depth formats)")
+            if name.startswith("libmetaxraudio"):
+                fixed = patch_metaxr_telemetry(data)
+                if fixed:
+                    data = fixed
+                    log(f"Patched telemetry class lookup in {name}")
+            if name == "libovrplatformloader.so":
+                if platform_compat:
+                    data = elf_add_needed(data, "libovrplatformcompat.so")
+                    log("Linked libovrplatformcompat.so into the platform loader")
+                if platform_missing:
+                    data = elf_add_needed(data, "libovrstubs.so")
+                    log("Linked ovr_* stand-ins into the platform loader")
+            if avatar_stub is not None and name == "libovravatarloader.so":
+                data = avatar_stub
+            if blazerush and name == BLAZERUSH_LIB:
+                data, notes = patch_blazerush(data)
+                for note in notes:
+                    log(f"BlazeRush: {note}")
             return data
 
         with zipfile.ZipFile(patched, "r") as src, zipfile.ZipFile(
@@ -959,6 +1604,9 @@ def convert(
                 log("No libOVRPlugin.so in the build; the XR shim will not be reached by the game.")
             for item in src.infolist():
                 if item.filename == loader or item.filename.startswith("META-INF/"):
+                    continue
+                if item.filename == "AndroidManifest.xml" and manifest_bytes is not None:
+                    dst.writestr(item, manifest_bytes)
                     continue
                 data = src.read(item.filename)
                 if item.filename.startswith(prefix):

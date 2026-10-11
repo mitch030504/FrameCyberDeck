@@ -252,18 +252,22 @@ class FramePortRecipeTest(unittest.TestCase):
         self.assertIn('pose_time_fix=1\n', text)
 
 
-def build_test_elf() -> bytes:
+def build_test_elf(exported=(), imported=(), soname='libchild.so') -> bytes:
     """A minimal ELF64 with PT_DYNAMIC, .rodata, and .dynsym/.dynstr, for shim tests."""
     import struct
 
-    strtab = b'\0libchild.so\0xrCreateSwapchain\0'
+    exports, imports = list(exported), list(imported)
+    strtab = b'\0' + soname.encode() + b'\0xrCreateSwapchain\0'
+    for name in exports + imports:
+        strtab += name.encode() + b'\0'
     rodata = b'libvulkan.so\0libopenxr_loader.so\0name-in-rodata\0'
     code = struct.pack('<I', 0x7140041F)  # cmp wN, #4096
     ehsize, phentsize, shentsize = 64, 56, 64
     dyn_off = ehsize + 2 * phentsize
     str_off = dyn_off + 4 * 16
     sym_off = str_off + len(strtab)
-    code_off = sym_off + 2 * 24
+    nsyms = 2 + len(exports) + len(imports)
+    code_off = sym_off + nsyms * 24
     rodata_off = code_off + len(code)
     shstr_off = rodata_off + len(rodata)
     shstrtab = b'\0.shstrtab\0.rodata\0.dynsym\0.dynstr\0'
@@ -296,8 +300,17 @@ def build_test_elf() -> bytes:
         struct.pack('<qQ', 0, 0),           # DT_NULL
     ])
     # Elf64_Sym: st_name st_info st_other st_shndx st_value st_size
-    symtab = (24 * b'\0'
-              + struct.pack('<IBBHQQ', 13, 0x12, 0, 1, code_off, 8))  # xrCreateSwapchain
+    xr_off = 1 + len(soname) + 1
+    symtab = bytearray(24 * b'\0'
+                       + struct.pack('<IBBHQQ', xr_off, 0x12, 0, 1, code_off, 8))  # xrCreateSwapchain
+    name_base = xr_off + len('xrCreateSwapchain') + 1
+    for name in exports:
+        symtab += struct.pack('<IBBHQQ', name_base, 0x12, 0, 1, code_off, 8)
+        name_base += len(name) + 1
+    for name in imports:
+        symtab += struct.pack('<IBBHQQ', name_base, 0x12, 0, 0, 0, 0)  # SHN_UNDEF: imported
+        name_base += len(name) + 1
+    symtab = bytes(symtab)
 
     shstr_ndx = {'.shstrtab': 1, '.rodata': 11, '.dynsym': 19, '.dynstr': 27}
 
@@ -322,6 +335,14 @@ def build_test_elf() -> bytes:
     blob[shstr_off:shstr_off + len(shstrtab)] = shstrtab
     blob[shoff:shoff + len(sections)] = sections
     return bytes(blob)
+
+
+def build_test_elf_with_exports(names):
+    return build_test_elf(exported=names, soname='libovrplatformloader.so')
+
+
+def build_test_elf_with_imports(names):
+    return build_test_elf(imported=names, soname='libgame.so')
 
 
 class ElfSurgeryTest(unittest.TestCase):
@@ -357,6 +378,112 @@ class ElfSurgeryTest(unittest.TestCase):
         plain, count = fc.raise_swapchain_limit(b'\x7fELF' + b'\x02\x01' + b'\0' * 200)
         self.assertIsNone(plain)
         self.assertEqual(count, 0)
+
+
+
+def build_test_axml() -> bytes:
+    """A minimal binary AndroidManifest.xml with an application element and a category INFO filter."""
+    import struct
+
+    strings = ['category', 'name', 'android.intent.category.INFO', 'application', 'debuggable']
+    enc = [struct.pack('<H', len(s)) + s.encode('utf-16-le') + b'\0' for s in strings]
+    pool_data = b''.join(enc)
+    pool_data += b'\0' * (-len(pool_data) % 4)
+    offsets = []
+    pos = 0
+    for e in enc:
+        offsets.append(pos)
+        pos += len(e)
+    pool_header_size = 28
+    sstart = pool_header_size + 4 * len(offsets)
+    pool = struct.pack('<HHIIIIII', 0x0001, pool_header_size, sstart + len(pool_data),
+                       len(offsets), 0, 0, sstart, 0)
+    pool += struct.pack(f'<{len(offsets)}I', *offsets) + pool_data
+    while len(pool) % 4:
+        pool += b'\0'
+
+    def attr(ns, name, raw, dtype, value):
+        return struct.pack('<IIII', ns, name, raw, (dtype << 24) | 8) + struct.pack('<I', value)
+
+    # start element: application with debuggable=true; category with name=INFO
+    app_attrs = attr(1, 4, 0xFFFFFFFF, 0x12, 0xFFFFFFFF)
+    cat_attrs = attr(1, 1, 2, 0x03, 2)
+    body = b''
+    for name_index, attrs in ((3, app_attrs), (0, cat_attrs)):
+        acount = len(attrs) // 20
+        chunk = struct.pack('<HHI', 0x0102, 16, 16 + 20 + len(attrs))  # header(8) + line/comment(8) + attrExt + attrs
+        chunk += b'\0' * 8  # lineNumber + comment
+        chunk += struct.pack('<IIHHHHHH', 0, name_index, 20, 20, acount, 0, 0, 0)  # attrExt
+        body += chunk + attrs
+    header = struct.pack('<HHI', 0x0003, 8, 8 + len(pool) + len(body))
+    return header + pool + body
+
+
+class StubLibraryTest(unittest.TestCase):
+    def test_stub_library_exports(self):
+        blob = fc.build_stub_library(['ovr_Test', 'ovr_MessageType_ToString'], soname='libtest.so')
+        self.assertTrue(fc.elf_is_elf(blob))
+        self.assertEqual(fc.elf_dyn_symbols(blob, True), {'ovr_Test', 'ovr_MessageType_ToString'})
+        self.assertEqual(fc.elf_dyn_symbols(blob, False), set())
+
+    def test_missing_ovr_symbols(self):
+        loader = build_test_elf_with_exports(['ovr_Present', 'ovrMessageType_ToString'])
+        game = build_test_elf_with_imports(['ovr_Present', 'ovr_Missing'])
+        missing = fc.missing_ovr_symbols({
+            'libovrplatformloader.so': loader,
+            'libgame.so': game,
+        })
+        self.assertEqual(missing, {'ovr_Missing'})
+
+
+class AxmlTest(unittest.TestCase):
+    def test_fix_launcher_retargets_info(self):
+        manifest = build_test_axml()
+        self.assertEqual(fc.axml_categories(manifest), {'android.intent.category.INFO'})
+        fixed = fc.axml_fix_launcher(manifest)
+        self.assertIsNotNone(fixed)
+        self.assertEqual(fc.axml_categories(fixed), {'android.intent.category.LAUNCHER'})
+        # already fixed: no change
+        self.assertIsNone(fc.axml_fix_launcher(fixed))
+
+    def test_set_bool_attr(self):
+        manifest = build_test_axml()
+        fixed = fc.axml_set_bool_attr(manifest, 'application', 'debuggable', False)
+        self.assertIsNotNone(fixed)
+
+
+class TelemetryPatternTest(unittest.TestCase):
+    def test_findclass_replaced(self):
+        import struct
+        data = bytearray(build_test_elf())
+        # grow the file and widen the (single, RWX) PT_LOAD so the target page exists
+        new_size = 0x2000
+        data.extend(b'\0' * (new_size - len(data)))
+        struct.pack_into('<Q', data, 64 + 32, new_size)  # p_filesz
+        struct.pack_into('<Q', data, 64 + 40, new_size)  # p_memsz
+        target = 0x1000
+        data[target:target + len(fc.TELEMETRY_CLASS)] = fc.TELEMETRY_CLASS
+        code_off = 400
+        pc_page = (code_off) & ~0xFFF
+        imm = (target - pc_page) >> 12
+        imm21 = imm & 0x1FFFFF
+        immlo = imm21 & 3
+        immhi = imm21 >> 2
+        adrp = 0x90000000 | (immlo << 29) | (immhi << 5) | 1
+        low = target & 0xFFF
+        add = 0x91000000 | (low << 10) | (1 << 5) | 1
+        ldr = 0xF9400000 | (6 << 10) | (0 << 5) | 0  # ldr x0, [x0, #0x30]
+        blr = 0xD63F0000 | (0 << 5)  # blr x0
+        cbz = 0x34000000 | (1 << 5)  # cbz w1, ...
+        for i, word in enumerate((adrp, add, ldr, blr, cbz)):
+            struct.pack_into('<I', data, code_off + i * 4, word)
+        patched = fc.patch_metaxr_telemetry(bytes(data))
+        self.assertIsNotNone(patched)
+        # blr x0 -> mov x0, xzr
+        self.assertEqual(int.from_bytes(patched[code_off + 12:code_off + 16], 'little'), 0xAA1F03E0)
+
+    def test_no_class_string_no_patch(self):
+        self.assertIsNone(fc.patch_metaxr_telemetry(build_test_elf()))
 
 
 if __name__ == '__main__':
