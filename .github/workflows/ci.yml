@@ -48,6 +48,9 @@ jobs:
       - name: Unit tests (node --test)
         run: npm run test:node
 
+      - name: Unit tests (frame converter)
+        run: python3 tests/frame_convert_test.py
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
