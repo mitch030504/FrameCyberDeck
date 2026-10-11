@@ -19,6 +19,7 @@
 **Steam Frame fixes**
 
 - Raw-bundle (non-OBB) game data — Unity asset-bundle releases such as Blade & Sorcery Nomad — now installs with its full payload instead of an APK-only install.
+- Conversions now apply [FramePort](https://github.com/spoopyghosty0/frameport)'s tested per-game recipes by spoopyghosty0: engine-bug fixes (pose timing, controller vibration freezes, GPU-hang shader fixes), alternate OVRPort patch sets, and the matching shim libraries — all credited to the FramePort project (GPLv3).
 
 **Cleanup**
 

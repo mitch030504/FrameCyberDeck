@@ -54,6 +54,10 @@ Frame CyberDeck can convert a compatible Quest APK before deployment:
 The converter uses the prebuilt FrameBridge OpenXR adapter from [FramePort](https://github.com/spoopyghosty0/frameport), pinned to commit `5424e429e46e53fe51497babac124dd91dbb73bf` and verified against its SHA256SUMS manifest.
 The normal path keeps the runtime default refresh rate unless explicitly requested.
 
+Frame CyberDeck also applies FramePort's per-game recipes (catalog by spoopyghosty0): for a game the catalog has tested, the conversion merges the recipe's FrameBridge adapter settings (engine-bug fixes such as pose timing, controller vibration, shader fixes) into the APK's settings library, selects the recipe's alternate OVRPort patch set when it asks for one, and injects the matching FramePort shim libraries (the XR shim, the Vulkan shim, and the OpenGL ES shader-fix layer) into the build. The recipe's own suggestions for scale/refresh rate never override your settings.
+
+All credits for the recipes, the FrameBridge adapter, the shim libraries, and the ELF surgery techniques belong to **spoopyghosty0** and the [FramePort](https://github.com/spoopyghosty0/frameport) project (GPLv3, like this project).
+
 The original source APK is never overwritten.
 
 Frame conversion options are available under **Other Settings → Steam Frame Conversion**:

@@ -187,6 +187,153 @@ class AdapterPinTest(unittest.TestCase):
         self.assertTrue(
             fc.FRAMEPORT_ADAPTER_URL.endswith('/artifacts/arm64-v8a/libopenxr_loader_generic.so')
         )
+        for name, digest in fc.FRAMEPORT_ARTIFACTS.items():
+            self.assertEqual(len(digest), 64, name)
+
+
+class FramePortRecipeTest(unittest.TestCase):
+    def _recipes_file(self, tmp: str) -> pathlib.Path:
+        data = {
+            '_source': 'FramePort by spoopyghosty0 test fixture',
+            'recipes': {
+                'com.test.game': {
+                    'title': 'Test Game',
+                    'adapter': {
+                        'pose_time_fix': 1,
+                        'haptic_fix': 1,
+                        'vk_shader_fix': 'aa:bb',
+                        'scale': 1.7,
+                    },
+                    'alt_overport': ['patch_remove_unreal_force_quit'],
+                },
+                'com.plain.game': {'title': 'Plain', 'adapter': {'rect_clamp': 0}},
+            },
+        }
+        path = pathlib.Path(tmp) / 'recipes.json'
+        path.write_text(json.dumps(data), encoding='utf-8')
+        return path
+
+    def test_load_and_lookup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recipes = fc.load_recipes(self._recipes_file(tmp))
+            self.assertEqual(fc.recipe_for('com.test.game', recipes)['title'], 'Test Game')
+            self.assertIsNone(fc.recipe_for('com.unknown.game', recipes))
+
+    def test_user_owned_settings_are_not_overridden(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recipes = fc.load_recipes(self._recipes_file(tmp))
+            merged = fc.recipe_adapter_settings(recipes['com.test.game'])
+            self.assertEqual(merged, {'haptic_fix': '1', 'pose_time_fix': '1', 'vk_shader_fix': 'aa:bb'})
+
+    def test_alt_overport_appends_to_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recipes = fc.load_recipes(self._recipes_file(tmp))
+            self.assertIsNone(fc.recipe_ovrport_patches(recipes['com.plain.game']))
+            patches = fc.recipe_ovrport_patches(recipes['com.test.game'])
+            self.assertEqual(patches[0], fc.DEFAULT_OVRPORT_PATCHES[0])
+            self.assertEqual(patches[-1], 'patch_remove_unreal_force_quit')
+            self.assertEqual(len(patches), len(set(patches)))
+
+    def test_shim_classification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recipes = fc.load_recipes(self._recipes_file(tmp))
+            shims = fc.recipe_shims(recipes['com.test.game'])
+            self.assertTrue(shims['vk'])
+            self.assertTrue(shims['xrshim'])
+            self.assertFalse(shims['zink'])
+            self.assertFalse(shims['gl'])
+            self.assertEqual(fc.recipe_shims(recipes['com.plain.game']), {
+                'xrshim': False, 'vk': False, 'zink': False, 'gl': False
+            })
+
+    def test_settings_bytes_merges_recipe_settings(self):
+        text = fc.settings_bytes(100, True, False, 90, {'pose_time_fix': '1'}).decode('utf-8')
+        self.assertIn('refresh_rate=90\n', text)
+        self.assertIn('pose_time_fix=1\n', text)
+
+
+def build_test_elf() -> bytes:
+    """A minimal ELF64 with PT_DYNAMIC and a .rodata section, for shim tests."""
+    import struct
+
+    strtab = b'\0libchild.so\0'
+    rodata = b'libvulkan.so\0libopenxr_loader.so\0name-in-rodata\0'
+    ehsize, phentsize, shentsize = 64, 56, 64
+    dyn_off = ehsize + 2 * phentsize
+    str_off = dyn_off + 4 * 16
+    rodata_off = str_off + len(strtab)
+    shstr_off = rodata_off + len(rodata)
+    shoff = (shstr_off + len(b'\0.shstrtab\0.rodata\0') + 15) // 16 * 16
+    file_size = shoff + 3 * shentsize
+
+    eh = bytearray(ehsize)
+    eh[0:4] = b'\x7fELF'
+    struct.pack_into('<B', eh, 4, 2)          # ELFCLASS64
+    struct.pack_into('<B', eh, 5, 1)         # little-endian
+    struct.pack_into('<H', eh, 16, 3)        # ET_DYN
+    struct.pack_into('<H', eh, 52, 64)       # e_ehsize
+    struct.pack_into('<Q', eh, 32, ehsize)   # e_phoff
+    struct.pack_into('<Q', eh, 40, shoff)    # e_shoff
+    struct.pack_into('<H', eh, 54, phentsize)
+    struct.pack_into('<H', eh, 56, 2)        # e_phnum
+    struct.pack_into('<H', eh, 58, shentsize)
+    struct.pack_into('<H', eh, 60, 3)        # e_shnum
+    struct.pack_into('<H', eh, 62, 1)        # e_shstrndx
+
+    def ph(p_type, offset, vaddr, filesz, memsz, flags):
+        return struct.pack('<IIQQQQQQ', p_type, flags, offset, vaddr, vaddr, filesz, memsz, 0x1000)
+
+    load = ph(1, 0, 0, file_size, file_size, 7)      # PT_LOAD, RWX
+    dynamic = ph(2, dyn_off, dyn_off, 4 * 16, 4 * 16, 6)  # PT_DYNAMIC
+    dyn = b''.join([
+        struct.pack('<qQ', 1, 1),           # DT_NEEDED -> "libchild.so"
+        struct.pack('<qQ', 5, str_off),     # DT_STRTAB
+        struct.pack('<qQ', 10, len(strtab)),  # DT_STRSZ
+        struct.pack('<qQ', 0, 0),           # DT_NULL
+    ])
+
+    shstrtab = b'\0.shstrtab\0.rodata\0'
+    shstr_ndx = {'.shstrtab': 1, '.rodata': 11}
+
+    def sh(name, sh_type, offset, size):
+        return struct.pack('<IIQQQQIIQQ', shstr_ndx[name], sh_type, 0, 0,
+                           offset, size, 0, 0, 1, 0)
+
+    sections = (shentsize * b'\0'
+               + sh('.shstrtab', 3, shstr_off, len(shstrtab))
+               + sh('.rodata', 1, rodata_off, len(rodata)))
+
+    blob = bytearray(file_size)
+    blob[0:ehsize] = eh
+    blob[ehsize:ehsize + 2 * phentsize] = load + dynamic
+    blob[dyn_off:dyn_off + len(dyn)] = dyn
+    blob[str_off:str_off + len(strtab)] = strtab
+    blob[rodata_off:rodata_off + len(rodata)] = rodata
+    blob[shstr_off:shstr_off + len(shstrtab)] = shstrtab
+    blob[shoff:shoff + len(sections)] = sections
+    return bytes(blob)
+
+
+class ElfSurgeryTest(unittest.TestCase):
+    def test_replace_rodata_string(self):
+        data = build_test_elf()
+        patched, count = fc.elf_replace_rodata_string(data, 'libvulkan.so', 'libfp_vk.so')
+        self.assertEqual(count, 1)
+        self.assertIn(b'\0libfp_vk.so\0', patched)
+        self.assertIn(b'libopenxr_loader.so\0', patched)  # untouched
+        # a longer replacement is refused
+        with self.assertRaises(ValueError):
+            fc.elf_replace_rodata_string(data, 'libfp_vk.so', 'libvulkan.so')
+
+    def test_needed_and_add_needed_roundtrip(self):
+        data = build_test_elf()
+        self.assertEqual(fc.elf_needed(data), ['libchild.so'])
+        patched = fc.elf_add_needed(data, 'libframe_xrshim.so')
+        needed = fc.elf_needed(patched)
+        self.assertEqual(needed[0], 'libframe_xrshim.so')  # first: interposition order
+        self.assertIn('libchild.so', needed)
+        # idempotent
+        self.assertEqual(fc.elf_add_needed(patched, 'libframe_xrshim.so'), patched)
 
 
 if __name__ == '__main__':
