@@ -109,8 +109,8 @@ Frame CyberDeck can sign in to your Meta account and contribute owned Quest titl
 - **Check:** a single entitlement query lists everything the account owns, with each title's latest Android binary (id, version code, package name). These are compared against the server catalog.
 - **What becomes a candidate:**
   - Updates — any owned title the server already carries where Meta has a newer version.
-  - New titles — only entitlements that were **paid**: purchases, preorders, cross-buy grants, and subscription (Horizon+) claims. Free downloads, demos obtained for free, promo keys, and trial grants never contribute a title the server does not already have.
-- **Download & contribute:** selected titles download their APK and OBB files from Meta's entitled CDN into the uploads cache and enter the normal contribution pipeline (HWID metadata, archive creation, `upload.config` upload) unchanged. Downloaded versions are cached, so re-checks never re-download.
+  - New titles — only entitlements that were **paid**: purchases, preorders, cross-buy grants, and subscription (Horizon+) claims. Free downloads, promo keys, and trial grants never contribute a title the server does not already have, and neither do demos — even the ones Meta grants through a paid-style offer.
+- **Download & contribute:** selected titles download their APK and data files from Meta's entitled CDN into the uploads cache — classic OBB files as well as data shipped under its own name (Unreal `.pak` chunks, named OBBs like `Sounds.obb`) — and enter the normal contribution pipeline (HWID metadata, archive creation, `upload.config` upload) unchanged. Downloaded versions are cached, so re-checks never re-download, and every successfully contributed version is recorded so it is never uploaded twice; a newer version still gets offered.
 - Tokens are never written to logs, and download URLs carrying the token are not logged either.
 
 ---
