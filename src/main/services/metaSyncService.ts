@@ -74,8 +74,14 @@ export interface EntitledTitle {
  * that is not on the server yet. Free downloads (NUX, UNKNOWN, promo keys)
  * stay off the server. Updates to titles the server already carries are
  * always offered regardless of how they were originally obtained.
+ * SUBSCRIPTION covers Horizon+ (Meta Quest+) claimed titles.
  */
-export const PAID_GRANT_REASONS = new Set(['PAID_OFFER', 'PREORDER', 'XBUY'])
+export const PAID_GRANT_REASONS = new Set(['PAID_OFFER', 'PREORDER', 'XBUY', 'SUBSCRIPTION'])
+
+/** Paid for the purpose of a new upload, by grant reason. */
+export function isPaidGrantReason(reason: string): boolean {
+  return PAID_GRANT_REASONS.has(reason) || reason.includes('SUBSCRIPTION')
+}
 
 /**
  * Pick, from everything the account is entitled to, the titles that are new
@@ -94,7 +100,7 @@ export function selectCandidates(
   for (const title of entitledTitles) {
     const serverVersion = serverVersionByPackage.get(title.packageName)
     if (serverVersion !== undefined && title.versionCode <= serverVersion) continue
-    if (serverVersion === undefined && !PAID_GRANT_REASONS.has(title.grantReason)) continue
+    if (serverVersion === undefined && !isPaidGrantReason(title.grantReason)) continue
     if (isBlacklisted(title.packageName, title.versionCode)) continue
     candidates.push({
       packageName: title.packageName,

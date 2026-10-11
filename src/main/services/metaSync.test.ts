@@ -86,6 +86,25 @@ describe('selectCandidates', () => {
     ])
   })
 
+  it('treats subscription (Horizon+) grants as paid new titles', () => {
+    const candidates = selectCandidates(
+      [
+        {
+          appId: '777',
+          displayName: 'Horizon Plus Game',
+          packageName: 'com.hplus.game',
+          versionCode: 3,
+          version: '1.0',
+          binaryId: 'b7',
+          grantReason: 'SUBSCRIPTION'
+        }
+      ],
+      [],
+      (): boolean => false
+    )
+    expect(candidates.map((candidate) => candidate.kind)).toEqual(['new'])
+  })
+
   it('skips versions already blacklisted (already contributed)', () => {
     const blacklist = (packageName: string, versionCode: number): boolean =>
       packageName === 'com.update.game' && versionCode === 20
