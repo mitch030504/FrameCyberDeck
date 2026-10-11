@@ -36,15 +36,17 @@ describe('selectCandidates', () => {
       packageName: 'com.update.game',
       versionCode: 20,
       version: '1.2',
-      binaryId: 'b1'
+      binaryId: 'b1',
+      grantReason: 'UNKNOWN'
     },
     {
       appId: '222',
-      displayName: 'New Game',
+      displayName: 'New Paid Game',
       packageName: 'com.new.game',
       versionCode: 5,
       version: '1.0',
-      binaryId: 'b2'
+      binaryId: 'b2',
+      grantReason: 'PAID_OFFER'
     },
     {
       appId: '333',
@@ -52,7 +54,17 @@ describe('selectCandidates', () => {
       packageName: 'com.current.game',
       versionCode: 7,
       version: '1.1',
-      binaryId: 'b3'
+      binaryId: 'b3',
+      grantReason: 'PAID_OFFER'
+    },
+    {
+      appId: '666',
+      displayName: 'New Free Game',
+      packageName: 'com.free.game',
+      versionCode: 2,
+      version: '0.2',
+      binaryId: 'b6',
+      grantReason: 'NUX'
     }
   ]
   const catalog = [
@@ -60,7 +72,7 @@ describe('selectCandidates', () => {
     { packageName: 'com.current.game', versionCode: 7 }
   ]
 
-  it('flags new titles and newer versions, skips up-to-date ones', () => {
+  it('flags paid new titles and updates (any grant reason), skips free new titles', () => {
     const never = (): boolean => false
     const candidates = selectCandidates(titles, catalog, never)
     expect(candidates).toEqual([
@@ -90,7 +102,8 @@ describe('selectCandidates', () => {
           packageName: 'com.newer.server',
           versionCode: 3,
           version: '0.9',
-          binaryId: 'b5'
+          binaryId: 'b5',
+          grantReason: 'PAID_OFFER'
         }
       ],
       [{ packageName: 'com.newer.server', versionCode: 4 }],

@@ -29,6 +29,7 @@ interface EntitlementsResponse {
       user?: {
         active_entitlements?: {
           nodes?: {
+            grant_reason?: string
             item?: {
               id?: string
               display_name?: string
@@ -64,7 +65,17 @@ export interface EntitledTitle {
   versionCode: number
   version: string
   binaryId: string
+  /** Why the account owns the title (PAID_OFFER, UNKNOWN, NUX, ...). */
+  grantReason: string
 }
+
+/**
+ * Grant reasons that mark a purchase: only these justify adding a title
+ * that is not on the server yet. Free downloads (NUX, UNKNOWN, promo keys)
+ * stay off the server. Updates to titles the server already carries are
+ * always offered regardless of how they were originally obtained.
+ */
+export const PAID_GRANT_REASONS = new Set(['PAID_OFFER', 'PREORDER', 'XBUY'])
 
 /**
  * Pick, from everything the account is entitled to, the titles that are new
@@ -83,6 +94,7 @@ export function selectCandidates(
   for (const title of entitledTitles) {
     const serverVersion = serverVersionByPackage.get(title.packageName)
     if (serverVersion !== undefined && title.versionCode <= serverVersion) continue
+    if (serverVersion === undefined && !PAID_GRANT_REASONS.has(title.grantReason)) continue
     if (isBlacklisted(title.packageName, title.versionCode)) continue
     candidates.push({
       packageName: title.packageName,
@@ -129,7 +141,8 @@ class MetaSyncService {
         packageName: latest.package_name,
         versionCode,
         version: latest.version ?? String(versionCode),
-        binaryId: latest.id
+        binaryId: latest.id,
+        grantReason: node.grant_reason ?? 'UNKNOWN'
       })
     }
 
