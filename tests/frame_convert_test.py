@@ -385,7 +385,9 @@ def build_test_axml() -> bytes:
     """A minimal binary AndroidManifest.xml with an application element and a category INFO filter."""
     import struct
 
-    strings = ['category', 'name', 'android.intent.category.INFO', 'application', 'debuggable']
+    strings = ['category', 'name', 'android.intent.category.INFO', 'application', 'debuggable',
+               'manifest', 'uses-permission', 'permission', 'com.oculus.permission.USE_SCENE',
+               'http://schemas.android.com/apk/res/android']
     enc = [struct.pack('<H', len(s)) + s.encode('utf-16-le') + b'\0' for s in strings]
     pool_data = b''.join(enc)
     pool_data += b'\0' * (-len(pool_data) % 4)
@@ -405,11 +407,12 @@ def build_test_axml() -> bytes:
     def attr(ns, name, raw, dtype, value):
         return struct.pack('<IIII', ns, name, raw, (dtype << 24) | 8) + struct.pack('<I', value)
 
-    # start element: application with debuggable=true; category with name=INFO
+    # manifest element, a uses-permission entry, application with debuggable=true, category with name=INFO
     app_attrs = attr(1, 4, 0xFFFFFFFF, 0x12, 0xFFFFFFFF)
-    cat_attrs = attr(1, 1, 2, 0x03, 2)
+    cat_attrs = attr(9, 1, 2, 0x03, 2)
+    uses_attrs = attr(9, 1, 8, 0x03, 8)  # android:name = com.oculus.permission.USE_SCENE
     body = b''
-    for name_index, attrs in ((3, app_attrs), (0, cat_attrs)):
+    for name_index, attrs in ((5, b''), (6, uses_attrs), (3, app_attrs), (0, cat_attrs)):
         acount = len(attrs) // 20
         chunk = struct.pack('<HHI', 0x0102, 16, 16 + 20 + len(attrs))  # header(8) + line/comment(8) + attrExt + attrs
         chunk += b'\0' * 8  # lineNumber + comment
@@ -450,6 +453,20 @@ class AxmlTest(unittest.TestCase):
         manifest = build_test_axml()
         fixed = fc.axml_set_bool_attr(manifest, 'application', 'debuggable', False)
         self.assertIsNotNone(fixed)
+
+    def test_define_meta_permissions(self):
+        manifest = build_test_axml()
+        self.assertEqual(fc.axml_undeclared_meta_permissions(manifest), ['com.oculus.permission.USE_SCENE'])
+        declared = fc.axml_define_meta_permissions(manifest)
+        self.assertIsNotNone(declared)
+        fixed, wanted = declared
+        self.assertEqual(wanted, ['com.oculus.permission.USE_SCENE'])
+        self.assertEqual(fc.axml_undeclared_meta_permissions(fixed), [])
+        used, declared_set = fc.axml_used_and_declared_permissions(fixed)
+        self.assertEqual(used, ['com.oculus.permission.USE_SCENE'])
+        self.assertIn('com.oculus.permission.USE_SCENE', declared_set)
+        # a manifest without undeclared Meta permissions is left alone
+        self.assertIsNone(fc.axml_define_meta_permissions(fixed))
 
 
 class TelemetryPatternTest(unittest.TestCase):

@@ -880,6 +880,7 @@ def build_stub_library(symbols: list[str], soname: str = "libovrstubs.so", abi: 
 RES_XML = 0x0003
 RES_STRING_POOL = 0x0001
 RES_XML_START_ELEMENT = 0x0102
+RES_XML_END_ELEMENT = 0x0103
 TYPE_STRING = 0x03
 TYPE_INT_BOOLEAN = 0x12
 AXML_LAUNCHER = "android.intent.category.LAUNCHER"
@@ -1047,6 +1048,58 @@ class Axml:
 
     def bytes(self) -> bytes:
         return bytes(self.data)
+
+
+def axml_used_and_declared_permissions(manifest: bytes) -> tuple[list[str], set[str]]:
+    x = Axml(manifest)
+    used, declared = [], set()
+    for el in x.elements():
+        if el.name in ("uses-permission", "permission"):
+            name = x.attr_str(el, "name")
+            if name:
+                (used.append if el.name == "uses-permission" else declared.add)(name)
+    return used, declared
+
+
+def axml_undeclared_meta_permissions(manifest: bytes) -> list[str]:
+    used, declared = axml_used_and_declared_permissions(manifest)
+    return [p for p in used if p.startswith(("com.oculus.permission.", "horizonos.permission.")) and p not in declared]
+
+
+def axml_define_meta_permissions(manifest: bytes):
+    """Declare Meta-only permissions (com.oculus.*, horizonos.*) the app uses. A permission the app declares
+    itself with the default 'normal' protection level is granted at install, so checks like "allow spatial
+    data" pass (mixed-reality games, for example Demeter)."""
+    wanted = axml_undeclared_meta_permissions(manifest)
+    x = Axml(manifest)
+    if not wanted or x.index("name") is None:
+        return None
+    android_ns = x.index("http://schemas.android.com/apk/res/android")
+    if android_ns is None:
+        return None
+    perm_el = x.index("permission")
+    if perm_el is None:
+        perm_el = x.append_string("permission")
+    names = x.strings()
+    name_attr = names.index("name")
+    chunks = b""
+    for p in wanted:
+        value = names.index(p)
+        start = struct.pack("<HHIII", RES_XML_START_ELEMENT, 16, 56, 0, 0xFFFFFFFF)
+        start += struct.pack("<IIHHHHHH", 0xFFFFFFFF, perm_el, 20, 20, 1, 0, 0, 0)
+        start += struct.pack("<IIIHBBI", android_ns, name_attr, value, 8, 0, TYPE_STRING, value)
+        end = (
+            struct.pack("<HHIII", RES_XML_END_ELEMENT, 16, 24, 0, 0xFFFFFFFF)
+            + struct.pack("<II", 0xFFFFFFFF, perm_el)
+        )
+        chunks += start + end
+    manifest_el = next((el for el in x.elements() if el.name == "manifest"), None)
+    if manifest_el is None:
+        return None
+    insert_at = manifest_el.offset + manifest_el.size
+    data = x.data[:insert_at] + chunks + x.data[insert_at:]
+    struct.pack_into("<I", data, 4, len(data))
+    return bytes(data), wanted
 
 
 def axml_categories(manifest: bytes) -> set[str]:
@@ -1482,6 +1535,10 @@ def convert(
             if fixed_manifest:
                 manifest_bytes = fixed_manifest
                 log("Retargeted category INFO to LAUNCHER (Lepton only launches LAUNCHER)")
+            declared = axml_define_meta_permissions(manifest_bytes)
+            if declared:
+                manifest_bytes = declared[0]
+                log(f"Declared {len(declared[1])} Meta permission(s): {', '.join(declared[1])}")
 
         platform_missing: set[str] = set()
         platform_compat = False
