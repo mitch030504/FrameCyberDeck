@@ -25,7 +25,7 @@ const DOC_BINARY_DETAILS = '4734929166632773'
 const DOWNLOAD_URI = 'https://securecdn.oculus.com/binaries/download/'
 
 interface EntitlementsResponse {
-  data: { viewer: { active_entitlements: { nodes: EntitlementNode[] } } }
+  data: { viewer: { user?: { active_entitlements?: { nodes?: EntitlementNode[] } } } }
 }
 interface EntitlementNode {
   item: { id: string; display_name?: string; canonical_name?: string }
@@ -42,8 +42,8 @@ interface BinaryNode {
   package_name?: string
 }
 interface BinaryDetailsResponse {
-  data: {
-    node: {
+  data?: {
+    node?: {
       obb_binary?: { id: string; file_name?: string } | null
       asset_files?: { nodes: { id: string; file_name?: string }[] }
     }
@@ -101,7 +101,8 @@ class MetaSyncService {
       { id: appId },
       token
     )
-    const binaries = history.data.node.supportedBinaries.edges
+    const edges = history.data.node?.supportedBinaries?.edges
+    const binaries = (Array.isArray(edges) ? edges : [])
       .map((edge) => edge.node)
       .filter(
         (node) => node.platform?.startsWith('ANDROID') && (node.version_code || node.versionCode)
@@ -125,7 +126,11 @@ class MetaSyncService {
     if (!token) throw new Error('Sign in to your Meta account first')
 
     const entitlements = await graphRequest<EntitlementsResponse>(DOC_ENTITLEMENTS, {}, token)
-    const entitledApps = entitlements.data.viewer.active_entitlements.nodes.map((node) => ({
+    const nodes = entitlements.data.viewer.user?.active_entitlements?.nodes
+    if (!Array.isArray(nodes)) {
+      throw new Error('Meta returned no entitlement list for this account')
+    }
+    const entitledApps = nodes.map((node) => ({
       appId: node.item.id,
       displayName: node.item.display_name || node.item.canonical_name || node.item.id
     }))
@@ -212,9 +217,13 @@ class MetaSyncService {
               { binaryID: candidate.binaryId },
               token
             )
+            const node = details.data?.node
+            if (!node) {
+              throw new Error('Meta returned no binary details for this title')
+            }
             const obbs = [
-              ...(details.data.node.obb_binary ? [details.data.node.obb_binary] : []),
-              ...(details.data.node.asset_files?.nodes ?? [])
+              ...(node.obb_binary ? [node.obb_binary] : []),
+              ...(node.asset_files?.nodes ?? [])
             ].map((file, index) => ({ ...file, name: file.file_name || `data${index}.obb` }))
 
             emit('Downloading APK', 0)

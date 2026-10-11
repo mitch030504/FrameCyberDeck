@@ -44,10 +44,14 @@ export async function graphRequest<T>(
 interface ViewerResponse {
   data: {
     viewer: {
-      alias?: string
-      oculus_user?: { alias?: string; name?: string }
+      user?: { alias?: string; display_name?: string }
     }
   }
+}
+
+/** Display name from a viewer response, tolerating both spellings Meta uses. */
+function viewerName(viewer: ViewerResponse['data']['viewer']): string | undefined {
+  return viewer.user?.alias || viewer.user?.display_name
 }
 
 class MetaAccountService extends EventEmitter {
@@ -80,10 +84,7 @@ class MetaAccountService extends EventEmitter {
     }
     try {
       const viewer = await graphRequest<ViewerResponse>('4149322231793299', {}, trimmed)
-      const name =
-        viewer.data.viewer.oculus_user?.alias ||
-        viewer.data.viewer.oculus_user?.name ||
-        viewer.data.viewer.alias
+      const name = viewerName(viewer.data.viewer)
       if (!safeStorage.isEncryptionAvailable()) {
         return { ok: false, error: 'OS key storage is unavailable; cannot store the token safely.' }
       }
@@ -116,10 +117,7 @@ class MetaAccountService extends EventEmitter {
       const viewer = await graphRequest<ViewerResponse>('4149322231793299', {}, token)
       return {
         authenticated: true,
-        name:
-          viewer.data.viewer.oculus_user?.alias ||
-          viewer.data.viewer.oculus_user?.name ||
-          viewer.data.viewer.alias
+        name: viewerName(viewer.data.viewer)
       }
     } catch {
       // A stored token that no longer validates is as good as logged out.
