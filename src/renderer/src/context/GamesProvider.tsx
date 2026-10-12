@@ -160,7 +160,17 @@ export const GamesProvider: React.FC<GamesProviderProps> = ({ children }) => {
 
     // Process installed packages and filter by blacklist
     const processInstalledPackages = async (): Promise<void> => {
+      // The Steam Frame lists every devkit game, including titles installed by
+      // other tools — only ones this app installed from a native Quest release
+      // are eligible for the server.
+      const frameManaged = selectedDeviceDetails?.isSteamFrame
+        ? new Set(await window.api.frame.recordedSourcePackages())
+        : null
       for (const pkg of installedPackages) {
+        if (frameManaged && !frameManaged.has(pkg.packageName)) {
+          continue
+        }
+
         // Skip blacklisted games
         if (await window.api.games.isGameBlacklisted(pkg.packageName, pkg.versionCode)) {
           continue

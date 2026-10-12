@@ -91,6 +91,18 @@ class FrameDevkitService {
     }
   }
 
+  /**
+   * Packages this app installed from a native Quest release — the only Frame
+   * titles eligible for server contribution. Devkit games installed by other
+   * tools are not Quest titles and stay off the server.
+   */
+  async getRecordedSourcePackages(): Promise<string[]> {
+    const registry = await this.readSourceRegistry()
+    return Object.values(registry)
+      .filter((record) => Boolean(record?.originalSourcePath))
+      .map((record) => record.packageName)
+  }
+
   private getHelperPath(): string {
     return app.isPackaged
       ? join(process.resourcesPath, 'frame-devkit-bridge.py')

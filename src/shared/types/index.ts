@@ -364,6 +364,7 @@ export interface DependencyAPIRenderer extends DependencyAPI {}
 
 export interface FrameAPIRenderer {
   runPackage: (packageName: string) => Promise<boolean>
+  recordedSourcePackages: () => Promise<string[]>
 }
 
 export interface AdbAPIRenderer extends AdbAPI {

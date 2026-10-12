@@ -577,6 +577,10 @@ app.whenReady().then(async () => {
     return success
   })
 
+  typedIpcMain.handle('frame:recorded-source-packages', () =>
+    frameDevkitService.getRecordedSourcePackages()
+  )
+
   // --- Game Handlers ---
   typedIpcMain.handle('games:get-games', async () => gameService.getGames())
   typedIpcMain.handle('games:get-blacklist-games', async () => gameService.getBlacklistGames())

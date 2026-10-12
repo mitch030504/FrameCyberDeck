@@ -120,7 +120,9 @@ const api = {
   } satisfies AdbAPIRenderer,
   frame: {
     runPackage: (packageName: string): Promise<boolean> =>
-      typedIpcRenderer.invoke('frame:run-package', packageName)
+      typedIpcRenderer.invoke('frame:run-package', packageName),
+    recordedSourcePackages: (): Promise<string[]> =>
+      typedIpcRenderer.invoke('frame:recorded-source-packages')
   } satisfies FrameAPIRenderer,
   games: {
     getGames: (): Promise<GameInfo[]> => typedIpcRenderer.invoke('games:get-games'),

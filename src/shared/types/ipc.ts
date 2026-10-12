@@ -78,6 +78,7 @@ export interface IPCChannels {
 
   // Steam Frame related channels
   'frame:run-package': DefineChannel<[packageName: string], boolean>
+  'frame:recorded-source-packages': DefineChannel<[], string[]>
 
   // Game related channels
   'games:get-games': DefineChannel<[], GameInfo[]>
