@@ -281,6 +281,13 @@ DEFAULT_OVRPORT_PATCHES = (
 )
 
 
+# Dead payload files from cracked/repacked releases: their runtime bootstrap
+# is stripped by OVRPort's patch_clean_up_frida, so nothing loads them — but
+# games scan their own APK for them (e.g. Nomad's StoreBase.Validate looks for
+# a lib/*.so entry containing "frda") and flag the install as pirated.
+CRACK_PAYLOAD_LIBS = frozenset({"libfrda.so", "libscript.so", "libfrda.config.so"})
+
+
 def load_recipes(path: pathlib.Path | None = None) -> dict:
     if path is None:
         path = pathlib.Path(__file__).resolve().parent / "frameport-recipes.json"
@@ -1661,6 +1668,12 @@ def convert(
                 log("No libOVRPlugin.so in the build; the XR shim will not be reached by the game.")
             for item in src.infolist():
                 if item.filename == loader or item.filename.startswith("META-INF/"):
+                    continue
+                if (
+                    item.filename.startswith(prefix)
+                    and pathlib.Path(item.filename).name in CRACK_PAYLOAD_LIBS
+                ):
+                    log(f"Dropped crack payload {item.filename} (inert; tamper checks scan for it)")
                     continue
                 if item.filename == "AndroidManifest.xml" and manifest_bytes is not None:
                     dst.writestr(item, manifest_bytes)
