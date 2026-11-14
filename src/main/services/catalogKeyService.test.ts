@@ -18,6 +18,12 @@ beforeEach(async () => {
   fetchMock.mockReset()
   global.fetch = fetchMock as unknown as typeof fetch
   vi.unstubAllEnvs()
+  // The test host may export real credentials (CI does); start from none so
+  // each test states exactly which credentials it needs.
+  vi.stubEnv('VRSRC_CLIENT_ID', '')
+  vi.stubEnv('VRSRC_BUILD_SECRET', '')
+  vi.stubEnv('FRAME_CYBERDECK_CLIENT_ID', '')
+  vi.stubEnv('FRAME_CYBERDECK_BUILD_SECRET', '')
 })
 
 function jsonResponse(status: number, body: unknown): Response {
