@@ -13,8 +13,6 @@ on:
         required: true
         type: string
     secrets:
-      VRSRC_API_KEY:
-        required: false
       VRSRC_CLIENT_ID:
         required: false
       VRSRC_BUILD_SECRET:
@@ -55,9 +53,9 @@ jobs:
 
       - name: Build app directories (no dmg-builder required)
         env:
-          VRSRC_API_KEY: ${{ secrets.VRSRC_API_KEY }}
           VRSRC_CLIENT_ID: ${{ secrets.VRSRC_CLIENT_ID }}
           VRSRC_BUILD_SECRET: ${{ secrets.VRSRC_BUILD_SECRET }}
+          FRAME_CYBERDECK_RELEASE_BUILD: '1'
         run: |
           npx electron-vite build
           npx electron-builder --mac --dir --x64 --publish never
@@ -90,9 +88,9 @@ jobs:
             ditto "$APP_PATH" "$STAGING/$(basename "$APP_PATH")"
             ln -s /Applications "$STAGING/Applications"
 
-            DMG="dist/vr-cyberdeck-${VERSION}-${ARCH}.dmg"
+            DMG="dist/frame-cyberdeck-${VERSION}-${ARCH}.dmg"
             hdiutil create \
-              -volname "VR CyberDeck" \
+              -volname "Frame CyberDeck" \
               -srcfolder "$STAGING" \
               -ov -format UDZO \
               "$DMG"
@@ -113,7 +111,7 @@ jobs:
             exit 1
           fi
 
-          for DMG in dist/vr-cyberdeck-${VERSION}-x64.dmg dist/vr-cyberdeck-${VERSION}-arm64.dmg; do
+          for DMG in dist/frame-cyberdeck-${VERSION}-x64.dmg dist/frame-cyberdeck-${VERSION}-arm64.dmg; do
             if [ ! -f "$DMG" ]; then
               echo "ERROR: expected DMG not found: $DMG"
               ls -la dist/ || true

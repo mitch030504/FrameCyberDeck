@@ -6,6 +6,7 @@ import dependencyService from '../dependencyService'
 import { DownloadItem, DownloadStatus } from '@shared/types'
 import mirrorService from '../mirrorService'
 import settingsService from '../settingsService'
+import { redactSecrets } from '../redaction'
 import { getAvailableDiskSpace, getDirectorySize, formatBytes } from './utils'
 import { verifyReleaseTree } from './releaseManifest'
 import {
@@ -561,7 +562,10 @@ export class ExtractionProcessor {
       }
 
       // Handle unexpected errors
-      console.error(`[ExtractProc Catch] Extraction error for ${item.releaseName}:`, error)
+      console.error(
+        `[ExtractProc Catch] Extraction error for ${item.releaseName}:`,
+        redactSecrets(error)
+      )
       if (this.activeExtractions.has(item.releaseName)) {
         this.activeExtractions.delete(item.releaseName)
       }
@@ -570,7 +574,7 @@ export class ExtractionProcessor {
       // "exit code N" and the real cause (wrong password vs. corrupt data vs.
       // a missing volume) is invisible, which makes failures impossible to
       // diagnose after the fact.
-      const sevenZipOutput = (stderrContent || stdoutContent).trim()
+      const sevenZipOutput = redactSecrets((stderrContent || stdoutContent).trim())
       if (sevenZipOutput) {
         console.error(
           `[ExtractProc Catch] 7-Zip output for ${item.releaseName} (tail): ${sevenZipOutput.slice(-1000)}`
@@ -608,7 +612,7 @@ export class ExtractionProcessor {
       } else {
         errorMessage = String(error)
       }
-      errorMessage = errorMessage.substring(0, 500)
+      errorMessage = redactSecrets(errorMessage).substring(0, 500)
 
       // Update status to Error only if it wasn't already handled (e.g., by cancellation)
       if (statusBeforeCatch === 'Extracting') {

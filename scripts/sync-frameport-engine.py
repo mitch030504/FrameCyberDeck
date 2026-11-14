@@ -44,7 +44,10 @@ ENGINE_SKIP_DIRS = {"ui", "__pycache__"}
 
 # Files this repository adds next to the vendored tree; they are not part of
 # the upstream manifest and are allowed by --check.
+# Preserved across an update; never part of the upstream tarball.
 LOCAL_FILES = {"PIN.json", "MANIFEST.sha256", "README.md", "requirements.txt"}
+# Files this repository owns and does not include in the upstream manifest.
+MANIFEST_SKIP = {"PIN.json", "MANIFEST.sha256", "README.md"}
 
 # Local fixes applied after copying the upstream tree. Keep them small and
 # documented; the manifest is generated after they run.
@@ -209,7 +212,7 @@ def manifest_files() -> list[Path]:
     result = []
     for path in VENDOR_DIR.rglob("*"):
         relative = path.relative_to(VENDOR_DIR).as_posix()
-        if not path.is_file() or relative in LOCAL_FILES:
+        if not path.is_file() or relative in MANIFEST_SKIP:
             continue
         if "__pycache__" in relative or relative.endswith((".pyc", ".pyo")):
             continue

@@ -3,9 +3,11 @@ import { promises as fs, promises as fsPromises } from 'fs'
 import { execa, ExecaError } from 'execa'
 import crypto from 'crypto'
 import { QueueManager } from './queueManager'
-import { ensureApiKey, getApiKey, invalidateApiKey, redactApiKey as redactKey } from '../apiKey'
+import { ensureApiKey, getApiKey, invalidateApiKey } from '../apiKey'
 import dependencyService from '../dependencyService'
 import mirrorService from '../mirrorService'
+import catalogKeyService from '../catalogKeyService'
+import { redactSecrets } from '../redaction'
 import settingsService from '../settingsService'
 import { DownloadItem } from '@shared/types'
 import { DownloadStatus } from '@shared/types'
@@ -254,7 +256,7 @@ export class DownloadProcessor {
     await ensureApiKey()
     if (!getApiKey()) {
       const errorMsg =
-        'Catalog API key is not configured. Set FRAME_CYBERDECK_API_KEY for an authorized source, or configure an authenticated mirror.'
+        'Catalog credentials are not configured. Prepare the catalog credential exchange or configure an authenticated mirror.'
       console.warn(`[DownProc] ${errorMsg}`)
       this.updateItemStatus(item.releaseName, 'Error', 0, errorMsg)
       return { success: false, startExtraction: false }
@@ -434,7 +436,8 @@ export class DownloadProcessor {
           '--config',
           nullConfigPath,
           '--http-url',
-          this.vrpConfig.baseUri!,
+          (catalogKeyService.hasCredentials() ? catalogKeyService.getBaseUri() : null) ||
+            this.vrpConfig.baseUri!,
           '--stats',
           '1s',
           '--stats-log-level',
@@ -701,7 +704,7 @@ export class DownloadProcessor {
 
       console.error(
         `[DownProc] rclone copy download error for ${item.releaseName}:`,
-        redactKey(String(error))
+        redactSecrets(error)
       )
 
       if (this.activeDownloads.has(item.releaseName)) {
@@ -729,7 +732,7 @@ export class DownloadProcessor {
       } else {
         errorMessage = String(error)
       }
-      errorMessage = redactKey(errorMessage).substring(0, 500)
+      errorMessage = redactSecrets(errorMessage).substring(0, 500)
       if (/\b403\b|Forbidden/i.test(errorMessage)) {
         // The mirror key was retired or revoked mid-run; the next attempt
         // mints a fresh one instead of reusing the rejected cache entry.

@@ -62,7 +62,7 @@ export function isWiFiBookmark(device: ExtendedDeviceInfo): boolean {
 
 // Type guard to check if a device is a TCP device (has IP:PORT format)
 export function isTcpDevice(device: ExtendedDeviceInfo): boolean {
-  return device.id.includes(':')
+  return !device.isVenture && device.id.includes(':')
 }
 
 export interface PackageInfo {

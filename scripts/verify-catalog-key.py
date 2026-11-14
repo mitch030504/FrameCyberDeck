@@ -16,6 +16,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import tempfile
 import uuid
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -50,12 +51,13 @@ def main() -> int:
         print("Missing VRSRC_CLIENT_ID / VRSRC_BUILD_SECRET in .env or the environment.")
         return 2
 
+    package_version = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))["version"]
     body = json.dumps(
         {
             "client_id": client_id,
             "build_secret": build_secret,
             "install_id": str(uuid.uuid4()),
-            "app_version": "0.1.0",
+            "app_version": package_version,
         }
     ).encode()
     # Python's urllib TLS fingerprint is challenged by the service's CDN
@@ -103,27 +105,38 @@ def main() -> int:
     if status != 200 or not key:
         return 1
 
-    probe = subprocess.run(
-        [
-            "curl",
-            "--http2",
-            "--silent",
-            "--output",
-            os.devnull,
-            "--write-out",
-            "%{http_code}",
-            "--user-agent",
-            "rclone/v1.72.1",
-            "--header",
-            f"X-API-Key: {key}",
-            "--range",
-            "0-0",
-            "https://go.srcdl1.xyz/meta.7z",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    base = (payload.get("baseUri") or "").rstrip("/")
+    if not base.startswith("https://"):
+        print("mirror skipped: the grant did not return an HTTPS baseUri")
+        return 1
+    config = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+    try:
+        os.chmod(config.name, 0o600)
+        config.write(f'header = "X-API-Key: {key}"\n')
+        config.close()
+        probe = subprocess.run(
+            [
+                "curl",
+                "--http2",
+                "--silent",
+                "--output",
+                os.devnull,
+                "--write-out",
+                "%{http_code}",
+                "--user-agent",
+                "rclone/v1.72.1",
+                "--config",
+                config.name,
+                "--range",
+                "0-0",
+                f"{base}/meta.7z",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    finally:
+        os.unlink(config.name)
     print("mirror status:", probe.stdout.strip())
     return 0 if probe.stdout.strip() in ("200", "206") else 1
 

@@ -87,7 +87,7 @@ export function friendlyRcloneError(
   // so a missing key looks like a timeout or a 403.
   const noKeyHint = hasApiKey
     ? ''
-    : ' This build has no API key configured (VRSRC_API_KEY_ENC), and the server blocks requests without it.'
+    : ' This build has no catalog credential configured, and the server blocks requests without one.'
   if (/i\/o timeout|context deadline exceeded|timed out|Client\.Timeout/i.test(s)) {
     return (
       'Connection to the server timed out. It may be down, blocked by your network/DNS, or needs a VPN.' +

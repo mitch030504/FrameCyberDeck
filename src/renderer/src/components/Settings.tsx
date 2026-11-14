@@ -315,6 +315,13 @@ const LogUploadSettings: React.FC = () => {
   } = useLogs()
 
   const handleUploadLog = async (): Promise<void> => {
+    if (
+      !window.confirm(
+        'This uploads the log as a public plain-text paste on rentry.co. Credentials and command lines are redacted, but review the log before sharing. Continue?'
+      )
+    ) {
+      return
+    }
     clearUploadState()
     await uploadCurrentLog()
   }
@@ -443,7 +450,7 @@ const LogUploadSettings: React.FC = () => {
         <Text className={styles.hint}>
           <InfoRegular />
           {
-            'The log is uploaded to rentry.co as plain text. Share the short code (e.g. abc12345) with support so they can open rentry.co/abc12345.'
+            'The log is uploaded to rentry.co as a public plain-text paste. Credentials and command lines are redacted, but review it before sharing — anyone with the short code (e.g. abc12345) can read rentry.co/abc12345.'
           }
         </Text>
       </div>

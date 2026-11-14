@@ -25,17 +25,39 @@ export default defineConfig(({ mode }) => {
     env.VRSRC_BUILD_SECRET?.trim() ||
     ''
 
-  if (clientId && buildSecret) {
+  const releaseBuild = process.env.FRAME_CYBERDECK_RELEASE_BUILD === '1'
+  const dynamicCredentials = Boolean(clientId && buildSecret)
+
+  if (releaseBuild) {
+    if (!dynamicCredentials) {
+      throw new Error(
+        'Release builds require VRSRC_CLIENT_ID and VRSRC_BUILD_SECRET for the short-lived catalog key exchange.'
+      )
+    }
+    if (apiKey) {
+      throw new Error(
+        'Release builds must not embed a static VRSRC_API_KEY. Remove the secret from the release workflow.'
+      )
+    }
+  } else if (clientId || buildSecret) {
+    if (!dynamicCredentials) {
+      console.warn(
+        '[electron.vite.config] Both a client id and a build secret are required for short-lived keys; using the static catalog key.'
+      )
+    } else if (apiKey) {
+      console.warn(
+        '[electron.vite.config] Both static and short-lived credentials are configured; ignoring the static key.'
+      )
+    }
+  }
+
+  if (dynamicCredentials) {
     console.log(
       '[electron.vite.config] Short-lived catalog key exchange configured; protected catalog sync will mint keys at runtime.'
     )
   } else if (!apiKey) {
     console.log(
       '[electron.vite.config] No catalog credential configured; protected catalog sync will stay disabled. Local sideloading and Steam Frame management remain available.'
-    )
-  } else if (clientId || buildSecret) {
-    console.warn(
-      '[electron.vite.config] Both a client id and a build secret are required for short-lived keys; falling back to the static catalog key.'
     )
   }
 
@@ -45,7 +67,10 @@ export default defineConfig(({ mode }) => {
       define: {
         // Embedded obfuscated (see src/shared/keyObfuscation.ts) rather than as
         // a raw string so the packaged app doesn't contain the plaintext value.
-        'process.env.VRSRC_API_KEY_ENC': JSON.stringify(encodeApiKey(apiKey)),
+        // Release builds never embed a static key; dynamic credentials win.
+        'process.env.VRSRC_API_KEY_ENC': JSON.stringify(
+          encodeApiKey(dynamicCredentials ? '' : apiKey)
+        ),
         'process.env.VRSRC_CLIENT_ID': JSON.stringify(clientId),
         'process.env.VRSRC_BUILD_SECRET_ENC': JSON.stringify(encodeApiKey(buildSecret))
       },

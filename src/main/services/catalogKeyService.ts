@@ -95,7 +95,17 @@ export class CatalogKeyService {
   }
 
   private endpoint(): string {
-    return process.env.FRAME_CYBERDECK_KEY_URL?.trim() || DEFAULT_ENDPOINT
+    // Packaged builds always use the compiled endpoint. A launcher or shortcut
+    // must not be able to redirect the build secret to another host.
+    if (app.isPackaged) return DEFAULT_ENDPOINT
+    const override = process.env.FRAME_CYBERDECK_KEY_URL?.trim()
+    if (!override) return DEFAULT_ENDPOINT
+    try {
+      const url = new URL(override)
+      return url.protocol === 'https:' ? override : DEFAULT_ENDPOINT
+    } catch {
+      return DEFAULT_ENDPOINT
+    }
   }
 
   private async installId(): Promise<string> {
@@ -143,6 +153,18 @@ export class CatalogKeyService {
     if (!apiKey || !baseUri) {
       throw new Error('The catalog key response is missing apiKey or baseUri')
     }
+    if (!/^[A-Za-z0-9._-]{8,256}$/.test(apiKey)) {
+      throw new Error('The catalog key response contained an invalid key')
+    }
+    let baseUrl: URL
+    try {
+      baseUrl = new URL(baseUri)
+    } catch {
+      throw new Error('The catalog key response contained an invalid baseUri')
+    }
+    if (baseUrl.protocol !== 'https:') {
+      throw new Error('The catalog key response must use HTTPS')
+    }
     const now = Date.now()
     const rawRefresh = parseDate(response.body.refreshAfter, now + 60 * 60 * 1000)
     const expiresAt = parseDate(response.body.expiresAt, rawRefresh + 24 * 60 * 60 * 1000)
@@ -164,7 +186,11 @@ export class CatalogKeyService {
     try {
       const response = await fetch(this.endpoint(), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        redirect: 'error',
+        headers: {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-store'
+        },
         body: JSON.stringify({
           client_id: this.clientId(),
           build_secret: this.buildSecret(),

@@ -6,8 +6,10 @@ import { existsSync } from 'fs'
 import axios from 'axios'
 import dependencyService from './dependencyService'
 import mirrorService from './mirrorService'
+import catalogKeyService from './catalogKeyService'
+import { redactSecrets } from './redaction'
 import settingsService from './settingsService'
-import { ensureApiKey, getApiKey, invalidateApiKey, redactApiKey as redactKey } from './apiKey'
+import { ensureApiKey, getApiKey, invalidateApiKey } from './apiKey'
 import { GameInfo, ServiceStatus, GamesAPI, BlacklistEntry } from '@shared/types'
 import EventEmitter from 'events'
 import { typedWebContentsSend } from '@shared/ipc-utils'
@@ -225,7 +227,7 @@ class GameService extends EventEmitter implements GamesAPI {
         typedWebContentsSend.send(mainWindow, 'games:background-sync-complete', this.games)
       }
     } catch (err) {
-      const message = redactKey(err instanceof Error ? err.message : String(err))
+      const message = redactSecrets(err)
       console.error('[GameService] Background sync failed:', message)
       const mainWindow = BrowserWindow.getAllWindows()[0]
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -273,7 +275,7 @@ class GameService extends EventEmitter implements GamesAPI {
         await this.saveConfig()
       }
     } catch (error) {
-      console.error('Error syncing game data:', redactKey(String(error)))
+      console.error('Error syncing game data:', redactSecrets(error))
       throw error
     }
   }
@@ -366,10 +368,14 @@ class GameService extends EventEmitter implements GamesAPI {
 
       // Check if there's an active mirror to use
       const activeMirror = await mirrorService.getActiveMirror()
-      const baseUri = this.vrpConfig.baseUri
+      // A minted key belongs to the baseUri that issued it. Never send it to a
+      // different configured host.
+      const baseUri =
+        (catalogKeyService.hasCredentials() ? catalogKeyService.getBaseUri() : null) ||
+        this.vrpConfig.baseUri
       let rcloneArgs: string[]
 
-      console.log(`Downloading meta.7z from ${baseUri}...`)
+      console.log(`Downloading meta.7z from ${redactSecrets(baseUri)}...`)
 
       // Fail fast with a clear message if DNS is dead or sinkholed
       if (!activeMirror) await preflightHostCheck(baseUri)
@@ -469,7 +475,7 @@ class GameService extends EventEmitter implements GamesAPI {
             }
             return // Success with mirror
           } catch (error) {
-            console.error('Failed to use mirror config file:', redactKey(String(error)))
+            console.error('Failed to use mirror config file:', redactSecrets(error))
             // Fall through to public endpoint logic
           }
         }
@@ -482,7 +488,7 @@ class GameService extends EventEmitter implements GamesAPI {
       const publicApiKey = getApiKey()
       if (!publicApiKey) {
         throw new Error(
-          'Catalog API key is not configured. Set FRAME_CYBERDECK_API_KEY for an authorized source, or configure an authenticated mirror.'
+          'Catalog credentials are not configured. Prepare the catalog credential exchange or configure an authenticated mirror.'
         )
       }
 
@@ -572,7 +578,7 @@ class GameService extends EventEmitter implements GamesAPI {
         })
       }
     } catch (error) {
-      const message = redactKey(String(error))
+      const message = redactSecrets(error)
       if (/\b403\b|Forbidden/i.test(message)) invalidateApiKey()
       console.error('Error downloading meta archive:', message)
       throw error

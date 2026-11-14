@@ -28,6 +28,11 @@ export interface FramePortEngineGame {
 
 type ProgressReporter = (step: string, percent?: number) => void
 
+/** Always written, including 0, so a previous recipe override is cleared. */
+export function refreshRateAssignment(rate: number): string {
+  return `refresh_rate=${rate}`
+}
+
 const ENGINE_FILES = [
   'vendor/frameport/src/frameport/pipeline.py',
   'vendor/frameport/requirements.txt'
@@ -394,10 +399,13 @@ class FramePortEngineService {
     await fs.mkdir(this.buildsRoot(), { recursive: true })
     const buildDir = await fs.mkdtemp(join(this.buildsRoot(), 'build-'))
     try {
-      if (refreshRate) {
-        onProgress?.(`Setting refresh rate to ${refreshRate} Hz…`, 12)
-        await this.recipeSet(game.package, [`refresh_rate=${refreshRate}`])
-      }
+      onProgress?.(
+        refreshRate ? `Setting refresh rate to ${refreshRate} Hz…` : 'Using the runtime refresh rate…',
+        12
+      )
+      // Always write the setting, including 0: a previous conversion may have
+      // persisted a custom rate in this engine's recipe.
+      await this.recipeSet(game.package, [refreshRateAssignment(refreshRate)])
       let lastStage = ''
       const result = await this.build(game.package, buildDir, (event) => {
         if (event.kind === 'stage' && event.message && event.message !== lastStage) {

@@ -14,134 +14,136 @@ const name = fs.readFileSync(path.join(root, '.github', 'release-name.txt'), 'ut
 const changelog = fs
   .readFileSync(path.join(root, '.github', 'release-changelog.md'), 'utf-8')
   .trim()
-
 const v = version
 
-const notes = `# VR CyberDeck v${v} — \`${name}\`
+const notes = `# Frame CyberDeck v${v} — \`${name}\`
 
-> \`> ACCESS GRANTED. JACK IN. OPERATE. DEPLOY. CONTROL.\`
+> \`> FRAME DETECTED. CONVERT. DEPLOY. LAUNCH.\`
 
+Frame CyberDeck is an independent, GPL-3.0-only fork of **VR CyberDeck** by
+DeliciousMeatPop, focused on Valve's Steam Frame. It is not an official VR
+CyberDeck release and is not affiliated with or endorsed by Valve, Meta,
+FramePort, Venture, or the VR CyberDeck maintainer.
 
-VR CyberDeck is a cross-platform desktop deck for managing, sideloading, and uploading content to Meta Quest devices. It started as a fork of [**ApprenticeVR**](https://github.com/jimzrt/apprenticeVr) by **jimzrt** (huge thanks — the core engine is theirs) and grew into a full neon-terminal rebrand of the experience.
+0.2.0 is the first public release. 0.1.0 was a development/AUR build and was
+never published on GitHub.
 
 ---
-
 
 ## \`// CHANGELOG\`
 
 ${changelog}
 
- ---
-
-<details>
-<summary>## // HEADLINE FEATURES (Click to Expand - ITS A SPOILER!)</summary>
-
-### \`[ LIBRARY ]\` — optional, when you add a server
-- Sideloader-first: works first launch with zero config; add your own server (a server config or an rclone config) under **Manage Remotes** for a browsable library
-- Card view **and** table view (table now stretches edge-to-edge in wide windows)
-- Persistent sort, density presets, 18+ filter, mirror management with public fallback
-- \`NEW\` / \`UPDATED\` badges driven off real \`lastUpdated\` timestamps
-
-### \`[ TRANSFERS ]\`
-- Up to **5 parallel downloads** with live progress
-- Live \`// TRANSFER_BUS\` strip in the header — rotates through active transfers with name, stage, %, speed, and ETA
-- Unified Transfers drawer with stage-aware labels (\`Installing APK...\`, \`Copying OBB...\`)
-- Cyberdeck warns you with \`[ TRANSFERS IN PROGRESS ]\` if you try to close the window mid-transfer (works for both X and Cmd+Q)
-- Scan existing downloads folder, retry, clear-completed, per-item delete
-
-### \`[ DEVICE / ADB ]\`
-- Auto-connect Quest on launch, WiFi bookmarks for wireless ADB
-- **ADB Shell** with built-in **quick-command shortcuts**:
-  - \`PERFORMANCE\` — pin CPU/GPU level, swap refresh rate (72/90/120Hz), reset texture
-  - \`UPDATES\` — block / unblock the OS updater and Meta Store
-  - \`SYSTEM\` — reboot variants, battery, storage, wifi, IP, proximity toggle
-  - \`PACKAGES\` — list 3rd-party / all / current focused app
-  - \`WIRELESS\` — \`tcpip 5555\`, \`adb devices\`
-- **Custom user macros** — define your own labelled pill for any command you spam (right-click to edit/delete, persisted across sessions)
-- Disable-sideloading toggle for safety
-
-### \`[ TRAILERS ]\`
-- Switched from youtube trailers to meta trailers... and back again.
-- **No ads, no suggested videos, no subscribe buttons, no comments, no end-screen "Watch next" grid** — just the trailer, then it stops
-- Autoplays as soon as you open the trailer drawer
-
-### \`[ INTERFACE ]\`
-- Glitch \`UNAUTHORIZED → AUTHORIZED\` boot intro
-- Matrix-style random \`g33ky_u$3rn4m3$\` per session
-- Neon Hacker Console in the header (live SYS_STATUS readout — now properly fits the 88px header without clipping)
-- **Font picker** — swap Courier New for Console / Terminal / System Mono if the default is hard to read
-- **Optional sound effects (drop-in)** — drop \`click.wav\`, \`type.wav\`, or \`matrix.wav\` into your user-data \`sounds/\` folder (no rebuild) or \`resources/sounds/\` (bundled), and the UI plays them on button clicks, the boot-intro typing, and the ADB shell matrix load. Settings has a master toggle, volume slider, TEST button, and a per-file "✓ READY / — missing" status readout. Lookup order: user data → bundled, so you can override bundled sounds without recompiling.
-- **Colorblind mode** now covers the whole UI — version subtitles, filter counters, Transfers button, battery pill, breach animation all swap palette
-- Accent color picker, font scale up to 200%, tab memory
-- Compact, **laptop-friendly** layout (900x640 minimum window)
-- One-click log upload from Settings → Log Upload
-
-</details>
-
 ---
 
 ## \`// DOWNLOAD\`
 
-Pick the build for your platform — same set of artifacts as the prereleases:
+| File | Platform | Status |
+|------|----------|--------|
+| \`frame-cyberdeck-${v}-x86_64.AppImage\` | Linux x64 | **Validated** |
+| \`frame-cyberdeck-${v}-amd64.deb\` | Debian/Ubuntu x64 | **Validated** |
+| \`frame-cyberdeck-${v}-arm64.AppImage\` | Linux ARM64 | Unverified |
+| \`frame-cyberdeck-${v}-arm64.deb\` | Debian/Ubuntu ARM64 | Unverified |
+| \`frame-cyberdeck-${v}-x64.dmg\` | macOS x64 | Experimental, unverified |
+| \`frame-cyberdeck-${v}-arm64.dmg\` | macOS arm64 | Experimental, unverified |
+| \`frame-cyberdeck-${v}-setup-x64.exe\` | Windows x64 installer | Experimental, unverified |
+| \`frame-cyberdeck-${v}-portable-x64.exe\` | Windows x64 portable | Experimental, unverified |
 
-| File | Platform |
-|------|----------|
-| \`vr-cyberdeck-${v}-x64.dmg\` | macOS x64 |
-| \`vr-cyberdeck-${v}-arm64.dmg\` | macOS arm64 |
-| \`vr-cyberdeck-${v}-setup-x64.exe\` | Windows — Installer |
-| \`vr-cyberdeck-${v}-portable-x64.exe\` | Windows — Portable |
-| \`vr-cyberdeck-${v}-x86_64.AppImage\` | Linux x64 |
-| \`vr-cyberdeck-${v}-arm64.AppImage\` | Linux ARM64 |
-| \`vr-cyberdeck-${v}-amd64.deb\` | Debian/Ubuntu x64 |
-| \`vr-cyberdeck-${v}-arm64.deb\` | Debian/Ubuntu ARM64 |
+Verify downloads against the attached \`SHA256SUMS\`.
 
-**macOS — "App is damaged":**
-\`\`\`
-xattr -c /Applications/VR\\ CyberDeck.app
-\`\`\`
+**Windows:** builds are unsigned; SmartScreen may warn. Check the SHA-256
+before choosing “More info → Run anyway”.
+
+**macOS:** builds are ad-hoc signed and not notarized. Gatekeeper will block a
+normal launch. Use System Settings → Privacy & Security → Open Anyway, and
+only after verifying the checksum. macOS 12 Monterey or newer is required.
 
 **Linux AppImage:**
-\`\`\`
-chmod +x vr-cyberdeck-${v}-x86_64.AppImage
-./vr-cyberdeck-${v}-x86_64.AppImage
-\`\`\`
 
-Already on a 0.x build? It will auto-update.
+\`\`\`
+chmod +x frame-cyberdeck-${v}-x86_64.AppImage
+./frame-cyberdeck-${v}-x86_64.AppImage
+\`\`\`
 
 ---
 
-## \`// JACK_IN\`
+## \`// REQUIREMENTS\`
 
-1. Install the build for your OS
-2. Plug your Quest in via USB (data-capable cable)
-3. Allow USB Debugging on the headset
-4. Drag an APK, ZIP, game folder, or OBB folder onto the deck to sideload it
+- **Steam Frame path:** SteamOS Devkit pairing, \`ssh\`, and (Linux/macOS)
+  \`rsync\`; Lepton installed on the Frame.
+- **FramePort engine:** 64-bit Python 3.11+ with \`venv\` and pip. Prepare the
+  engine once in **Other Settings → Steam Frame Conversion**; it downloads its
+  own Java, OVRPort and apksigner on first use. Network access is required.
+- **Built-in fallback converter:** Python 3, JDK 21+, and Android SDK
+  build-tools with \`aapt\`, \`zipalign\` and \`apksigner\`.
+- **Venture PC target (experimental):** an existing \`venture-cli\` install.
+  Frame CyberDeck does not install Venture or sign in to Meta for it.
 
-That's it — no account, no server, no JSON to edit. Want a browsable library instead? You can add your own server (a server config or an rclone config) under **Manage Remotes** — either you already know one, or you just use it as a sideloader. Power-user knobs (custom servers, mirrors, rclone configs, ADB macros, sound effects) all live in **Settings**.
+---
+
+## \`// UPGRADE NOTES\`
+
+- From a 0.1.0 development/AUR install: settings and downloads carry over.
+  Existing converted titles are not rebuilt; redeploy from the original source
+  to pick up the new per-game launcher.
+- From upstream VR CyberDeck 1.9.x: this is a separate application and version
+  line. It installs side by side; settings and library state do not migrate.
+- Run **Prepare FramePort engine** before the first engine conversion. Until
+  then \`auto\` uses the built-in converter.
+
+---
+
+## \`// KNOWN LIMITATIONS\`
+
+- Linux x64 is the validated host in this release. Windows and macOS packages
+  are produced but were not validated with FramePort, Devkit deployment, or
+  Venture in this cycle.
+- FramePort compatibility is per title and per build. Recipes are configurations
+  from FramePort's catalog, not a guarantee that every recipe works.
+- The FramePort engine path applies build-stage patches. FramePort's install-
+  stage hardware video decode and device-side settings are not applied by Frame
+  CyberDeck's deployment path.
+- Room scan captures and stores a room on the Frame. Captured rooms are not yet
+  copied into individual MR titles.
+- Venture support is experimental and requires an external CLI. Close the
+  Venture launcher before importing.
+- The build credential is obfuscated, not secret: it can be recovered from any
+  shipped build. Revocation is server-side. Local sideloading and Frame
+  management work without catalog credentials.
+
+---
+
+## \`// PRIVACY AND CREDENTIALS\`
+
+Official builds exchange a public client id and a build credential for a
+short-lived mirror key at \`https://vrsrc.fyi/api/mirror/app-key\`, sending a
+random installation id and the app version. The minted key is held in memory,
+refreshed, and used only for catalog downloads. The app also checks GitHub for
+updates. Local sideloading and conversion do not use the catalog.
+
+Support logs uploaded from Settings go to a **public** rentry.co paste.
+Credentials and command lines are redacted, but review the log before sharing.
+
+---
+
+## \`// CREDITS AND LICENSE\`
+
+Frame CyberDeck is GPL-3.0-only. Source is available at this tag. It includes
+vendored FramePort 1.4.1 (GPL-3.0-only) by spoopyghosty0, and uses OVRPort,
+AXRB/RiftLift, and optional Venture. See \`THIRD_PARTY_NOTICES.md\` and
+\`vendor/frameport/THIRD_PARTY_NOTICES.md\`.
+
+Built on VR CyberDeck by DeliciousMeatPop, which was built on ApprenticeVR by
+jimzrt.
 
 ---
 
 ## \`// FEEDBACK\`
 
-- 🐛 [Open an issue](https://github.com/DeliciousMeatPop/VRCD/issues/new) for bugs — include a rentry link of the log from **Other Settings → //Upload Log**.
-
----
-
-## \`// CREDITS\`
-
-Built on top of [ApprenticeVR](https://github.com/jimzrt/apprenticeVr) by **jimzrt**. Without that foundation this project doesn't exist.
-
-Special thanks to **Rod** — my crazy friend who believes in megalodons on Mars and gave me incredible feedback during the prerelease cycle.
-
-And to everyone who tested the 0.x builds and reported issues — y'all shaped the 1.0.0 polish list.
-
-## \`// LICENSE\`
-
-GNU Affero GPL v3
-
----
-
-[Need help adding a server? Tutorial Video by CrazyScamp here](https://streamable.com/v0ljxx)
+- [Open an issue](https://github.com/mitch030504/FrameCyberDeck/issues/new) in
+  this repository, not the upstream tracker.
+- Include the log from **Other Settings → Upload Log** only after reviewing the
+  public paste.
 
 \`> v${v} — END_OF_FILE\``
 

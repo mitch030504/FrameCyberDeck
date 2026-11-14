@@ -1005,7 +1005,7 @@ const DeviceList: React.FC<DeviceListProps> = ({ onSkip, onConnected }) => {
 
   const handleDisconnect = useCallback(
     async (device: ExtendedDeviceInfo): Promise<void> => {
-      const isTcp = device.id.includes(':')
+      const isTcp = device.id.includes(':') && !device.isVenture
       if (isTcp) {
         const [ip, portStr] = device.id.split(':')
         await disconnectTcpDevice(ip, parseInt(portStr) || 5555)

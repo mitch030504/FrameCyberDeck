@@ -36,6 +36,10 @@ extraResources:
     to: custom-notes.json
   - from: resources/frame-devkit-bridge.py
     to: frame-devkit-bridge.py
+  - from: LICENSE
+    to: LICENSE
+  - from: THIRD_PARTY_NOTICES.md
+    to: THIRD_PARTY_NOTICES.md
   - from: resources/frame-convert.py
     to: frame-convert.py
   - from: resources/frameport-engine.py
@@ -44,6 +48,8 @@ extraResources:
     to: vendor/frameport
     filter:
       - '**/*'
+      - '!**/__pycache__/**'
+      - '!**/*.pyc'
   - from: resources/frameport-recipes.json
     to: frameport-recipes.json
   - from: resources/sounds
@@ -57,11 +63,9 @@ win:
     - target: nsis
       arch:
         - x64
-        - ia32
     - target: portable
       arch:
         - x64
-        - ia32
   executableName: frame-cyberdeck
 nsis:
   artifactName: ${name}-${version}-setup-${arch}.${ext}
@@ -80,11 +84,11 @@ mac:
         - arm64
   entitlementsInherit: build/entitlements.mac.plist
   extendInfo:
-    - NSDocumentsFolderUsageDescription: Application requests access to the user's Documents folder.
-    - NSDownloadsFolderUsageDescription: Application requests access to the user's Downloads folder.
-    - CFBundleName: VR CyberDeck
-    - CFBundleDisplayName: VR CyberDeck
-  minimumSystemVersion: 10.15
+    NSDocumentsFolderUsageDescription: Application requests access to the user's Documents folder.
+    NSDownloadsFolderUsageDescription: Application requests access to the user's Downloads folder.
+    CFBundleName: Frame CyberDeck
+    CFBundleDisplayName: Frame CyberDeck
+  minimumSystemVersion: '12.0'
   notarize: false
   icon: build/icon.icns
 dmg:
@@ -94,7 +98,7 @@ linux:
     - target: AppImage
     - target: deb
   icon: build/icon.png
-  maintainer: electronjs.org
+  maintainer: mitch030504
   category: Utility
 appImage:
   artifactName: ${name}-${version}-${arch}.${ext}

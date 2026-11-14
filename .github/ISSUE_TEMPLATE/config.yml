@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: "\U0001F4CB How to find your log file"
-    url: https://github.com/DeliciousMeatPop/VRCD/wiki/Exporting-Logs
-    about: 'Other Settings → // Log Upload → Upload to Renty.co — get a link in seconds.'
+    url: https://github.com/mitch030504/FrameCyberDeck/blob/main/docs/INSTALL.md#logs
+    about: 'Other Settings → Upload Log. The paste is public; review it before sharing.'

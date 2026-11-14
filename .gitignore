@@ -10,3 +10,9 @@ out
 pkg/
 *.tsbuildinfo
 __pycache__/
+
+AUR/src/
+AUR/pkg/
+AUR/squashfs-root/
+AUR/*.AppImage
+AUR/*.pkg.tar.zst

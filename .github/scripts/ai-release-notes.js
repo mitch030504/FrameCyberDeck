@@ -31,7 +31,7 @@ commits = commits
   .slice(0, 30)
   .join('\n')
 
-const prompt = `You are generating release notes for VR CyberDeck, a cyberpunk-themed Electron desktop app for sideloading games to Meta Quest VR headsets. The UI has a hacker/neon aesthetic.
+const prompt = `You are generating release notes for Frame CyberDeck, a GPL-3.0-only Electron desktop app for Valve Steam Frame: Quest-to-Frame conversion via a vendored FramePort engine, SteamOS Devkit deployment, an on-Frame agent, and an optional Venture PC target. Never call a recipe a working game, never claim install-stage features, and label experimental/unverified paths. The UI has a hacker/neon aesthetic.
 
 Git commits since last release:
 ${commits}

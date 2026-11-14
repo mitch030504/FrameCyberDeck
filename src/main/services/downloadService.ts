@@ -1,6 +1,6 @@
 import { app, BrowserWindow } from 'electron'
 import { promises as fs, existsSync } from 'fs'
-import { join, basename, dirname, resolve } from 'path'
+import { join, basename, resolve } from 'path'
 import { childPath } from './fileSafety'
 import { execFile } from 'child_process'
 import SevenZip from 'node-7z'
@@ -1600,10 +1600,10 @@ class DownloadService extends EventEmitter implements DownloadAPI {
         return false
       }
       try {
-        const stats = await fs.stat(filePath)
-        const folder = stats.isDirectory() ? filePath : dirname(filePath)
+        // Venture accepts an APK, an archive, or a folder. Pass the selection
+        // directly so a single APK does not import its whole parent directory.
         onProgress('Importing into Venture…')
-        const imported = await ventureService.importFolder(folder)
+        const imported = await ventureService.importFolder(filePath)
         console.log(`[Service installManualFile] Venture imported ${imported.join(', ')}`)
         return imported.length > 0
       } catch (error) {

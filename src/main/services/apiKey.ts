@@ -6,10 +6,18 @@ let legacyKey: string | null = null
 /**
  * The catalog key currently in use. Official builds mint a short-lived key at
  * runtime; older builds can still carry a static key in VRSRC_API_KEY_ENC.
+ * Dynamic builds never fall back to that static key.
  */
 export function getApiKey(): string {
-  const dynamic = catalogKeyService.getCachedKey()
-  if (dynamic) return dynamic
+  if (catalogKeyService.hasCredentials()) {
+    // Dynamic builds never fall back to a long-lived static key: a failed mint
+    // must degrade to local-only so revocation actually works.
+    return catalogKeyService.getCachedKey()
+  }
+
+  const runtime = process.env.FRAME_CYBERDECK_API_KEY?.trim() || process.env.VRSRC_API_KEY?.trim()
+  if (runtime) return runtime
+
   if (legacyKey === null) {
     try {
       legacyKey = decodeApiKey(process.env.VRSRC_API_KEY_ENC ?? '')

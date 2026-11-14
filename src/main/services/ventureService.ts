@@ -138,6 +138,17 @@ export class VentureService {
     const cli = await this.resolveCli()
     if (!cli) throw new Error('Venture CLI not found')
     const child = spawn(cli, ['play', gameId], { detached: true, stdio: 'ignore' })
+    let failure: Error | null = null
+    child.on('error', (error) => {
+      failure = error
+    })
+    // `play` waits for the game to exit, so return as soon as we know it
+    // started. Surface immediate spawn failures instead of claiming success.
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+    if (failure) throw failure
+    if (child.exitCode !== null && child.exitCode !== 0) {
+      throw new Error(`Venture exited with code ${child.exitCode}`)
+    }
     child.unref()
     return true
   }
