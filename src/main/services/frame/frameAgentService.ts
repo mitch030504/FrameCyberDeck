@@ -55,7 +55,12 @@ class FrameAgentService {
       throw new Error(`Frame agent command is not allowed: ${command}`)
     }
     await this.ensureAgent(host)
-    return await frameDevkitService.runFramePortAgent(command, args, host)
+    const reply = await frameDevkitService.runFramePortAgent(command, args, host)
+    const result = reply.result
+    if (result && typeof result === 'object' && !Array.isArray(result)) {
+      return { ...(result as Record<string, unknown>), ok: Boolean(reply.ok) }
+    }
+    return reply
   }
 
   async info(host?: string): Promise<FrameAgentResult> {

@@ -841,8 +841,11 @@ def run_game(host: str, port: int, name: str, ssh_port: int = 22) -> None:
 
 
 
-REMOTE_AGENT_DIR = "~/.local/share/frame-cyberdeck/agent"
-REMOTE_AGENT = REMOTE_AGENT_DIR + "/frameport_agent.py"
+REMOTE_AGENT_SUBDIR = ".local/share/frame-cyberdeck/agent"
+
+
+def _remote_agent(login: str) -> str:
+    return posixpath.join("/home", login, REMOTE_AGENT_SUBDIR, "frameport_agent.py")
 
 
 def _agent_version(text: str) -> int:
@@ -872,6 +875,7 @@ def agent_sync(host: str, port: int, source: str, ssh_port: int = 22) -> None:
         fail(f"Agent source not found: {source}")
     text = path.read_text(encoding="utf-8", errors="replace")
     local_version = _agent_version(text)
+    remote_agent = _remote_agent(str(current["login"]))
 
     # Never replace a newer agent another FramePort install put on the Frame.
     remote_version = 0
@@ -879,7 +883,7 @@ def agent_sync(host: str, port: int, source: str, ssh_port: int = 22) -> None:
         probe = ssh_command(
             str(current["address"]),
             str(current["login"]),
-            f"grep -m1 '^AGENT_VERSION' {shlex.quote(REMOTE_AGENT)} 2>/dev/null",
+            f"grep -m1 '^AGENT_VERSION' {shlex.quote(remote_agent)} 2>/dev/null",
             port=ssh_port,
             check=False,
         )
@@ -890,7 +894,7 @@ def agent_sync(host: str, port: int, source: str, ssh_port: int = 22) -> None:
     uploaded = False
     if remote_version <= local_version:
         try:
-            _upload_text(current, ssh_port, REMOTE_AGENT, path.read_bytes(), mode=0o700)
+            _upload_text(current, ssh_port, remote_agent, path.read_bytes(), mode=0o700)
         except subprocess.CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
             fail(f"Uploading the FramePort agent failed: {detail}")
@@ -925,7 +929,7 @@ def agent_sync(host: str, port: int, source: str, ssh_port: int = 22) -> None:
     emit(
         {
             "ok": True,
-            "path": REMOTE_AGENT.replace("~", "/home/" + str(current["login"])),
+            "path": remote_agent,
             "agentVersion": local_version,
             "uploaded": uploaded,
             "keptNewerRemote": remote_version > local_version,
@@ -942,10 +946,15 @@ def agent_run(host: str, port: int, command: str, args_json: str, ssh_port: int 
         json.loads(args_json) if args_json else {}
     except ValueError:
         fail("Agent arguments must be JSON")
-    script = f"python3 {REMOTE_AGENT} {command} {shlex.quote(args_json or '{}')}"
+    script = f"python3 {shlex.quote(_remote_agent(str(current['login'])))} {command}"
     try:
         result = ssh_command(
-            str(current["address"]), str(current["login"]), script, port=ssh_port, check=False
+            str(current["address"]),
+            str(current["login"]),
+            script,
+            port=ssh_port,
+            check=False,
+            stdin=args_json or "{}",
         )
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout or str(exc)).strip()
@@ -987,7 +996,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync = sub.add_parser("agent-sync")
     sync.add_argument("--source", required=True)
     run_agent = sub.add_parser("agent-run")
-    run_agent.add_argument("--command", required=True)
+    run_agent.add_argument("--command", dest="agent_command", required=True)
     run_agent.add_argument("--args", default="{}")
     return p
 
@@ -1015,7 +1024,7 @@ def main() -> None:
     elif args.command == "agent-sync":
         agent_sync(args.host, args.port, args.source, args.ssh_port)
     elif args.command == "agent-run":
-        agent_run(args.host, args.port, args.command, args.args, args.ssh_port)
+        agent_run(args.host, args.port, args.agent_command, args.args, args.ssh_port)
     else:
         fail(f"Unknown command: {args.command}")
 

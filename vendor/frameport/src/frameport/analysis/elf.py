@@ -23,10 +23,14 @@ def _elf(data: bytes) -> ELFFile:
 def dynsym_section(elf: ELFFile):
     """The dynamic symbol table, found by section type: some shipped libraries have a scrambled section name table
     (GitHub #349: Transformers Beyond Reality's libOVRPlugin.so calls .dynsym "text"), types and links are intact."""
-    sec = elf.get_section_by_name(".dynsym")
-    if isinstance(sec, SymbolTableSection) and sec["sh_type"] == "SHT_DYNSYM":
-        return sec
-    return next((s for s in elf.iter_sections() if s["sh_type"] == "SHT_DYNSYM"), None)
+    try:
+        sec = elf.get_section_by_name(".dynsym")
+        if isinstance(sec, SymbolTableSection) and sec["sh_type"] == "SHT_DYNSYM":
+            return sec
+        return next((s for s in elf.iter_sections() if s["sh_type"] == "SHT_DYNSYM"), None)
+    except Exception:
+        # Some shipped libraries have stripped or malformed section tables.
+        return None
 
 
 def dynstr_section(elf: ELFFile, dynsym=None):
@@ -38,20 +42,26 @@ def dynstr_section(elf: ELFFile, dynsym=None):
 
 
 def needed(data: bytes) -> list[str]:
-    elf = _elf(data)
-    for sec in elf.iter_sections():
-        if isinstance(sec, DynamicSection):
-            return [t.needed for t in sec.iter_tags() if t.entry.d_tag == "DT_NEEDED"]
+    try:
+        elf = _elf(data)
+        for sec in elf.iter_sections():
+            if isinstance(sec, DynamicSection):
+                return [t.needed for t in sec.iter_tags() if t.entry.d_tag == "DT_NEEDED"]
+    except Exception:
+        return []
     return []
 
 
 def soname(data: bytes) -> str | None:
-    elf = _elf(data)
-    for sec in elf.iter_sections():
-        if isinstance(sec, DynamicSection):
-            for t in sec.iter_tags():
-                if t.entry.d_tag == "DT_SONAME":
-                    return t.soname
+    try:
+        elf = _elf(data)
+        for sec in elf.iter_sections():
+            if isinstance(sec, DynamicSection):
+                for t in sec.iter_tags():
+                    if t.entry.d_tag == "DT_SONAME":
+                        return t.soname
+    except Exception:
+        return None
     return None
 
 

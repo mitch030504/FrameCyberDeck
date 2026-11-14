@@ -46,6 +46,81 @@ ENGINE_SKIP_DIRS = {"ui", "__pycache__"}
 # the upstream manifest and are allowed by --check.
 LOCAL_FILES = {"PIN.json", "MANIFEST.sha256", "README.md", "requirements.txt"}
 
+# Local fixes applied after copying the upstream tree. Keep them small and
+# documented; the manifest is generated after they run.
+VENDOR_PATCHES = [
+    (
+        "src/frameport/analysis/elf.py",
+        """    sec = elf.get_section_by_name(".dynsym")
+    if isinstance(sec, SymbolTableSection) and sec["sh_type"] == "SHT_DYNSYM":
+        return sec
+    return next((s for s in elf.iter_sections() if s["sh_type"] == "SHT_DYNSYM"), None)
+""",
+        """    try:
+        sec = elf.get_section_by_name(".dynsym")
+        if isinstance(sec, SymbolTableSection) and sec["sh_type"] == "SHT_DYNSYM":
+            return sec
+        return next((s for s in elf.iter_sections() if s["sh_type"] == "SHT_DYNSYM"), None)
+    except Exception:
+        # Some shipped libraries have stripped or malformed section tables.
+        return None
+""",
+    ),
+    (
+        "src/frameport/analysis/elf.py",
+        """def needed(data: bytes) -> list[str]:
+    elf = _elf(data)
+    for sec in elf.iter_sections():
+        if isinstance(sec, DynamicSection):
+            return [t.needed for t in sec.iter_tags() if t.entry.d_tag == "DT_NEEDED"]
+    return []
+""",
+        """def needed(data: bytes) -> list[str]:
+    try:
+        elf = _elf(data)
+        for sec in elf.iter_sections():
+            if isinstance(sec, DynamicSection):
+                return [t.needed for t in sec.iter_tags() if t.entry.d_tag == "DT_NEEDED"]
+    except Exception:
+        return []
+    return []
+""",
+    ),
+    (
+        "src/frameport/analysis/elf.py",
+        """def soname(data: bytes) -> str | None:
+    elf = _elf(data)
+    for sec in elf.iter_sections():
+        if isinstance(sec, DynamicSection):
+            for t in sec.iter_tags():
+                if t.entry.d_tag == "DT_SONAME":
+                    return t.soname
+    return None
+""",
+        """def soname(data: bytes) -> str | None:
+    try:
+        elf = _elf(data)
+        for sec in elf.iter_sections():
+            if isinstance(sec, DynamicSection):
+                for t in sec.iter_tags():
+                    if t.entry.d_tag == "DT_SONAME":
+                        return t.soname
+    except Exception:
+        return None
+    return None
+""",
+    ),
+]
+
+
+def apply_vendor_patches() -> None:
+    for relative, old, new in VENDOR_PATCHES:
+        path = VENDOR_DIR / relative
+        text = path.read_text(encoding="utf-8")
+        if old not in text:
+            fail(f"vendored patch no longer applies: {relative}")
+        path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
 
 def fail(message: str) -> None:
     print(f"sync-frameport-engine: {message}", file=sys.stderr)
@@ -119,6 +194,8 @@ def build_tree(upstream: Path) -> None:
         if not source.is_file():
             fail(f"upstream tarball has no {name}")
         shutil.copy2(source, VENDOR_DIR / name)
+
+    apply_vendor_patches()
 
     for name, data in preserved.items():
         (VENDOR_DIR / name).write_bytes(data)
