@@ -1,0 +1,16 @@
+package: com.xrgames.hitman3reloaded
+title: 'HITMAN 3 VR: Reloaded'
+tested_version: 0.0.3469 main-14813cc56
+source_hint: 'HITMAN 3 VR- Reloaded'
+engine: Other
+xr: OpenXR
+status: unsupported
+notes: Vulkan driver crash (freedreno), even without Valve layers.
+details: 'Glacier engine, Vulkan renderer; Quest 3-only title. Release notes: may require a CLEAN install (remove
+  any previous install first).'
+pcvr_alternative: HITMAN World of Assassination (Steam 1659040) PC VR mode, Standard Edition or higher; more content.
+verified:
+  date: '2026-09-28'
+  overport_cli: 1.2.3
+  overport_runtime: 3.4.3-23204ea
+  known_good_sha256: 85e861a56857b56f715d6358d71175814fe50e6e0d7f39997e786748ec795153

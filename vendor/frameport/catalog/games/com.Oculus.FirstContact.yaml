@@ -1,0 +1,19 @@
+package: com.Oculus.FirstContact
+title: First Contact
+status: works
+notes: '32-bit only, runs through FramePort''s 32-bit bridge (experimental). Played in the headset
+  (GitHub #489); the headless launch test ends early, which is expected for the bridge.'
+tested_version: '1.12'
+engine: Unreal
+xr: VrApi
+frame:
+- frame.a32_bridge
+verified:
+  date: '2026-10-25'
+  known_good_sha256: 7b971d70af24ec554994e59f65b2568c5b86a94df04e962699051f267d6358b7
+  app: 1.3.0
+  overport_cli: 1.2.5
+  frame_build: '20261022.6153909'
+  agent: 109
+  issue: 489
+source_hint: com.Oculus.FirstContact

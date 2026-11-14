@@ -1,0 +1,28 @@
+package: cn.vr4p.oculus4xvrplayerov
+title: 4XVR Video Player
+status: works
+notes: 'Native OpenXR GLES video player. 360 theatres/videos (equirect2 layers, which the Frame lacks) are drawn
+  by FrameBridge''s equirect_emul; stable_local/focus_hold stop the menu recentring; scale 0.75 keeps the menu screen
+  at 72 fps (the runtime asks for 4536 px per eye). Confirmed in the headset by the owner (2026-10-01). Its "Internal
+  Storage" list is /sdcard/4XPlayer: send videos with the game page''s "Add videos".'
+details: 'Settings: equirect_emul (GLES worker draws 360 layers into a projection layer), stable_local, focus_hold,
+  scale 0.75; frame.swapchain_limit for its 7680x3840 theatre swapchains. Its hardware decoding mode (Java MediaCodec,
+  Vr4pMediaPlayer; its own FFmpeg is the software path) gets the Frame''s video hardware with frame.hw_video_decode
+  (added 2026-10-09, not yet checked in the headset). swapchain_pool shares extra GLES panel images to avoid the
+  runtime swapchain count cap (#387); host-tested only, menu interaction needs a headset check.'
+tested_version: 2.0.22
+engine: Other
+xr: OpenXR
+frame:
+- frame.hw_video_decode
+adapter:
+  swapchain_pool: 1
+  equirect_emul: 1
+  stable_local: 1
+  focus_hold: 1
+  scale: 0.75
+verified:
+  date: '2026-10-01'
+updated: '2026-10-18'
+min_app: 0.12.1
+source_hint: 4XVR Video Player

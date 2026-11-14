@@ -376,6 +376,8 @@ export interface DependencyAPIRenderer extends DependencyAPI {}
 export interface FrameAPIRenderer {
   runPackage: (packageName: string) => Promise<boolean>
   recordedSourcePackages: () => Promise<string[]>
+  engineStatus: () => Promise<FramePortEngineStatus>
+  enginePrepare: () => Promise<FramePortEngineStatus>
 }
 
 export interface AdbAPIRenderer extends AdbAPI {
@@ -561,8 +563,32 @@ export interface WindowBounds {
 
 export type FrameRefreshRate = 0 | 72 | 80 | 90 | 96 | 108 | 120 | 144
 
+/** Which conversion pipeline builds a Steam Frame APK. */
+export type FrameConversionEngine = 'auto' | 'builtin' | 'frameport'
+
+export interface FramePortEngineTool {
+  name: string
+  installed: boolean
+  version: string | null
+  path: string | null
+  optional?: boolean
+  detail?: string
+}
+
+export interface FramePortEngineStatus {
+  filesReady: boolean
+  venvReady: boolean
+  toolsReady: boolean
+  engineVersion: string | null
+  python: string | null
+  tools: FramePortEngineTool[]
+  error: string | null
+}
+
 export interface FrameConversionSettings {
   refreshRate: FrameRefreshRate
+  /** auto: FramePort when prepared, otherwise the built-in converter. */
+  engine: FrameConversionEngine
 }
 
 export interface Settings {

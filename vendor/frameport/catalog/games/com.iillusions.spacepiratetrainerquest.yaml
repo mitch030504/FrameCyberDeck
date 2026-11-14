@@ -1,0 +1,20 @@
+package: com.iillusions.spacepiratetrainerquest
+title: Space Pirate Trainer Quest
+status: works
+tested_version: '1.97'
+engine: Unity
+xr: VrApi
+frame:
+- frame.unity_text_input
+- frame.unity_runtime_msaa_off
+device:
+- device.text_input_window
+verified:
+  date: '2026-10-04'
+  known_good_sha256: 711d87e6c1fa14fdcdc8bab5792657523d0281b5d904f7f1abafd98f3189d2c0
+  app: 0.6.3
+  overport_cli: 1.2.5
+  frame_build: '20260930.6234839'
+  agent: 35
+  issue: 14
+source_hint: Space Pirate Trainer

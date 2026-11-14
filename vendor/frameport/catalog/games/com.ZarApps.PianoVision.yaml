@@ -1,0 +1,11 @@
+package: com.ZarApps.PianoVision
+title: PianoVision
+status: unsupported
+notes: Starts, but needs camera hand tracking (Android games on the Frame only get hands built from the controllers)
+  and USB MIDI from a piano, which the Frame's Android container doesn't pass through.
+tested_version: 3.0.8
+engine: Unity
+xr: OpenXR
+verified:
+  date: '2026-10-20'
+  issue: 297

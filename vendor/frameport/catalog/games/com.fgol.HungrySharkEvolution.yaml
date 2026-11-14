@@ -1,0 +1,36 @@
+package: com.fgol.HungrySharkEvolution
+title: Hungry Shark Evolution
+status: works
+notes: Phone game (2D). Tested with 14.6.0 installed from an .xapk bundle; cloud sync and Google services don't work.
+tested_version: 14.6.0
+engine: Unity
+xr: '?'
+overport_remove:
+- patch_copy_libraries
+- patch_copy_ovrplugin_vrapi
+- patch_replace_icon_label
+- patch_fix_min_android_sdk
+- patch_generate_config
+- patch_remove_localized_names
+- patch_clean_up_frida
+- patch_oculus_unity
+- patch_oculus_unreal
+- patch_vr_metadata
+- patch_launcher_entry
+- patch_remove_uses_library
+- patch_fix_unreal_crash
+- patch_meta_xr_audio
+- patch_mark_as_debuggable
+- patch_mark_allow_backup
+frame:
+- frame.unity_text_input
+- frame.hw_video_decode
+verified:
+  date: '2026-10-25'
+  known_good_sha256: d912bc914ea396f19e51d1b35777232cb0a4225a5f288870916744fcaacba9b1
+  app: 1.3.1.dev675
+  overport_cli: 1.2.5
+  frame_build: '20261022.6153909'
+  agent: 123
+  issue: 486
+source_hint: Hungry+Shark+Evolution_14.6.0_APKPure

@@ -1,0 +1,17 @@
+package: com.twistedpixelgames.PILO
+title: Marvel's Deadpool VR
+status: works
+notes: 'Unreal (Vulkan): Lepton''s Fossilize layer crashed on uninitialized render-pass pNexts; frame.vk_sanitize
+  fixes it. Confirmed working in the headset by the owner (2026-10-01).'
+details: Needs frame.vk_sanitize (native/vkshim) and frame.swapchain_limit; space warp disabled (32 GiB OVRPlugin
+  game).
+tested_version: 1.0.40.356975.Quest
+engine: Unreal
+xr: OpenXR
+overport_extra:
+- patch_disable_space_warp
+alt_overport:
+- patch_remove_unreal_force_quit
+verified:
+  date: '2026-10-01'
+source_hint: Marvels Deadpool VR

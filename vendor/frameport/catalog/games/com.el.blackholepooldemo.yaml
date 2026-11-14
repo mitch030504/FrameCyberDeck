@@ -1,0 +1,22 @@
+package: com.el.blackholepooldemo
+title: Black Hole Pool
+status: works
+tested_version: 5.3.2
+engine: Unity
+xr: OpenXR
+frame:
+- frame.vivox_audio_route
+- frame.unity_text_input
+device:
+- device.text_input_window
+adapter:
+  haptic_fix: 1
+verified:
+  date: '2026-10-17'
+  known_good_sha256: 17c23df3813324250ec1792d8dc0488dadf0df0a7ccbe33157d88f427889a92e
+  app: 1.2.1
+  overport_cli: 1.2.5
+  frame_build: '20261007.6125817'
+  agent: 96
+  issue: 396
+source_hint: Black Hole Pool

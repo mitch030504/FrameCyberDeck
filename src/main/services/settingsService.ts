@@ -6,6 +6,7 @@ import {
   WindowBounds,
   DownloadProxySettings,
   FrameConversionSettings,
+  FrameConversionEngine,
   FrameRefreshRate
 } from '@shared/types'
 import { sanitizeBaseUri } from '@shared/serverConfig'
@@ -41,7 +42,8 @@ class SettingsService extends EventEmitter implements SettingsAPI {
       existingDownloadAction: 'ask',
       downloadProxy: { ...DEFAULT_DOWNLOAD_PROXY_SETTINGS },
       frameConversion: {
-        refreshRate: 0
+        refreshRate: 0,
+        engine: 'auto'
       }
     }
 
@@ -155,20 +157,27 @@ class SettingsService extends EventEmitter implements SettingsAPI {
   }
 
   getFrameConversionSettings(): FrameConversionSettings {
-    const raw = this.settings.frameConversion ?? { refreshRate: 0 }
+    const raw = this.settings.frameConversion ?? { refreshRate: 0, engine: 'auto' }
     const allowed: FrameRefreshRate[] = [0, 72, 80, 90, 96, 108, 120, 144]
     const refreshRate = allowed.includes(raw.refreshRate as FrameRefreshRate)
       ? (raw.refreshRate as FrameRefreshRate)
       : 0
+    const engines: FrameConversionEngine[] = ['auto', 'builtin', 'frameport']
+    const engine = engines.includes(raw.engine as FrameConversionEngine)
+      ? (raw.engine as FrameConversionEngine)
+      : 'auto'
     return {
-      refreshRate
+      refreshRate,
+      engine
     }
   }
 
   setFrameConversionSettings(settings: FrameConversionSettings): FrameConversionSettings {
     const allowed: FrameRefreshRate[] = [0, 72, 80, 90, 96, 108, 120, 144]
+    const engines: FrameConversionEngine[] = ['auto', 'builtin', 'frameport']
     const normalized: FrameConversionSettings = {
-      refreshRate: allowed.includes(settings.refreshRate) ? settings.refreshRate : 0
+      refreshRate: allowed.includes(settings.refreshRate) ? settings.refreshRate : 0,
+      engine: engines.includes(settings.engine) ? settings.engine : 'auto'
     }
     this.settings.frameConversion = normalized
     this.saveSettings()
@@ -192,7 +201,9 @@ class SettingsService extends EventEmitter implements SettingsAPI {
         const data = readFileSync(this.settingsPath, 'utf-8')
         const loadedSettings = JSON.parse(data)
         this.settings = { ...this.settings, ...loadedSettings }
-        this.settings.downloadProxy = readPersistedDownloadProxySettings(loadedSettings.downloadProxy)
+        this.settings.downloadProxy = readPersistedDownloadProxySettings(
+          loadedSettings.downloadProxy
+        )
         this.settings.frameConversion = this.getFrameConversionSettings()
         console.log('Settings loaded successfully')
       } else {

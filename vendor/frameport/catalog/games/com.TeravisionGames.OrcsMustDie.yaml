@@ -1,0 +1,24 @@
+package: com.TeravisionGames.OrcsMustDie
+title: 'Orcs Must Die: By The Blade'
+status: works
+notes: Perfect at v151
+tested_version: 1.0.164237
+engine: Unreal
+xr: OpenXR
+alt_overport:
+- patch_remove_unreal_force_quit
+frame:
+- frame.unreal_ovrp_entrypoints
+- frame.hw_video_decode
+adapter:
+  equirect_emul: 1
+  haptic_fix: 1
+verified:
+  date: '2026-10-21'
+  known_good_sha256: 11e5d45587277a5edea8be4862c7af19aa5c38445676607c541bc1e471f473ff
+  app: 1.3.0
+  overport_cli: 1.2.5
+  frame_build: '20261015.6141207'
+  agent: 109
+  issue: 453
+source_hint: OrcsMustDie

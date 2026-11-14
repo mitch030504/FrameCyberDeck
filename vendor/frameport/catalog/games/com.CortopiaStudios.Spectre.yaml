@@ -1,0 +1,25 @@
+package: com.CortopiaStudios.Spectre
+title: Spectre
+status: works
+notes: Works since 1.2.1 (the loading screen waited for a Meta analytics request).
+tested_version: 1.0.1.1354
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+- frame.hw_video_decode
+- frame.cortopia_org_id
+device:
+- device.text_input_window
+adapter:
+  haptic_fix: 1
+  scale: 2.0
+verified:
+  date: '2026-10-17'
+  known_good_sha256: a37a5400ef58906b575f6da1649b62ac7ce024eab831fae105457c1d5d12c2de
+  app: 1.2.1
+  overport_cli: 1.2.5
+  frame_build: '20261007.6125817'
+  agent: 96
+  issue: 390
+source_hint: Wonder

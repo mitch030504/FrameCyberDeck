@@ -1,0 +1,14 @@
+package: com.roblox.client
+title: Roblox
+status: unsupported
+notes: Crashes on its first VR frame on the Frame.
+details: SIGSEGV on Roblox's render thread right after it re-creates its eye swapchains (format 37, which the Frame
+  doesn't offer, retried as sRGB 43) — in its own code or inside the runtime's xrBeginFrame. No integrity or login
+  check involved; also needs an online login once it runs.
+tested_version: 2.741.1051
+engine: Other
+xr: OpenXR
+verified:
+  date: '2026-10-04'
+updated: '2026-10-04'
+source_hint: Roblox

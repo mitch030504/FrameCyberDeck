@@ -1,0 +1,12863 @@
+#!/usr/bin/env python3
+"""FramePort agent: runs ON the Steam Frame (SteamOS, python3 stdlib only).
+
+The PC app uploads this file to ~/.local/share/frameport/agent/ and calls:
+    python3 frameport_agent.py <command>        (JSON arguments on stdin, one JSON object on stdout)
+
+Commands: info, prepare, finalize, shortcuts, shortcut_status, launch_test, stop, set_settings, uninstall,
+          install_lepton, list_installed, proton_status, install_proton, prepare_pcvr, finalize_pcvr,
+          controller_models, list_screenshots, delete_screenshots (and more: see the cmd_* functions).
+Streaming: python3 frameport_agent.py _keyboard   (a virtual keyboard: JSON lines on stdin, see keyboard_session)
+           python3 frameport_agent.py _backup_saves|_restore_saves '<json>'  (save backups: tar.gz on stdout/stdin)
+
+Install layout (one Lepton container per game; same as the manual installs from 2026-09):
+    ~/Applications/quest-frame/<pkg>/            anchor: launch.sh, deployment.json, artwork/ (always internal storage)
+    <dest>/<pkg>/lepton-app/{game.apk,obb/}      game files (dest defaults to ~/Applications/quest-frame; another
+                                                 drive: <mount>/FramePort, see `drives`; `move` moves a game)
+    <dest>/<pkg>/lepton-data/                    container data + saves (kept across reinstalls)
+    <dest>/<pkg>/lepton-shaders/, settings.conf, launch.log
+
+PC VR (Oculus Rift) games packed for the Frame (id "rift.<slug>"), run by Proton (ARM64; x86 via FEX in Proton):
+    ~/Applications/quest-frame/<id>/             anchor: launch.sh, deployment.json (kind "pcvr"), artwork/
+    <dest>/<id>/game/                            the Windows game folder
+    <dest>/<id>/revive/                          Revive (ReviveInjector.exe + DLLs)
+    <dest>/<id>/compatdata/                      Proton prefix = saves (kept across reinstalls), launch.log
+"""
+import base64
+import contextlib
+import errno
+import glob
+import hashlib
+import json
+import math
+import os
+import re
+import select
+import shlex
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import zipfile
+import zlib
+from types import SimpleNamespace
+
+try:
+    import fcntl
+except ImportError:  # Windows: pc_revive loads this file for its VDF code only (GitHub #131)
+    fcntl = None
+
+AGENT_VERSION = 129
+HOME = os.path.expanduser("~")
+STEAM = os.path.join(HOME, ".local/share/Steam")
+ANCHORS = os.path.join(HOME, "Applications/quest-frame")
+LEPTON_APPID = "3029110"  # fallback when no appmanifest names Lepton
+PKG_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$")
+VIDEO_CODEC_DIR = os.path.join(HOME, ".local/share/frameport/video-codec")
+VIDEO_CODEC_FILES = ("libstagefrighthw.so", "media_codecs_frameport.xml", "podman.py", "COPYING.FFmpeg")
+# Hardware video decoding (patch frame.hw_video_decode, per game): only launchers of games whose recipe has it put the
+# shared codec's Podman wrapper first on Lepton's PATH (it adds the codec plugin to that game's container). Off for
+# every game: FramePort's setting (VIDEO_CODEC_DIR/disabled); one game: FRAMEPORT_NO_HW_VIDEO=1 in its launch options.
+VIDEO_CODEC_LINE = ('codec_dir="$HOME/.local/share/frameport/video-codec"\n'
+                    '[[ "${FRAMEPORT_NO_HW_VIDEO:-0}" != 0 || -e "$codec_dir/disabled" || '
+                    '! -x "$codec_dir/current/bin/podman" ]] || export PATH="$codec_dir/current/bin:$PATH"')
+HW_VIDEO_PATCH = "frame.hw_video_decode"
+# Who holds the Iris decoder when the game starts: it takes an 8K video only while nothing else has it open, and
+# Steam's own web helper sometimes keeps it (GitHub #437: Batman's 8K cutscenes fell back to software)
+DECODER_USERS_LINE = ('for f in /sys/class/video4linux/video*/name; do grep -qs iris-decoder "$f" && '
+                      'dec=/dev/$(basename "$(dirname "$f")"); done; [[ -z "${dec:-}" ]] || '
+                      'echo "FramePort: hardware video decoder $dec in use by: $(for p in /proc/[0-9]*; do '
+                      'ls -l "$p/fd" 2>/dev/null | grep -q " $dec\\$" && printf "%s(%s) " "$(cat "$p/comm")" '
+                      '"${p#/proc/}"; done)"')
+# earlier codec lines: agent <= 70 (per-game codec extracted from the APK, line in every launcher) and PR #128's
+# shared line (in every Lepton launcher)
+OLD_CODEC_LINES = ('[[ ! -x "$app_dir/frameport-codec/bin/podman" ]] || '
+                   'export PATH="$app_dir/frameport-codec/bin:$PATH"',
+                   'codec_bin="$HOME/.local/share/frameport/video-codec/current/bin"\n'
+                   '[[ ! -x "$codec_bin/podman" ]] || export PATH="$codec_bin:$PATH"')
+# Steam Input's virtual gamepad for 2D Android apps (patch device.steam_gamepad, per game, GitHub #162): Lepton's
+# Android only gets keyboard/pointer/touch from the Wayland seat, so a game never sees a controller. The launcher of a
+# game that has it puts FramePort's own Podman wrapper (PODMAN_WRAPPER, written next to the agent, independent of the
+# video codec) first on Lepton's PATH; for that game's `podman run` it bind-mounts Steam's virtual pads
+# (/dev/input/eventN) and a key layout, then hands on to the next Podman on PATH (the codec wrapper, if that game has
+# it, else Podman itself). LEPTON_ENV_SDL_... = SDL's hint that stops it ignoring Steam's virtual pad (Lepton passes
+# LEPTON_ENV_<NAME> to the app as <NAME>). Off for one game: FRAMEPORT_NO_GAMEPAD=1 in its launch options.
+GAMEPAD_PATCH = "device.steam_gamepad"
+PODMAN_BIN = os.path.join(HOME, ".local/share/frameport/agent/bin")
+# Pads come and go (Steam makes its virtual pad only while the Frame's controllers are awake): the container gets the
+# host's /dev/input at /dev/fp-input, and _gamepad_links keeps /dev/input/eventN links to Steam's pads in step while
+# the game runs (Android's EventHub adds and removes them through inotify; agent v85, before only the pads present at
+# the start were bound).
+OLD_GAMEPAD_LINES = ('[[ "${FRAMEPORT_NO_GAMEPAD:-0}" != 0 ]] || { export FRAMEPORT_GAMEPAD=1 '
+                     'LEPTON_ENV_SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD=1; '
+                     '[[ ! -x "$HOME/.local/share/frameport/agent/bin/podman" ]] || '
+                     'export PATH="$HOME/.local/share/frameport/agent/bin:$PATH"; }',)
+GAMEPAD_LINE = ('[[ "${FRAMEPORT_NO_GAMEPAD:-0}" != 0 ]] || { export FRAMEPORT_GAMEPAD=1 '
+                'LEPTON_ENV_SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD=1; '
+                '[[ ! -x "$HOME/.local/share/frameport/agent/bin/podman" ]] || '
+                'export PATH="$HOME/.local/share/frameport/agent/bin:$PATH"; '
+                'python3 "$HOME/.local/share/frameport/agent/frameport_agent.py" _gamepad_links "$SteamAppId" $$ '
+                '>"$app_dir/gamepad.log" 2>&1 9>&- & }')
+PAD_DIR = "/dev/fp-input"  # the host's /dev/input inside the container
+# "Ignore the laser pointer" (device.steam_gamepad's ignore_pointer, GitHub #162): pointing SteamVR's laser at a 2D
+# app's window sends pointer events into Android through Waydroid's pipe /dev/input/wl_pointer_events (EventHub device
+# "wayland_pointer"), and SDL games then flip between gamepad and mouse prompts. Lepton's hwcomposer.waydroid.so makes
+# that pipe (mkfifo, errors ignored; reopened per event when its end is gone) and Waydroid's patched EventHub
+# (libinputreader.so) opens it by its fixed path, before and without Android's excluded-device names (an
+# excluded-input-devices.xml naming wayland_pointer was read but didn't drop it). The launcher exports
+# FRAMEPORT_GAMEPAD_IGNORE_POINTER=1 and the Podman wrapper binds /dev/null at the pipe's path: the hwcomposer's
+# mkfifo fails (exists), its writes go to /dev/null, and EventHub can't poll /dev/null (epoll_ctl EPERM: "Could not
+# add input device fd to epoll"), so it drops the device. Touch, keyboard and the pads stay.
+POINTER_ENV = "FRAMEPORT_GAMEPAD_IGNORE_POINTER"
+POINTER_PIPE = "/dev/input/wl_pointer_events"
+# System features for a game's Android (patch device.hybrid_app, per game, GitHub #484): Horizon OS "hybrid apps"
+# (YouTube) only leave their 2D panel for VR when the system has oculus.software.vr.app.hybrid. The launcher exports
+# FRAMEPORT_FEATURES (the patch's env) and puts the Podman wrapper on PATH; the wrapper mounts a permissions file that
+# declares them (Android reads /system/etc/permissions at every container start).
+FEATURES_LINE = ('[[ -z "${FRAMEPORT_FEATURES:-}" || ! -x "$HOME/.local/share/frameport/agent/bin/podman" ]] || '
+                 'export PATH="$HOME/.local/share/frameport/agent/bin:$PATH"')
+# a development build's line (also for FRAMEPORT_OFFLINE, when device.offline used --network=none: Lepton's adb install
+# goes through the container's network, so that never started a game)
+OLD_FEATURES_LINES = ('[[ -z "${FRAMEPORT_FEATURES:-}${FRAMEPORT_OFFLINE:-}" || '
+                      '! -x "$HOME/.local/share/frameport/agent/bin/podman" ]] || '
+                      'export PATH="$HOME/.local/share/frameport/agent/bin:$PATH"',)
+FEATURES_TARGET = "/system/etc/permissions/frameport-features.xml"
+
+
+class AgentError(Exception):
+    pass
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, errors="replace", **kw)
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 22), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def check_pkg(pkg):
+    if not pkg or not PKG_RE.match(pkg):
+        raise AgentError(f"bad package name {pkg!r}")
+    return pkg
+
+
+# ------------------------------------------------------------------------------------------ Steam / Lepton discovery
+def steam_libraries():
+    libs = [os.path.join(STEAM, "steamapps")]
+    vdf = os.path.join(STEAM, "steamapps/libraryfolders.vdf")
+    try:
+        for path in re.findall(r'"path"\s+"([^"]+)"', open(vdf, encoding="utf-8", errors="replace").read()):
+            p = os.path.join(path, "steamapps")
+            if p not in libs and os.path.isdir(p):
+                libs.append(p)
+    except OSError:
+        pass
+    return libs
+
+
+def find_app(name_regex):
+    for lib in steam_libraries():
+        for acf in glob.glob(os.path.join(lib, "appmanifest_*.acf")):
+            try:
+                text = open(acf, encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            name = re.search(r'"name"\s+"([^"]*)"', text)
+            if name and re.fullmatch(name_regex, name[1]):
+                appid = re.search(r'"appid"\s+"(\d+)"', text)[1]
+                installdir = re.search(r'"installdir"\s+"([^"]*)"', text)[1]
+                return {"appid": appid, "name": name[1], "dir": os.path.join(lib, "common", installdir)}
+    return None
+
+
+def lepton_path():
+    app = find_app(r"Lepton")
+    candidates = (([os.path.join(app["dir"], "lepton")] if app else [])
+                  + [os.path.join(STEAM, "steamapps/common/Lepton/lepton")])
+    for c in candidates:
+        if os.access(c, os.X_OK):
+            return c, app
+    return None, app
+
+
+def find_app_id(appid):
+    """{appid, name, dir} of an installed app by id (its appmanifest), or None."""
+    for lib in steam_libraries():
+        acf = os.path.join(lib, f"appmanifest_{appid}.acf")
+        try:
+            text = open(acf, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        installdir = re.search(r'"installdir"\s+"([^"]*)"', text)
+        name = re.search(r'"name"\s+"([^"]*)"', text)
+        state = re.search(r'"StateFlags"\s+"(\d+)"', text)
+        d = os.path.join(lib, "common", installdir[1]) if installdir else None
+        num = {k: int(m[1]) for k in ("BytesDownloaded", "BytesToDownload", "SizeOnDisk")
+               for m in [re.search(rf'"{k}"\s+"(\d+)"', text)] if m}
+        return {"appid": str(appid), "name": name[1] if name else "", "dir": d, "state": int(state[1]) if state else 0,
+                "complete": bool(state and int(state[1]) & 4 and d and os.path.isdir(d)),
+                "downloaded": num.get("BytesDownloaded", 0), "to_download": num.get("BytesToDownload", 0)}
+    return None
+
+
+# ------------------------------------------------------------------------------------------ Steam appinfo (binary)
+APPINFO = os.path.join(STEAM, "appcache/appinfo.vdf")
+
+
+def appinfo_entries(want=None, path=APPINFO):
+    """Parse Steam's appinfo.vdf (v28/v29) into {appid: appinfo dict}; only the apps in `want` (or all)."""
+    data = open(path, "rb").read()
+    magic = struct.unpack_from("<I", data, 0)[0]
+    if magic >> 8 != 0x075644 or magic & 0xFF not in (0x28, 0x29):
+        raise AgentError(f"unknown appinfo.vdf version {magic:#x}")
+    v29 = magic & 0xFF == 0x29
+    strings = []
+    end = len(data)
+    if v29:
+        str_off = struct.unpack_from("<q", data, 8)[0]
+        n = struct.unpack_from("<I", data, str_off)[0]
+        p = str_off + 4
+        for _ in range(n):
+            e = data.index(b"\0", p)
+            strings.append(data[p:e].decode("utf-8", "replace"))
+            p = e + 1
+        end = str_off
+
+    def key(p):
+        if v29:
+            return strings[struct.unpack_from("<I", data, p)[0]], p + 4
+        e = data.index(b"\0", p)
+        return data[p:e].decode("utf-8", "replace"), e + 1
+
+    def kv(p):
+        obj = {}
+        while True:
+            t = data[p]
+            p += 1
+            if t == 8:
+                return obj, p
+            k, p = key(p)
+            if t == 0:
+                obj[k], p = kv(p)
+            elif t == 1:
+                e = data.index(b"\0", p)
+                obj[k] = data[p:e].decode("utf-8", "replace")
+                p = e + 1
+            elif t in (2, 3, 4, 6):  # int32, float, pointer, color
+                obj[k] = struct.unpack_from("<f" if t == 3 else "<i", data, p)[0]
+                p += 4
+            elif t in (7, 10):  # uint64 / int64
+                obj[k] = struct.unpack_from("<Q", data, p)[0]
+                p += 8
+            else:
+                raise AgentError(f"unsupported appinfo value type {t}")
+
+    out, p = {}, 16 if v29 else 8
+    while p + 8 <= end:
+        appid, size = struct.unpack_from("<II", data, p)
+        if appid == 0:
+            break
+        body = p + 8
+        if want is None or appid in want:
+            try:
+                obj, _ = kv(body + 60)  # infostate, last updated, pics token, sha1, change number, binary sha1
+                out[appid] = obj.get("appinfo", obj)
+            except (AgentError, IndexError, struct.error, ValueError):
+                pass
+        p = body + size
+    return out
+
+
+def arm64_compat_tools():
+    """Steam compat tools for this device from Valve's ARM64 compat list app (appinfo extended.compat_tools):
+    {name: {appid, display_name, require_tool_appid, aliases, from_oslist}}. Found dynamically (no hardcoded ids)."""
+    best = {}
+    for info in appinfo_entries().values():
+        tools = ((info.get("extended") or {}).get("compat_tools"))
+        if isinstance(tools, dict) and any(k.endswith("-arm64") for k in tools):
+            if len(tools) > len(best):
+                best = tools
+    return best
+
+
+def _compat_entries(keep):
+    """Compat tools from the ARM64 compat list that `keep(name, entry)` selects, newest first, with install state."""
+    out = []
+    for name, t in arm64_compat_tools().items():
+        if not isinstance(t, dict) or "appid" not in t or not keep(name, t):
+            continue
+        app = find_app_id(t["appid"])
+        req = t.get("require_tool_appid")
+        if app and app["complete"]:
+            req = tool_manifest(app["dir"]).get("require_tool_appid") or req
+        req_app = find_app_id(req) if req else None
+        ver = re.findall(r"\d+", name)
+        out.append({"name": name, "appid": int(t["appid"]), "display_name": t.get("display_name", name),
+                    "aliases": t.get("aliases", ""), "experimental": "experimental" in name,
+                    "installed": bool(app and app["complete"]), "dir": app["dir"] if app else None,
+                    "require_tool_appid": int(req) if req else None,
+                    "require_installed": (not req) or bool(req_app and req_app["complete"]),
+                    "require_dir": req_app["dir"] if req_app else None,
+                    "sort": (0 if "experimental" in name else 1, int(ver[0]) if ver else 0)})
+    out.sort(key=lambda t: t.pop("sort"), reverse=True)
+    return out
+
+
+def proton_tools():
+    """Proton builds for Windows games on this (ARM64) device, newest first, with install state."""
+    return _compat_entries(lambda name, t: t.get("from_oslist") == "windows")
+
+
+def linux_x86_tools():
+    """Compat tools that run Linux x86_64 programs on this ARM64 device: FEX-Emu (app "fex" 3127680; its
+    fex-compat-tool runs the program with FEX on SteamOS's x86 guest root /usr/share/guestos/fex-mesa)."""
+    # (the Steam Linux Runtimes are listed as Linux tools too: they are what FEX needs, not a translator)
+    return _compat_entries(lambda name, t: "fex" in f"{name} {t.get('display_name', '')}".lower())
+
+
+def compat_tools(kind):
+    return linux_x86_tools() if kind == "linux_x86" else proton_tools()
+
+
+def pick_tool(kind, tools, wanted=None):
+    if kind != "linux_x86":
+        return pick_proton(tools, wanted)
+    if wanted:
+        return next((t for t in tools if wanted in (t["name"], t["display_name"])), None)
+    ready = [t for t in tools if t["installed"] and t["require_installed"]]
+    return (ready or tools or [None])[0]
+
+
+def tool_manifest(tool_dir):
+    """commandline / require_tool_appid from a compat tool's toolmanifest.vdf (text KeyValues)."""
+    try:
+        text = open(os.path.join(tool_dir, "toolmanifest.vdf"), encoding="utf-8", errors="replace").read()
+    except OSError:
+        return {}
+    out = {}
+    for k in ("commandline", "require_tool_appid", "version"):
+        m = re.search(rf'"{k}"\s+"((?:[^"\\]|\\.)*)"', text)
+        if m:
+            out[k] = m[1].replace('\\"', '"')
+    if "require_tool_appid" in out:
+        out["require_tool_appid"] = int(out["require_tool_appid"])
+    return out
+
+
+def compat_command(tool_dir, verb="waitforexitandrun", depth=0):
+    """argv prefix Steam would run for a compat tool: its required runtime's command first, then the tool's own
+    (e.g. SteamLinuxRuntime_4-arm64/_v2-entry-point --verb=... -- Proton/proton waitforexitandrun)."""
+    man = tool_manifest(tool_dir)
+    cmd = man.get("commandline")
+    if not cmd:
+        raise AgentError(f"no toolmanifest.vdf commandline in {tool_dir}")
+    own = [os.path.join(tool_dir, a.lstrip("/")) if i == 0 else a
+           for i, a in enumerate(shlex.split(cmd.replace("%verb%", verb)))]
+    req = man.get("require_tool_appid")
+    if req and depth < 3:
+        app = find_app_id(req)
+        if not app or not app["complete"]:
+            raise AgentError(f"{os.path.basename(tool_dir)} needs Steam app {req} (runtime), which isn't installed")
+        return compat_command(app["dir"], verb, depth + 1) + own
+    return own
+
+
+def pick_proton(tools, wanted=None):
+    """The Proton build a game uses: the one asked for (name, display name or alias such as proton-experimental),
+    else the newest stable one (owner's choice 2026-10-05 after an A/B in the headset: Rick and Morty felt much
+    smoother on Proton 11 than on Experimental; a game that fails gets "try Proton Experimental" suggested).
+    Returned even when not installed yet: the installer installs it."""
+    def matches(t, w):
+        return w in (t["name"], t["display_name"]) or w in [a.strip() for a in t["aliases"].split(",")]
+    if wanted:
+        return next((t for t in tools if matches(t, wanted)), None)
+    stable = [t for t in tools if not t["experimental"]]
+    ready = [t for t in stable if t["installed"] and t["require_installed"]]
+    return (ready or stable or tools or [None])[0]
+
+
+def openxr_runtime():
+    for d in (os.path.join(HOME, ".config/openxr/1"), "/etc/xdg/openxr/1", "/usr/share/openxr/1"):
+        p = os.path.join(d, "active_runtime.json")
+        if os.path.exists(p):
+            try:
+                return {"path": os.path.realpath(p), "name": json.load(open(p))["runtime"].get("name")}
+            except (OSError, ValueError, KeyError):
+                return {"path": os.path.realpath(p), "name": None}
+    return None
+
+
+def cmd_proton_status(args):
+    """Proton (kind "proton", the default) or the Linux x86_64 tool FEX (kind "linux_x86"): installed or not."""
+    kind = args.get("kind") or "proton"
+    try:
+        tools = compat_tools(kind)
+    except (OSError, AgentError) as exc:
+        return {"tools": [], "ready": None, "error": str(exc), "openxr": openxr_runtime()}
+    ready = pick_tool(kind, tools, args.get("tool"))
+    ok = bool(ready and ready["installed"] and ready["require_installed"])
+    download = {"done": 0, "total": 0}
+    if ready and not ok:
+        for a in (ready["appid"], ready.get("require_tool_appid")):
+            app = find_app_id(a) if a else None
+            if app and not app["complete"]:
+                download["done"] += app["downloaded"]
+                download["total"] += app["to_download"]
+    return {"tools": tools, "ready": ready if ok else None, "suggested": ready, "openxr": openxr_runtime(),
+            "download": download}
+
+
+SELFTEST_DIR = os.path.join(HOME, ".local/share/frameport/proton-selftest")
+
+
+SESSION_VARS = ("DISPLAY", "WAYLAND_DISPLAY", "GAMESCOPE_WAYLAND_DISPLAY", "XAUTHORITY", "XDG_SESSION_TYPE")
+
+
+def session_env():
+    """The display session variables of the running Steam client (gamescope's X/Wayland), for headless launches."""
+    p = run(["pgrep", "-x", "steam"])
+    for pid in p.stdout.split():
+        try:
+            raw = open(f"/proc/{pid}/environ", "rb").read().split(b"\0")
+        except OSError:
+            continue
+        env = dict(kv.decode(errors="replace").split("=", 1) for kv in raw if b"=" in kv)
+        return {k: env[k] for k in SESSION_VARS if k in env}
+    return {}
+
+
+def run_tree(cmd, env, cwd, log_path, timeout):
+    """Run a command in its own process group with output to a file; on timeout kill the whole group (Wine leaves
+    children that keep pipes open, so subprocess.run(timeout=...) would hang). Returns (output, exit code | None)."""
+    import signal
+
+    with open(log_path, "wb") as log:
+        p = subprocess.Popen(cmd, env=env, cwd=cwd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                             start_new_session=True)
+        try:
+            code = p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            code = None
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(p.pid, sig)
+                except ProcessLookupError:
+                    break
+                try:
+                    p.wait(timeout=10)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+    return open(log_path, errors="replace").read(), code
+
+
+def stop_prefix(tool, prefix):
+    """wineserver -k for a Proton prefix (ends every process of that prefix)."""
+    wineserver = next(iter(glob.glob(os.path.join(tool["dir"], "files/bin*/wineserver"))), None)
+    if wineserver and os.path.isdir(prefix):
+        try:
+            run([wineserver, "-k"], env=dict(os.environ, WINEPREFIX=prefix), timeout=20)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def cmd_proton_selftest(args):
+    """Run a Windows program (cmd.exe) under the Frame's Proton, the way FramePort launches PC VR games (SteamGameId
+    set so Proton sets up VR), and report whether it ran and whether wineopenxr was registered as the OpenXR runtime."""
+    tool = pick_proton(proton_tools(), args.get("tool"))
+    if not tool or not (tool["installed"] and tool["require_installed"]):
+        raise AgentError("Proton isn't installed on the Frame yet")
+    os.makedirs(os.path.join(SELFTEST_DIR, "compatdata"), exist_ok=True)
+    appid = str(shortcut_appid("frameport-proton-selftest", "FramePort"))
+    env = dict(os.environ, SteamAppId=appid, STEAM_COMPAT_APP_ID=appid,
+               STEAM_COMPAT_DATA_PATH=os.path.join(SELFTEST_DIR, "compatdata"),
+               STEAM_COMPAT_CLIENT_INSTALL_PATH=STEAM, STEAM_COMPAT_INSTALL_PATH=SELFTEST_DIR,
+               STEAM_COMPAT_LIBRARY_PATHS=SELFTEST_DIR, XDG_RUNTIME_DIR=f"/run/user/{os.getuid()}",
+               PROTON_LOG_DIR=SELFTEST_DIR)
+    for k, v in session_env().items():
+        env.setdefault(k, v)
+    if args.get("vr", True):
+        env["SteamGameId"] = appid  # Proton sets up vrclient/wineopenxr only for "game" processes
+    if args.get("log"):
+        env["PROTON_LOG"] = "1"
+    for k, v in (args.get("env") or {}).items():
+        env[str(k)] = str(v)
+    marker = os.path.join(SELFTEST_DIR, "marker.txt")
+    if os.path.exists(marker):
+        os.remove(marker)
+    cmd = compat_command(tool["dir"], args.get("verb", "waitforexitandrun")) + \
+        ["c:\\windows\\system32\\cmd.exe", "/c", f"echo FRAMEPORT_PROTON_OK>{windows_path(marker)}"]
+    start = time.time()
+    out, code = run_tree(cmd, env, SELFTEST_DIR, os.path.join(SELFTEST_DIR, "selftest.log"),
+                         int(args.get("timeout_s", 600)))
+    stop_prefix(tool, os.path.join(SELFTEST_DIR, "compatdata/pfx"))
+    reg = os.path.join(SELFTEST_DIR, "compatdata/pfx/system.reg")
+    text = open(reg, errors="replace").read() if os.path.exists(reg) else ""
+    m = re.search(r'\[Software\\\\Khronos\\\\OpenXR\\\\1\][^\[]*"ActiveRuntime"="([^"]*)"', text)
+    plog = os.path.join(SELFTEST_DIR, f"steam-{appid}.log")
+    ran = os.path.exists(marker) and "FRAMEPORT_PROTON_OK" in open(marker, errors="replace").read()
+    return {"tool": tool["name"], "ran": ran, "exit_code": code, "proton_log": plog
+            if os.path.exists(plog) else None,
+            "seconds": round(time.time() - start), "openxr_runtime": m[1] if m else None,
+            "prefix_created": bool(text), "log_tail": out[-3000:]}
+
+
+def xr_probe(payload):
+    """(child process) Create an OpenXR instance with XR_KHR_convert_timespec_time through Proton's loader and call
+    xrConvertTimespecTimeToTimeKHR. Prints one JSON line. The layer (if any) is enabled via the environment."""
+    import ctypes as C
+
+    args = json.loads(payload)
+    out = {"loader": args["loader"]}
+    try:
+        xr = C.CDLL(args["loader"])
+        xr.xrGetInstanceProcAddr.argtypes = [C.c_uint64, C.c_char_p, C.POINTER(C.c_void_p)]
+        xr.xrDestroyInstance.argtypes = [C.c_uint64]
+
+        class AppInfo(C.Structure):
+            _fields_ = [("applicationName", C.c_char * 128), ("applicationVersion", C.c_uint32),
+                        ("engineName", C.c_char * 128), ("engineVersion", C.c_uint32), ("apiVersion", C.c_uint64)]
+
+        class CreateInfo(C.Structure):
+            _fields_ = [("type", C.c_int), ("next", C.c_void_p), ("createFlags", C.c_uint64), ("app", AppInfo),
+                        ("layerCount", C.c_uint32), ("layers", C.c_void_p), ("extCount", C.c_uint32),
+                        ("exts", C.POINTER(C.c_char_p))]
+
+        class LayerProps(C.Structure):
+            _fields_ = [("type", C.c_int), ("next", C.c_void_p), ("layerName", C.c_char * 256),
+                        ("specVersion", C.c_uint64), ("layerVersion", C.c_uint32), ("description", C.c_char * 256)]
+
+        n = C.c_uint32()
+        xr.xrEnumerateApiLayerProperties(0, C.byref(n), None)
+        props = (LayerProps * max(n.value, 1))()
+        for p in props:
+            p.type = 1  # XR_TYPE_API_LAYER_PROPERTIES
+        xr.xrEnumerateApiLayerProperties(n.value, C.byref(n), props)
+        out["layers"] = [props[i].layerName.decode() for i in range(n.value)]
+        exts = (C.c_char_p * 1)(b"XR_KHR_convert_timespec_time")
+        ci = CreateInfo(3, None, 0, AppInfo(b"FramePort timefix probe", 1, b"FramePort", 1, 1 << 48), 0, None, 1, exts)
+        inst = C.c_uint64()
+        out["create"] = xr.xrCreateInstance(C.byref(ci), C.byref(inst))
+        if out["create"] == -4:  # the runtime sometimes fails the first attempt (as Proton's own probe sees)
+            out["create"] = xr.xrCreateInstance(C.byref(ci), C.byref(inst))
+        if out["create"] == 0:
+            fn = C.c_void_p()
+            out["proc"] = xr.xrGetInstanceProcAddr(inst.value, b"xrConvertTimespecTimeToTimeKHR", C.byref(fn))
+            if out["proc"] == 0 and fn.value:
+                class Ts(C.Structure):
+                    _fields_ = [("tv_sec", C.c_long), ("tv_nsec", C.c_long)]
+                now = Ts()
+                C.CDLL(None).clock_gettime(1, C.byref(now))
+                t = C.c_int64()
+                conv = C.CFUNCTYPE(C.c_int, C.c_uint64, C.POINTER(Ts), C.POINTER(C.c_int64))(fn.value)
+                out["convert"] = conv(inst.value, C.byref(now), C.byref(t))
+                out["time"] = t.value
+            xr.xrDestroyInstance(inst.value)
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    print(json.dumps(out))
+
+
+def cmd_xr_layer_test(args):
+    """Does the timefix layer fix time conversion on this runtime? Runs xr_probe with Proton's OpenXR loader, without
+    and with the layer (layer_dir = folder with XR_APILAYER_FRAMEPORT_timefix.json)."""
+    tool = pick_proton(proton_tools(), args.get("tool"))
+    loader = next(iter(glob.glob(os.path.join(tool["dir"], "files/lib/aarch64-linux-gnu/libopenxr_loader.so.1")))
+                  if tool and tool.get("dir") else [], None) or "/opt/steamvr/bin/linuxarm64/libopenxr_loader.so"
+    results = {}
+    for name, layer in (("without_layer", None), ("with_layer", args.get("layer_dir"))):
+        if name == "with_layer" and not layer:
+            continue
+        env = dict(os.environ, XDG_RUNTIME_DIR=f"/run/user/{os.getuid()}", XR_LOADER_DEBUG="error")
+        env.pop("XR_API_LAYER_PATH", None)
+        env.pop("XR_ENABLE_API_LAYERS", None)
+        for k, v in session_env().items():
+            env.setdefault(k, v)
+        if layer:
+            env.update(XR_API_LAYER_PATH=os.path.expanduser(layer), XR_ENABLE_API_LAYERS=XR_LAYER)
+        try:
+            p = run([sys.executable, os.path.abspath(__file__), "_xr_probe", json.dumps({"loader": loader})],
+                    env=env, timeout=60)
+            line = next((ln for ln in reversed(p.stdout.splitlines()) if ln.startswith("{")), None)
+            results[name] = json.loads(line) if line else {"error": (p.stderr or p.stdout)[-800:]}
+        except subprocess.TimeoutExpired:
+            results[name] = {"error": "timed out"}
+    return results
+
+
+def write_stub_manifest(appid, name, installdir, lib=None):
+    """An appmanifest with StateFlags 'update required': Steam downloads the app on its next start."""
+    lib = lib or os.path.join(STEAM, "steamapps")
+    path = os.path.join(lib, f"appmanifest_{appid}.acf")
+    if os.path.exists(path):
+        return False
+    text = ('"AppState"\n{\n' + "".join(f'\t"{k}"\t\t"{v}"\n' for k, v in (
+        ("appid", appid), ("Universe", 1), ("name", name), ("StateFlags", 1026), ("installdir", installdir),
+        ("AutoUpdateBehavior", 0))) + "}\n")
+    with open(path + ".tmp", "w") as f:
+        f.write(text)
+    os.replace(path + ".tmp", path)
+    return True
+
+
+def cmd_install_proton(args):
+    """Install Proton for Windows games (plus the Steam Linux Runtime it needs). mode "request" asks Steam
+    (steam://install; the user confirms in the headset); mode "unattended" writes appmanifest stubs and restarts
+    Steam so it downloads them by itself. kind "linux_x86": FEX (+ its runtime) for x86_64 Linux apps instead."""
+    kind = args.get("kind") or "proton"
+    tools = compat_tools(kind)
+    tool = pick_tool(kind, tools, args.get("tool"))
+    if not tool:
+        raise AgentError("this Steam has no ARM64 Proton in its compat list (update SteamOS/Steam)" if kind == "proton"
+                         else "this Steam has no x86 translation tool (FEX) in its compat list (update SteamOS/Steam)")
+    need = [a for a, ok in ((tool["appid"], tool["installed"]),
+                            (tool["require_tool_appid"], tool["require_installed"])) if a and not ok]
+    if not need:
+        return {"tool": tool["name"], "installed": True, "requested": []}
+    if args.get("mode") == "unattended":
+        info = appinfo_entries(set(need))
+        stubs = []
+        for a in need:
+            common = (info.get(a) or {}).get("common") or {}
+            installdir = ((info.get(a) or {}).get("config") or {}).get("installdir")
+            if not installdir:
+                raise AgentError(f"Steam's app cache has no install folder for app {a}")
+            stubs.append({"appid": a, "name": common.get("name", str(a)), "installdir": installdir})
+        payload = json.dumps({"stubs": stubs})
+        unit = f"frameport-tools-{int(time.time())}"
+        run(["systemd-run", "--user", "--collect", "--quiet", f"--unit={unit}", "--setenv=HOME=" + HOME,
+             sys.executable, os.path.abspath(__file__), "_tools_worker", payload])
+        return {"tool": tool["name"], "installed": False, "requested": need, "mode": "unattended", "unit": unit,
+                "hint": f"Steam restarts once and downloads {tool['display_name']} in the background "
+                        "(a few hundred MB)."}
+    for a in need:
+        subprocess.Popen(["steam", "-ifrunning", f"steam://install/{a}"], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    return {"tool": tool["name"], "installed": False, "requested": need, "mode": "request",
+            "hint": "Put the headset on and confirm the install in Steam (one dialog per item)."}
+
+
+def stop_steam():
+    service = run(["systemctl", "--user", "is-active", "--quiet", "steam.service"]).returncode == 0
+    if service:
+        run(["systemctl", "--user", "stop", "steam.service"])
+    else:
+        run(["steam", "-shutdown"])
+    for _ in range(40):
+        if run(["pgrep", "-x", "steam"]).returncode:
+            break
+        time.sleep(1)
+    if run(["pgrep", "-x", "steam"]).returncode == 0:
+        raise AgentError("Steam did not close")
+    for _ in range(15):  # Steam's helpers can still be writing its config (shortcuts.vdf) for a moment
+        if run(["pgrep", "-f", "steamwebhelper|steam.sh|reaper SteamLaunch"]).returncode:
+            break
+        time.sleep(1)
+    time.sleep(2)
+    return service
+
+
+def start_steam(service):
+    if service:
+        run(["systemctl", "--user", "start", "steam.service"])
+    else:
+        subprocess.Popen(["systemd-run", "--user", "--collect", f"--unit=frameport-steam-{int(time.time())}",
+                          "/usr/bin/steam"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def tools_worker(payload):
+    args = json.loads(payload)
+    service = True
+    try:
+        service = stop_steam()
+        for st in args["stubs"]:
+            write_stub_manifest(st["appid"], st["name"], st["installdir"])
+    finally:
+        start_steam(service)
+
+
+def steam_users():
+    return sorted(d for d in os.listdir(os.path.join(STEAM, "userdata")) if d.isdigit() and d != "0") \
+        if os.path.isdir(os.path.join(STEAM, "userdata")) else []
+
+
+STEAMID64_BASE = 76561197960265728
+
+
+def active_steam_user():
+    """userdata folder (account id) of the most recent Steam login (config/loginusers.vdf), if it has one."""
+    try:
+        text = open(os.path.join(STEAM, "config/loginusers.vdf"), encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None
+    users = steam_users()
+    for sid, body in re.findall(r'"(\d{17})"\s*\{([^}]*)\}', text):
+        if re.search(r'"MostRecent"\s+"1"', body) and str(int(sid) - STEAMID64_BASE) in users:
+            return str(int(sid) - STEAMID64_BASE)
+    return None
+
+
+def library_users():
+    """Steam accounts whose library gets FramePort's shortcuts: every account on the Frame, the signed-in one first
+    (loginusers.vdf's MostRecent isn't always the account signed in on the Frame: GitHub #4/#21 got shortcuts in the
+    other account; an extra shortcut in an unused account does no harm)."""
+    users = steam_users()
+    if not users:
+        raise AgentError("Steam has no signed-in account on this Frame yet; sign in to Steam on the Frame first")
+    active = active_steam_user()
+    return [active] + [u for u in users if u != active] if active else users
+
+
+def shortcut_appid_for(exe):
+    """appid of the shortcut whose Exe is `exe` in the signed-in account's library (any account if unknown); None
+    when it isn't in the library."""
+    for u in library_users():
+        vdf = os.path.join(STEAM, "userdata", u, "config/shortcuts.vdf")
+        try:
+            root = vdf_decode(open(vdf, "rb").read()) if os.path.exists(vdf) else {}
+        except (OSError, AgentError):
+            continue
+        for v in (root.get("shortcuts") or {}).values():
+            if isinstance(v, dict) and v.get("Exe") == exe and v.get("appid"):
+                return v["appid"] & 0xFFFFFFFF
+    return None
+
+
+def container_running(appid):
+    p = run(["podman", "ps", "--format", "{{.Names}}"])
+    return f"lepton-steamlaunch-{appid}" in p.stdout.split()
+
+
+CONTAINERS_CONF = os.path.join(HOME, ".config/containers/containers.conf")
+
+
+def ensure_host_fixes():
+    """Rootless podman (used by Lepton) leaks one kernel session keyring per container start; after ~200 launches
+    since boot every game fails with 'crun: create keyring ...: Disk quota exceeded'. keyring=false stops that."""
+    changed = []
+    text = open(CONTAINERS_CONF).read() if os.path.exists(CONTAINERS_CONF) else ""
+    if not re.search(r"^\s*keyring\s*=", text, re.M):
+        note = "# FramePort: stop rootless podman leaking a kernel keyring per container start (Lepton launches)\n"
+        if re.search(r"^\[containers\]\s*$", text, re.M):
+            text = re.sub(r"^\[containers\]\s*$", "[containers]\n" + note + "keyring = false", text, count=1,
+                          flags=re.M)
+        else:
+            sep = "\n" if text and not text.endswith("\n") else ""
+            text = text + sep + "[containers]\n" + note + "keyring = false\n"
+        os.makedirs(os.path.dirname(CONTAINERS_CONF), exist_ok=True)
+        with open(CONTAINERS_CONF, "w") as f:
+            f.write(text)
+        changed.append("podman keyring=false")
+    try:
+        ensure_podman_wrapper()  # used only by launchers with the gamepad line (device.steam_gamepad)
+    except OSError:
+        pass
+    try:
+        ensure_lepton_shims()  # the readlink launchers' time zone line uses (written quietly, GitHub #429)
+    except OSError:
+        pass
+    try:
+        upgraded = upgrade_launchers()
+    except Exception:  # noqa: BLE001
+        upgraded = []
+    if upgraded:
+        changed.append(f"launchers: exit watchdog, dashboard, play log ({len(upgraded)})")
+    try:
+        theater = theater_settle()  # a worker killed with its game left auto-theater off
+    except Exception:  # noqa: BLE001
+        theater = None
+    if theater:
+        changed.append(f"SteamVR {theater}")
+    try:
+        old = remove_old_codec_dirs()
+    except Exception:  # noqa: BLE001
+        old = []
+    if old:
+        changed.append(f"per-game video codec folders removed ({len(old)})")
+    try:
+        entries = refresh_desktop_entries()
+    except Exception:  # noqa: BLE001
+        entries = []
+    if entries:
+        changed.append(f"Desktop Mode entries ({len(entries)})")
+    try:
+        overlays = overlay_registrations()
+    except Exception:  # noqa: BLE001
+        overlays = []
+    if overlays:
+        changed.append(f"SteamVR overlay apps registered ({len(overlays)})")
+    try:
+        service = ensure_overlay_service()
+    except Exception:  # noqa: BLE001
+        service = None
+    if service:
+        changed.append(f"overlay autostart service {service}")
+    return changed
+
+
+def key_usage():
+    try:
+        for line in open("/proc/key-users"):
+            f = line.split()
+            if f[0].rstrip(":") == str(os.getuid()):
+                used, limit = f[3].split("/")
+                return {"keys": int(used), "max_keys": int(limit)}
+    except (OSError, ValueError, IndexError):
+        pass
+    return {}
+
+
+POWER_SUPPLY = "/sys/class/power_supply"
+CHARGER_TYPES = ("Mains", "USB", "USB_C", "USB_PD", "USB_PD_DRP", "USB_DCP", "USB_CDP", "USB_ACA", "Wireless")
+
+
+def battery_state():
+    """The Frame's battery: {"percent", "status" (Charging/Discharging/Full/Not charging), "plugged", "draining"};
+    None without one. "plugged" = a charger reports online (or the battery says it's charging/full); "draining" = the
+    battery's own gauge says Discharging (with a charger: it supplies less than the Frame uses, or just booted).
+    On the Frame (2026-10-03): max1720x_bat (Battery), pm8550b-charger (Unknown), tcpm …typec (USB, online=1)."""
+    def read(path):
+        try:
+            with open(path) as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+    battery, plugged = None, False
+    try:
+        names = sorted(os.listdir(POWER_SUPPLY))
+    except OSError:
+        return None
+    for name in names:
+        d = os.path.join(POWER_SUPPLY, name)
+        kind = read(os.path.join(d, "type"))
+        if kind == "Battery" and battery is None and read(os.path.join(d, "capacity")).isdigit():
+            battery = {"percent": int(read(os.path.join(d, "capacity"))), "status": read(os.path.join(d, "status"))}
+        elif kind in CHARGER_TYPES and read(os.path.join(d, "online")) == "1":
+            plugged = True
+    if battery is not None:
+        battery["plugged"] = plugged or battery["status"] in ("Charging", "Full")
+        battery["draining"] = battery["status"] == "Discharging"
+        battery["gauge_percent"] = battery["percent"]
+        battery["percent"] = steam_battery_percent(battery["percent"])
+    return battery
+
+
+BATTERY_SCALE = os.path.join(HOME, ".cache/frameport-battery-scale.json")
+
+
+def steam_battery_percent(gauge):
+    """The battery level as Steam shows it in the headset. Steam's level (SteamClient.System battery state) is the
+    fuel gauge's capacity rescaled (41 % in sysfs = 45 % in Steam, 77 % = 85 %: about /0.9, GitHub #414), so the app
+    showed less than the headset. Steam's value is read at most every 2 minutes (cached in a file: `info` runs in a
+    new agent process each time) and its ratio to the gauge then applied; without Steam the gauge's own value."""
+    if gauge is None:
+        return None
+    now = time.time()
+    try:
+        with open(BATTERY_SCALE) as f:
+            cached = json.load(f)
+    except (OSError, ValueError):
+        cached = {}
+    if now - float(cached.get("time", 0)) > 120:
+        cached = {"time": now, "ratio": None}
+        try:
+            level = steam_js("new Promise(r=>{let h;h=SteamClient.System.RegisterForBatteryStateChanges(s=>{"
+                             "try{h&&h.unregister()}catch(e){};r(s.flLevel)});setTimeout(()=>r(null),1500)})",
+                             timeout=2)
+            if isinstance(level, (int, float)) and 0 < level <= 1 and gauge > 0:
+                cached["ratio"] = level * 100 / gauge
+        except Exception:  # noqa: BLE001 (Steam not running, devtools off: the gauge's value)
+            pass
+        try:
+            os.makedirs(os.path.dirname(BATTERY_SCALE), exist_ok=True)
+            with open(BATTERY_SCALE, "w") as f:
+                json.dump(cached, f)
+        except OSError:
+            pass
+    ratio = cached.get("ratio")
+    if not ratio or not 0.8 <= ratio <= 1.25:  # a stale or odd reading: never show something wildly off
+        return gauge
+    return max(0, min(100, int(gauge * ratio + 0.5)))
+
+
+BOOT_STATE = os.path.join(HOME, ".cache/frameport-boot.json")
+# what the last lines of a boot's journal say when it was shut down or rebooted on purpose (a crash, a GPU hang that
+# reset the Frame or a pulled battery leaves none of these)
+CLEAN_SHUTDOWN = ("Reached target System Power Off", "Reached target System Reboot", "Reached target Shutdown",
+                  "System is powering down", "System is rebooting", "systemd-shutdown", "Power-Off", "Rebooting.")
+
+
+# Why the Frame's power chip (Qualcomm PMIC) started this boot and how the previous one ended: the kernel's PON driver
+# logs it once at boot. Two formats seen: the #598 zip's `qcom-pon c400000.spmi:pmic@0:pon@1300: PON: trigger: SPML`
+# (sic: SMPL, "sudden momentary power loss") with `PON_PON_REASON1 0x02` lines, and kernel 6.18 / SteamOS 0.5.6's
+# `PON: trigger [0x80]: KPDPWR_N`, `PON: warm_reset_reason [0x02]: RESIN_N`, `PON: poff_reason [0x02]: PS_HOLD`,
+# `PON: off_reason [0x80]: POFF_SEQ`, `PON: fault_reason1 [0x00]: none` (no device prefix). A sudden power loss (SMPL;
+# UVLO = the battery voltage fell too low) in the trigger, the power-off or the fault reasons means the previous boot
+# ended without power, not by a game crash (GitHub #598). Kinds: power_loss, power_key (pressed), hard_reset (power key
+# held / PMIC reset), charger (plugged in), reboot (PS_HOLD: software reset), other.
+PON_LOSS = ("SMPL", "SPML", "UVLO")
+PON_TRIGGERS = (("power_loss", PON_LOSS), ("power_key", ("KPDPWR",)),
+                ("hard_reset", ("HARD RESET", "HARD_RESET")), ("charger", ("USB_CHG", "DC_CHG", "CBLPWR")),
+                ("reboot", ("PS_HOLD", "PSHOLD", "WARM")))
+# PON_PON_REASON1 bits (Qualcomm PMICs): 0 hard reset, 1 SMPL, 2 RTC, 3 DC charger, 4 USB charger, 5 PON1,
+# 6 cable power, 7 power key
+PON_REASON_BITS = ((1, "SMPL", "power_loss"), (7, "KPDPWR_N", "power_key"), (0, "HARD_RESET", "hard_reset"),
+                   (4, "USB_CHG", "charger"), (3, "DC_CHG", "charger"), (6, "CBLPWR_N", "charger"))
+PON_FIELD_RE = re.compile(r"\bPON: ([a-z_]+[0-9]*)(?: \[(0x[0-9a-fA-F]+)\])?: ([^\r\n]+)")
+PON_REASON1_RE = re.compile(r"\bPON_PON_REASON1 (0x[0-9a-fA-F]+)")
+
+
+def pon_reason(text):
+    """{"kind", "trigger", "poff_reason", "fault_reason"} from a boot's kernel log (its PON lines), or None when it
+    has none. The kind is power_loss when the trigger or a power-off/fault reason names one, else the trigger's."""
+    fields = {}
+    for m in PON_FIELD_RE.finditer(text or ""):
+        fields.setdefault(m.group(1).lower(), m.group(3).strip())
+    trigger = fields.get("trigger")
+    if trigger is None:
+        m = PON_REASON1_RE.search(text or "")
+        if m:
+            bits = int(m.group(1), 16)
+            trigger = next((name for bit, name, _kind in PON_REASON_BITS if bits >> bit & 1), m.group(1))
+    faults = [v for k, v in fields.items() if k.startswith("fault_reason") and v.lower() != "none"]
+    if trigger is None and not faults and "poff_reason" not in fields:
+        return None
+    ended = " ".join([fields.get("poff_reason", ""), *faults]).upper()
+    upper = (trigger or "").upper()
+    if any(w in upper or w in ended for w in PON_LOSS):
+        kind = "power_loss"
+    else:
+        kind = next((k for k, words in PON_TRIGGERS if any(w in upper for w in words)), "other")
+    return {"kind": kind, "trigger": trigger, "poff_reason": fields.get("poff_reason"),
+            "fault_reason": ", ".join(faults) or None}
+
+
+def boot_pon_reason():
+    """pon_reason of this boot's kernel log (journalctl -k -b 0; the lines come early: it reads at most the first
+    20000 lines and stops 200 lines after the first PON line), or None."""
+    try:
+        proc = subprocess.Popen(["journalctl", "-k", "-b", "0", "-q", "--no-pager", "-o", "cat"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace")
+    except OSError:
+        return None
+    lines, first = [], None
+    try:
+        for i, line in enumerate(proc.stdout):
+            if "PON: " in line or "PON_PON_REASON1" in line:
+                lines.append(line)
+                first = i if first is None else first
+            if i > 20000 or (first is not None and i - first > 200):
+                break
+    finally:
+        proc.kill()
+        proc.wait()
+    return pon_reason("".join(lines))
+
+
+def boot_state():
+    """This boot and how the previous one ended: {"boot_id", "boot_time", "prev_clean" (True/False/None = unknown),
+    "prev_reason" (from the power chip: pon_reason's kind, e.g. "power_loss", or None), "pon_trigger",
+    "pon_poff_reason", "pon_fault_reason" (its words), "last_launch" ({"package", "title", "time"}: the FramePort
+    game started last before this boot)}. Worked out once per boot (cached), so the app can say "your Frame restarted
+    while <game> was running" (or that it lost power). An unknown power-on reason is read again by a newer agent and
+    during a boot's first 5 minutes (the kernel log may not be in the journal yet)."""
+    try:
+        boot_id = open("/proc/sys/kernel/random/boot_id").read().strip()
+    except OSError:
+        return None
+    try:
+        cached = json.load(open(BOOT_STATE))
+        if cached.get("boot_id") == boot_id and "prev_reason" in cached:  # (agent <= 125 had no prev_reason)
+            if cached.get("prev_reason") is not None or (cached.get("pon_agent") == AGENT_VERSION and
+                                                         time.time() - (cached.get("boot_time") or 0) > 300):
+                return cached
+            return save_boot_state({**cached, **pon_fields(boot_pon_reason())})
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    boot_time = None
+    try:
+        for line in open("/proc/stat"):
+            if line.startswith("btime "):
+                boot_time = int(line.split()[1])
+    except OSError:
+        pass
+    try:
+        tail = run(["journalctl", "-b", "-1", "-n", "120", "-q", "--no-pager", "-o", "cat"]).stdout
+    except OSError:
+        tail = ""
+    prev_clean = any(m in tail for m in CLEAN_SHUTDOWN) if tail.strip() else None
+    last = None
+    for d in cmd_list_installed({})["games"]:
+        log = os.path.join(d["base"], "launch.log")
+        try:
+            t = os.path.getmtime(log)
+        except OSError:
+            continue
+        if (boot_time is None or t < boot_time) and (last is None or t > last["time"]):
+            last = {"package": d["package"], "title": d.get("title") or d["package"], "time": t}
+    return save_boot_state({"boot_id": boot_id, "boot_time": boot_time, "prev_clean": prev_clean,
+                            **pon_fields(boot_pon_reason()), "last_launch": last})
+
+
+def pon_fields(pon):
+    pon = pon or {}
+    return {"prev_reason": pon.get("kind"), "pon_trigger": pon.get("trigger"),
+            "pon_poff_reason": pon.get("poff_reason"), "pon_fault_reason": pon.get("fault_reason"),
+            "pon_agent": AGENT_VERSION}
+
+
+def save_boot_state(state):
+    try:
+        os.makedirs(os.path.dirname(BOOT_STATE), exist_ok=True)
+        with open(BOOT_STATE, "w") as f:
+            json.dump(state, f)
+    except OSError:
+        pass
+    return state
+
+
+def cmd_battery(args):
+    return {"battery": battery_state()}
+
+
+def cmd_info(args):
+    lepton, app = lepton_path()
+    osr = {}
+    try:
+        for line in open("/etc/os-release"):
+            k, _, v = line.strip().partition("=")
+            osr[k] = v.strip('"')
+    except OSError:
+        pass
+    st = os.statvfs(HOME)
+    return {
+        "agent_version": AGENT_VERSION, "hostname": os.uname().nodename, "arch": os.uname().machine,
+        "os": osr.get("NAME"), "os_version": osr.get("VERSION_ID"), "build_id": osr.get("BUILD_ID"),
+        "lepton": lepton, "lepton_app": app, "lepton_dev": find_app(r"Lepton Development"),
+        "steam_users": steam_users(), "free_bytes": st.f_bavail * st.f_frsize,
+        "installed": cmd_list_installed({})["games"],
+        "steam_running": run(["pgrep", "-x", "steam"]).returncode == 0,
+        "host_fixes": ensure_host_fixes(), "kernel_keys": key_usage(),
+        "proton": cmd_proton_status({}) if args.get("proton", True) else None,
+        "boot": boot_state(),
+        "battery": battery_state(),
+    }
+
+
+def cmd_install_lepton(args):
+    """Ask Steam to install Lepton (requires Developer Mode)."""
+    lepton, app = lepton_path()
+    if lepton:
+        return {"installed": True, "path": lepton}
+    appid = (app or {}).get("appid") or args.get("appid") or LEPTON_APPID
+    subprocess.Popen(["steam", f"steam://install/{appid}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    return {"installed": False, "requested": appid,
+            "hint": "Enable Developer Mode, then confirm the install in Steam (or launch 'Lepton Development' once)."}
+
+
+# ------------------------------------------------------------------------------------- Steam shortcuts (binary VDF)
+TYPE_MAP, TYPE_STRING, TYPE_INT, TYPE_END = 0, 1, 2, 8
+
+
+def shortcut_appid(exe, title):
+    return zlib.crc32((exe + title).encode("utf-8")) | 0x80000000
+
+
+class VdfMap(dict):
+    """Steam's KeyValues names are case-insensitive; keep their spelling when writing back (#263)."""
+
+    def _key(self, key):
+        return next((k for k in self if k.casefold() == key.casefold()), key)
+
+    def __contains__(self, key):
+        return super().__contains__(self._key(key))
+
+    def __getitem__(self, key):
+        return super().__getitem__(self._key(key))
+
+    def __setitem__(self, key, value):
+        super().__setitem__(self._key(key), value)
+
+    def get(self, key, default=None):
+        return super().get(self._key(key), default)
+
+    def setdefault(self, key, default=None):
+        return super().setdefault(self._key(key), default)
+
+    def update(self, *args, **kwargs):
+        for key, value in dict(*args, **kwargs).items():
+            self[key] = value
+
+
+def vdf_decode(data):
+    pos = 0
+
+    def cstring():
+        nonlocal pos
+        end = data.index(b"\0", pos)
+        value = data[pos:end].decode("utf-8", "surrogateescape")
+        pos = end + 1
+        return value
+
+    def node():
+        nonlocal pos
+        out = VdfMap()
+        while True:
+            kind = data[pos]
+            pos += 1
+            if kind == TYPE_END:
+                return out
+            key = cstring()
+            if kind == TYPE_MAP:
+                value = node()
+            elif kind == TYPE_STRING:
+                value = cstring()
+            elif kind == TYPE_INT:
+                value = struct.unpack_from("<I", data, pos)[0]
+                pos += 4
+            else:
+                raise AgentError(f"unsupported VDF value type {kind}; not modifying shortcuts.vdf")
+            if key in out:
+                old_key = out._key(key)
+                # Older agents wrote lowercase twins of Steam's capitalized keys. Keep their position.
+                if key[:1].isupper() and not old_key[:1].isupper():
+                    out = VdfMap((key if k == old_key else k, v) for k, v in out.items())
+            out[key] = value
+
+    root = node()
+    if any(b != TYPE_END for b in data[pos:]):
+        raise AgentError("unexpected trailing data in shortcuts.vdf; not modifying it")
+    return root
+
+
+def vdf_encode(obj):
+    out = bytearray()
+    for key, value in obj.items():
+        name = key.encode("utf-8", "surrogateescape") + b"\0"
+        if isinstance(value, dict):
+            out += bytes([TYPE_MAP]) + name + vdf_encode(value)
+        elif isinstance(value, str):
+            out += bytes([TYPE_STRING]) + name + value.encode("utf-8", "surrogateescape") + b"\0"
+        else:
+            out += bytes([TYPE_INT]) + name + struct.pack("<I", value & 0xFFFFFFFF)
+    return bytes(out) + bytes([TYPE_END])
+
+
+def upsert_shortcut(vdf_path, exe, title, start_dir, icon="", tag="Quest on Frame", launch_options="", tags=None,
+                    openvr=True, write=True):
+    """Add/update a non-Steam shortcut (matched by Exe, so its appid never changes). `tags` (genres, the user's tags)
+    are merged with tags already on the shortcut, so ones set in Steam are kept. write=False: change nothing, return
+    (appid, whether shortcuts.vdf would change)."""
+    data = open(vdf_path, "rb").read() if os.path.exists(vdf_path) else b""
+    root = vdf_decode(data) if data else {"shortcuts": {}}
+    shortcuts = root.setdefault("shortcuts", {})
+    # matched by Exe; a launcher many games share (Revive's injector on a PC) also by the game in its launch options,
+    # or two Revive games overwrote each other's shortcut
+    shared = "reviveinjector" in exe.lower()
+
+    def game_of(options):  # the game's program in the injector's arguments (its flags may change)
+        found = re.findall(r'"([^"]+\.exe)"|(\S+\.exe)', options or "", re.IGNORECASE)
+        return (found[-1][0] or found[-1][1]).lower() if found else (options or "")
+    entry = next((v for v in shortcuts.values() if isinstance(v, dict) and v.get("Exe") == exe
+                  and (not shared or game_of(v.get("LaunchOptions", "")) == game_of(launch_options))), None)
+    ident = entry["appid"] if entry else shortcut_appid(exe, title)
+    if entry is None:
+        entry = {"appid": ident, "LastPlayTime": 0, "tags": {"0": tag}}
+        shortcuts[str(max([int(k) for k in shortcuts if k.isdigit()] + [-1]) + 1)] = entry
+    if tags:
+        have = [v for v in (entry.get("tags") or {}).values() if isinstance(v, str)]
+        merged = list(dict.fromkeys(have + [t for t in [tag] + list(tags) if t]))
+        entry["tags"] = {str(i): t for i, t in enumerate(merged)}
+    entry.update(appname=title, Exe=exe, StartDir=start_dir, icon=icon or entry.get("icon", ""), ShortcutPath="",
+                 LaunchOptions=launch_options, IsHidden=0, AllowDesktopConfig=1, AllowOverlay=1,
+                 OpenVR=1 if openvr else 0, Devkit=0, DevkitGameID="", DevkitOverrideAppID=0, FlatpakAppID="")
+    if not write:
+        return ident, vdf_encode(root) != data
+    if data:
+        backup_vdf(vdf_path)
+    os.makedirs(os.path.dirname(vdf_path), exist_ok=True)
+    tmp = vdf_path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(vdf_encode(root))
+    os.replace(tmp, vdf_path)
+    return ident
+
+
+def prune_shortcuts(vdf_path, title, keep_exe, tag):
+    """Remove FramePort-tagged shortcuts for `title` whose Exe differs from keep_exe (a reinstall that changed the
+    launch command, e.g. Revive -> direct, would otherwise leave the old, crashing shortcut behind). Returns the
+    removed appids."""
+    if not os.path.exists(vdf_path):
+        return []
+    tags = (tag,) if isinstance(tag, str) else tuple(tag)  # one tag, or several (current + earlier names)
+    root = vdf_decode(open(vdf_path, "rb").read())
+    sc = root.get("shortcuts", {})
+
+    def stale(v):
+        return (isinstance(v, dict) and v.get("appname") == title and v.get("Exe") != keep_exe
+                and any(t in (v.get("tags") or {}).values() for t in tags))
+    removed = [v.get("appid") for v in sc.values() if stale(v)]
+    if not removed:
+        return []
+    keep = [v for v in sc.values() if not stale(v)]
+    root["shortcuts"] = {str(i): v for i, v in enumerate(keep)}
+    backup_vdf(vdf_path)
+    with open(vdf_path + ".tmp", "wb") as f:
+        f.write(vdf_encode(root))
+    os.replace(vdf_path + ".tmp", vdf_path)
+    return removed
+
+
+VDF_BACKUPS = 5
+
+
+def backup_vdf(vdf_path):
+    """Keep a copy before changing shortcuts.vdf (the last VDF_BACKUPS are kept)."""
+    shutil.copy2(vdf_path, f"{vdf_path}.backup-{time.strftime('%Y%m%d-%H%M%S')}")
+    for old in sorted(glob.glob(f"{vdf_path}.backup-*"))[:-VDF_BACKUPS]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+
+
+def remove_tree(path):
+    """Remove a file or folder tree, including what Lepton's containers leave in a game's data: overlayfs work dirs
+    with mode 000 (and whiteout device files in them), which shutil.rmtree(ignore_errors=True) silently skipped, so
+    "remove saves" left lepton-data behind. Last resort: podman unshare (files owned by the container's user ids)."""
+    if not os.path.lexists(path):
+        return
+    if os.path.islink(path) or not os.path.isdir(path):
+        os.remove(path)
+        return
+    for root, dirs, _files in os.walk(path):  # top-down: fix a folder's mode before walking into it
+        for d in dirs:
+            p = os.path.join(root, d)
+            if not os.path.islink(p):
+                try:
+                    os.chmod(p, 0o700)
+                except OSError:
+                    pass
+    shutil.rmtree(path, ignore_errors=True)
+    if os.path.lexists(path) and shutil.which("podman"):
+        run(["podman", "unshare", "rm", "-rf", path])
+
+
+def grid_files(grid, appid):
+    """A shortcut's grid artwork (<appid>p.jpg, <appid>_hero.png, …): exact names, never another appid that merely
+    starts with the same digits."""
+    pat = re.compile(rf"^{re.escape(str(appid))}(p|_hero|_logo|_icon)?\.[A-Za-z0-9]+$")
+    try:
+        return [os.path.join(grid, n) for n in os.listdir(grid) if pat.match(n)]
+    except OSError:
+        return []
+
+
+def remove_shortcut(vdf_path, exe):
+    if not os.path.exists(vdf_path):
+        return False
+    root = vdf_decode(open(vdf_path, "rb").read())
+    sc = root.get("shortcuts", {})
+    keep = [v for v in sc.values() if not (isinstance(v, dict) and v.get("Exe") == exe)]
+    if len(keep) == len(sc):
+        return False
+    root["shortcuts"] = {str(i): v for i, v in enumerate(keep)}
+    backup_vdf(vdf_path)
+    with open(vdf_path + ".tmp", "wb") as f:
+        f.write(vdf_encode(root))
+    os.replace(vdf_path + ".tmp", vdf_path)
+    return True
+
+
+STATUS_FILE = os.path.join(HOME, ".local/share/frameport/shortcuts-status.json")
+
+
+LIBRARY_MODE_FILE = os.path.join(HOME, ".local/share/frameport/library-mode.json")
+PENDING_FILE = os.path.join(HOME, ".local/share/frameport/library-pending.json")
+RESTART_REQUEST_FILE = os.path.join(HOME, ".local/share/frameport/restart-request.json")
+
+
+def library_mode(args=None):
+    mode = (args or {}).get("mode")
+    if mode is None:
+        try:
+            mode = json.load(open(LIBRARY_MODE_FILE))["mode"]
+        except (OSError, ValueError, KeyError):
+            mode = "now"
+    if mode not in ("now", "later", "off"):
+        raise AgentError("Steam library mode must be now, later or off")
+    return mode
+
+
+@contextlib.contextmanager
+def shortcut_lock(wait=None):
+    """The shortcut lock: one library writer at a time (the worker, Steam's start hooks, a live `later` update).
+    A `now` worker holds it while it waits for FramePort/Desktop Mode/a game to close (up to 12 h), so only the
+    detached worker and Steam's hooks may block on it (wait=None). What an SSH command reaches passes `wait`
+    (seconds, 0 = one try) and gets False while it stays busy: an install waited for it until the PC's 600 s agent
+    timeout (discussion #305)."""
+    os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
+    with open(STATUS_FILE + ".lock", "w") as lock:
+        got = True
+        if wait is None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        else:
+            end = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= end:
+                        got = False
+                        break
+                    time.sleep(0.5)
+        yield got
+
+
+def shortcut_lock_busy():
+    """Some library writer (most of the time a waiting `now` worker) holds the shortcut lock right now."""
+    with shortcut_lock(wait=0) as got:
+        return not got
+
+
+@contextlib.contextmanager
+def pending_lock():
+    """Guards read-modify-write of the pending journal only: never held across a wait or a Steam restart, so it is
+    always short. Lock order: the shortcut lock first, then this one."""
+    os.makedirs(os.path.dirname(PENDING_FILE), exist_ok=True)
+    with open(PENDING_FILE + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def add_pending(packages, remove):
+    """Journal games to add / shortcuts to remove (merged with what already waits). Returns the journal."""
+    with pending_lock():
+        return _add_pending(packages, remove)
+
+
+def _add_pending(packages, remove):
+    """Caller holds the pending lock (flock isn't reentrant across file descriptors)."""
+    pending = pending_library()
+    pending["packages"] = sorted(set(pending["packages"]) | set(packages))
+    pending["remove"].extend(r for r in remove if r not in pending["remove"])
+    _write_json(PENDING_FILE, pending)
+    return pending
+
+
+def consume_pending(applied):
+    """Drop what a worker/hook has applied (`applied`, a journal snapshot) from the journal; entries journaled since
+    that snapshot stay for the next run."""
+    with pending_lock():
+        pending = pending_library()
+        pending["packages"] = [p for p in pending["packages"] if p not in applied["packages"]]
+        pending["remove"] = [r for r in pending["remove"] if r not in applied["remove"]]
+        if not pending["packages"] and not pending["remove"]:
+            pending = {"packages": [], "remove": []}
+        _write_json(PENDING_FILE, pending)
+
+
+def cmd_library_mode(args):
+    """Every install calls this first. The mode is written at once; the hook cleanup needs the shortcut lock and is
+    skipped while another writer holds it (never waited for, discussion #305): a waiting `now` worker re-reads
+    library_mode() every 10 s (later: journals its games and keeps the hooks; off: drops its games) and drops idle
+    hooks when it ends; Steam's post-start check drops them once the journal is empty."""
+    mode = library_mode(args)
+    _write_json(LIBRARY_MODE_FILE, {"mode": mode})
+    if mode == "off":
+        with pending_lock():
+            pending = pending_library()
+            pending["packages"] = []
+            _write_json(PENDING_FILE, pending)
+    with shortcut_lock(wait=0) as got:
+        if got:
+            drop_library_hooks_if_idle()
+    return {"mode": mode} if got else {"mode": mode, "worker_active": True}
+
+
+def pending_library():
+    try:
+        pending = json.load(open(PENDING_FILE))
+    except (OSError, ValueError):
+        pending = {}
+    if not isinstance(pending, dict):
+        pending = {}
+    pending["packages"] = [p for p in pending.get("packages") or [] if isinstance(p, str)]
+    pending["remove"] = [r for r in pending.get("remove") or [] if isinstance(r, dict)]
+    return pending
+
+
+def queue_library(packages, remove):
+    # Serialize with the worker and Steam's startup hooks; persist before touching the live VDF. A `now` worker lets
+    # go within 10 s of the switch to `later`; a lock that stays busy longer (a Steam restart in progress) leaves the
+    # live update to the hook at Steam's next start (bounded: never the PC's 600 s agent timeout).
+    with shortcut_lock(wait=30) as got:
+        if got:
+            return _queue_library(packages, remove)
+        return {"state": "pending", **add_pending(packages, remove), "added": [], "errors": []}
+
+
+def _queue_library(packages, remove):
+    """Caller holds the shortcut lock."""
+    pending = add_pending(packages, remove)
+    result = {"state": "pending", **pending, "added": [], "errors": []}
+    for user in library_users():
+        update_library(user, packages, result)
+    _write_json(STATUS_FILE, result)
+    return result
+
+
+LIBRARY_HOOK_DIR = os.path.join(HOME, ".config/systemd/user/steam.service.d")
+LIBRARY_HOOK = os.path.join(LIBRARY_HOOK_DIR, "frameport-library.conf")
+TIMEOUT_BIN = "/usr/bin/timeout"  # coreutils; present on SteamOS (checked on the Frame, 2026-10-16)
+SYSTEMD_RUN_BIN = "/usr/bin/systemd-run"
+LIBRARY_HOOK_SECONDS = 20  # steam.service's start timeout is 90 s: a stuck hook must never get near it
+LIBRARY_VERIFY_UNIT = "frameport-library-verify"
+
+
+def _unit_quote(value):
+    """One argument of a systemd Exec= line: quoted, with the specifier (%) and variable ($) characters escaped."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$") + '"'
+
+
+def library_hooks_text(python=None, agent=None, timeout_bin=None):
+    """steam.service drop-in for the `later` mode. Both hooks start with '-' (a failure never fails Steam's start)
+    and run under timeout(1) (systemd's '-' ignores exit codes, not a hook that hangs until the unit's start
+    timeout), so a missing interpreter/agent (exit 127/2) or a hang can't keep Steam from starting. The
+    pre-start hook rewrites shortcuts.vdf before Steam reads it; the post-start check (it waits for Steam and may
+    register devkit entries) runs as its own transient unit, so Steam's start never waits for it."""
+    python = python or sys.executable
+    agent = agent or os.path.abspath(__file__)
+    timeout_bin = TIMEOUT_BIN if timeout_bin is None else timeout_bin
+    wrap = f"{timeout_bin} -k 5 {LIBRARY_HOOK_SECONDS} " if timeout_bin else ""
+    command = _unit_quote(python) + " " + _unit_quote(agent)
+    return ("# Written by FramePort (Steam library: \"later\"); removed again when nothing waits for Steam's start.\n"
+            "[Service]\n"
+            f"ExecStartPre=-{wrap}{command} library_pending\n"
+            f"ExecStartPost=-{wrap}{SYSTEMD_RUN_BIN} --user --collect --quiet --no-block "
+            f"--unit={LIBRARY_VERIFY_UNIT} --property=RuntimeMaxSec=300 {command} library_pending_verify\n")
+
+
+def ensure_library_hooks():
+    """SteamOS runs Steam as the user unit steam.service (Type=simple, Restart=always, TimeoutStartSec 90 s).
+    Apply AFTER its exit writes and BEFORE its next start; keep the journal until the post-start verification
+    succeeds, including across reboots/crashes."""
+    text = library_hooks_text(timeout_bin=TIMEOUT_BIN if os.access(TIMEOUT_BIN, os.X_OK) else "")
+    try:
+        if open(LIBRARY_HOOK).read() == text:
+            return
+    except OSError:
+        pass
+    os.makedirs(LIBRARY_HOOK_DIR, exist_ok=True)
+    with open(LIBRARY_HOOK + ".tmp", "w") as f:
+        f.write(text)
+    os.replace(LIBRARY_HOOK + ".tmp", LIBRARY_HOOK)
+    if run(["systemctl", "--user", "daemon-reload"]).returncode:
+        raise AgentError("Could not enable Steam library startup hooks")
+
+
+def remove_library_hooks():
+    """Remove the steam.service drop-in (mode switched away from `later` with nothing pending, purge).
+    Returns whether there was one."""
+    if not os.path.exists(LIBRARY_HOOK):
+        return False
+    try:
+        os.remove(LIBRARY_HOOK)
+    except FileNotFoundError:
+        return False
+    try:
+        os.rmdir(LIBRARY_HOOK_DIR)  # only when empty: the user's own drop-ins (extra_args.conf) stay
+    except OSError:
+        pass
+    run(["systemctl", "--user", "daemon-reload"])
+    return True
+
+
+def drop_library_hooks_if_idle():
+    """The drop-in only stays while the `later` mode is on or something still waits for Steam's next start."""
+    pending = pending_library()
+    if library_mode() != "later" and not pending["packages"] and not pending["remove"]:
+        return remove_library_hooks()
+    return False
+
+
+def cmd_library_pending(args):
+    os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
+    with open(STATUS_FILE + ".lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {"worker_active": True}  # that worker writes before start and verifies afterward
+        pending = pending_library()
+        result = {"added": [], "errors": []}
+        if not pending["packages"] and not pending["remove"]:
+            return result  # every Steam start runs this: leave shortcuts.vdf alone when nothing waits
+        # An uninstall queued after an install wins; never resurrect a deleted deployment.
+        packages = [p for p in pending["packages"] if deployment(p)]
+        for user in steam_users():
+            remove_from_library(user, pending["remove"], result)
+        for user in library_users():
+            update_library(user, packages, result)
+        with pending_lock():  # only the errors: what was journaled meanwhile stays
+            current = pending_library()
+            current["errors"] = result["errors"]
+            _write_json(PENDING_FILE, current)
+        return result
+
+
+def cmd_library_pending_verify(args):
+    os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
+    with open(STATUS_FILE + ".lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {"worker_active": True}  # that worker writes before start and verifies afterward
+        pending = pending_library()
+        packages = [p for p in pending["packages"] if deployment(p)]
+        result = {"state": "done", "added": [], "errors": list(pending.get("errors", []))}
+        if not packages and not pending["remove"]:
+            if pending["packages"]:  # only uninstalled games were left
+                consume_pending(pending)
+            drop_library_hooks_if_idle()
+            return result
+        for pkg in shortcuts_lost(library_users(), packages):
+            add_devkit_entry(pkg, result)
+        if not result["errors"]:
+            consume_pending(pending)
+            drop_library_hooks_if_idle()
+        _write_json(STATUS_FILE, result)
+        return result
+
+
+def frameport_running():
+    """A local GUI heartbeat is refreshed every second; crashed/closed windows expire in ten seconds."""
+    data = os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local/share"))
+    try:
+        age = time.time() - os.path.getmtime(os.path.join(data, "frameport-app/gui.alive"))
+        return 0 <= age < 10
+    except OSError:
+        return False
+
+
+def restart_hold():
+    return "game" if game_running() else "desktop" if desktop_mode() else "frameport" if frameport_running() else None
+
+
+def cmd_restart_steam(args):
+    if game_running() and not args.get("confirm"):
+        return {"confirmation_required": True}
+    status = cmd_shortcut_status({})
+    if status.get("state") == "waiting" and time.time() - float(status.get("started") or 0) < 60:
+        # Wake the worker already holding the lock; a second worker would wait behind the local GUI hold.
+        _write_json(RESTART_REQUEST_FILE, {"requested": time.time()})
+        return {"started": True, "waiting_worker": True}
+    return cmd_shortcuts({"packages": pending_library()["packages"], "restart_now": True,
+                          "remove": pending_library()["remove"], "mode": "now"})
+
+
+def cmd_shortcuts(args):
+    """Add library entries (+ grid artwork) for installed games. Steam must be closed while shortcuts.vdf is
+    rewritten, so the work runs in a detached systemd unit (terminals/SSH sessions started from Steam live in
+    steam.service's cgroup and would be killed with it). Poll shortcut_status for the result."""
+    packages = [check_pkg(p) for p in args.get("packages", [])]
+    remove = [r for r in args.get("remove", [])
+              if isinstance(r, dict) and str(r.get("exe", "")).startswith('"' + ANCHORS)]
+    mode = library_mode(args)
+    if mode == "off" and not remove:
+        return {"state": "done", "disabled": True, "added": [], "errors": []}
+    if mode == "off":
+        packages = []
+    if mode == "later":
+        ensure_library_hooks()
+        return queue_library(packages, remove)
+    if not packages and not remove and not args.get("restart_now"):
+        return {"started": False}
+    if not args.get("restart_now"):
+        # A worker waiting for FramePort/Desktop Mode/a game to close holds the shortcut lock: a second worker would
+        # only queue behind it for a second Steam restart. Journal these changes instead; the waiting worker merges
+        # the journal once Steam is closed. Under the journal lock: the worker leaves "waiting" under it too, so a
+        # change journaled here is never missed.
+        with pending_lock():
+            current = cmd_shortcut_status({})
+            alive = time.time() - float(current.get("started") or 0) < 60  # rewritten every 10 s while waiting
+            if current.get("state") == "waiting" and alive and shortcut_lock_busy():
+                if not set(packages) <= set(current.get("packages") or []) or remove:
+                    _add_pending(packages, remove)
+                return {**current, "started": False, "waiting": True}
+    os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
+    with open(STATUS_FILE, "w") as f:
+        json.dump({"state": "running", "packages": packages, "started": time.time()}, f)
+    unit = f"frameport-shortcuts-{int(time.time())}"
+    payload = json.dumps({"packages": packages, "remove": remove, "restart": args.get("restart", True),
+                          "restart_now": bool(args.get("restart_now"))})
+    run(["systemd-run", "--user", "--collect", "--quiet", f"--unit={unit}", "--setenv=HOME=" + HOME,
+         sys.executable, os.path.abspath(__file__), "_shortcuts_worker", payload])
+    return {"started": True, "unit": unit}
+
+
+def shortcut_args(pkg):
+    """(exe, title, start dir, icon, tag, tags, openvr) of an installed game's shortcut."""
+    anchor = os.path.join(ANCHORS, pkg)
+    dep = json.load(open(os.path.join(anchor, "deployment.json")))
+    icon = app_icon_for(dep, anchor, steam=True)[0]  # a Linux app's own icon unless the user chose one
+    flat = dep.get("vr") is False
+    kind = dep.get("kind")
+    tag = ("Windows game on Frame" if flat else "PC VR on Frame") if kind == "pcvr" else \
+        "Linux app on Frame" if kind == "linux" else "Quest on Frame"
+    return f'"{anchor}/launch.sh"', dep["title"], anchor, icon, tag, dep.get("tags") or [], not flat
+
+
+def library_changes(users, packages):
+    """Whether shortcuts.vdf would change for any of these games (a reinstall usually changes nothing)."""
+    for user in users:
+        vdf = os.path.join(STEAM, "userdata", user, "config/shortcuts.vdf")
+        for pkg in packages:
+            exe, title, start, icon, tag, tags, openvr = shortcut_args(pkg)
+            if upsert_shortcut(vdf, exe, title, start, icon, tag, tags=tags, openvr=openvr, write=False)[1]:
+                return True
+    return False
+
+
+def shortcuts_lost(users, packages, wait=25):
+    """Packages whose shortcut isn't in any account's shortcuts.vdf once Steam has started again (Steam saving its own
+    copy over ours on the way out looked like a successful install with no game in the library, GitHub #27)."""
+    for _ in range(wait):  # until Steam runs again (it rewrites shortcuts.vdf while starting, too)
+        if run(["pgrep", "-x", "steam"]).returncode == 0:
+            break
+        time.sleep(1)
+    time.sleep(8)
+    lost = []
+    for pkg in packages:
+        exe = shortcut_args(pkg)[0]
+        found = False
+        for user in users:
+            vdf = os.path.join(STEAM, "userdata", user, "config/shortcuts.vdf")
+            try:
+                root = vdf_decode(open(vdf, "rb").read()) if os.path.exists(vdf) else {}
+            except (OSError, AgentError):
+                continue
+            entries = (root.get("shortcuts") or {}).values()
+            found = found or any(isinstance(v, dict) and v.get("Exe") == exe for v in entries)
+        if not found:
+            lost.append(pkg)
+    return lost
+
+
+def desktop_mode():
+    """Desktop Mode is open: it runs inside Steam's session, so a Steam restart would end it (and FramePort itself when
+    it runs on the Frame); library changes wait until the user is back in Gaming Mode."""
+    return run(["pgrep", "-x", "plasmashell"]).returncode == 0
+
+
+def game_running():
+    """A game is being played on the Frame (any Lepton game container, or a FramePort PC VR game)."""
+    names = run(["podman", "ps", "--format", "{{.Names}}"]).stdout.split()
+    if any(n.startswith("lepton-steamlaunch-") for n in names):
+        return True
+    # overlay apps (fpsVR & co.) run next to games, often all the time: they don't hold up installs
+    return any(pcvr_pids(d["base"]) for d in cmd_list_installed({})["games"]
+               if d.get("kind") in ("pcvr", "linux") and not is_overlay(d))
+
+
+def shortcuts_worker(payload):
+    """One library update at a time: two at once each read shortcuts.vdf, changed it and wrote it back, so the second
+    write brought back a shortcut the first had removed (uninstalling two games quickly left Roblox in Steam)."""
+    import fcntl
+
+    os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
+    with open(STATUS_FILE + ".lock", "w") as lock:
+        if json.loads(payload).get("restart_now"):
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                _write_json(RESTART_REQUEST_FILE, {"requested": time.time()})
+                return  # wake an existing hold, rather than queueing another restart behind it
+        else:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        _shortcuts_worker(payload)
+
+
+def _split_devkit(packages):
+    """Games Steam only knows through their devkit entry (this Frame's Steam drops FramePort's shortcuts.vdf
+    entries, GitHub #41/#42): rewriting the vdf changes nothing for them, and the Steam restart would drop the live
+    devkit entry too. They get their art only; Play re-adds a lost devkit entry live. Returns (vdf games, devkit)."""
+    devkit = [p for p in packages if devkit_gameid(p)]
+    for pkg in devkit:
+        appid = devkit_appid(devkit_gameid(pkg))
+        if appid:
+            copy_grid_art(pkg, appid)
+    return [p for p in packages if p not in devkit], devkit
+
+
+def _shortcuts_worker(payload):
+    args = json.loads(payload)
+    result = {"state": "done", "added": [], "errors": [], "finished": None}
+    applied = None  # the journal entries merged into this run
+    os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
+    try:  # new art (e.g. the user's own icon) also reaches Linux apps' Desktop Mode entries
+        refresh_desktop_entries()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        users = library_users()
+        args["packages"], result["devkit"] = _split_devkit(args["packages"])
+        if not args.get("restart_now") and not args.get("remove") and not library_changes(users, args["packages"]):
+            # nothing to change in shortcuts.vdf (e.g. a reinstall): only the artwork, no Steam restart
+            for user in users:
+                update_library(user, args["packages"], result, shortcuts=False)
+            result["unchanged"] = True
+            result["finished"] = time.time()
+            with open(STATUS_FILE, "w") as f:
+                json.dump(result, f)
+            return
+        deadline = time.time() + 12 * 3600
+        while not args.get("restart_now") and time.time() < deadline:
+            try:
+                requested = json.load(open(RESTART_REQUEST_FILE))["requested"]
+                if 0 <= time.time() - requested < 60:
+                    os.remove(RESTART_REQUEST_FILE)
+                    break
+            except (OSError, ValueError, KeyError):
+                pass
+            mode = library_mode()
+            if mode == "later":
+                ensure_library_hooks()
+                _queue_library(args["packages"], args.get("remove", []))
+                return
+            if mode == "off":  # games journaled meanwhile are dropped too; removals still happen
+                args["packages"] = []
+                with pending_lock():
+                    pending = pending_library()
+                    pending["packages"] = []
+                    _write_json(PENDING_FILE, pending)
+                if not args.get("remove") and not pending["remove"]:
+                    _write_json(STATUS_FILE, {"state": "done", "disabled": True, "added": [], "errors": []})
+                    drop_library_hooks_if_idle()
+                    return
+            reason = restart_hold()
+            if not reason:
+                break
+            with open(STATUS_FILE, "w") as f:
+                json.dump({"state": "waiting", "reason": reason, "packages": args["packages"],
+                           "started": time.time()}, f)
+            time.sleep(10)
+        with pending_lock():  # cmd_shortcuts journals into a waiting worker under this lock: not after this point
+            _write_json(STATUS_FILE, {"state": "running", "packages": args["packages"], "started": time.time()})
+        try:
+            service = stop_steam()
+        except AgentError:
+            raise AgentError("Steam did not close; library not modified") from None
+        # Everything journaled for Steam's restart (later installs/uninstalls while this worker waited, discussion
+        # #305): one restart covers it all. An uninstall queued after an install wins: deployments are checked here.
+        with pending_lock():
+            applied = pending_library()
+        extra, devkit = _split_devkit([p for p in applied["packages"] if p not in args["packages"] and deployment(p)])
+        result["devkit"] += devkit
+        args["packages"] = sorted(p for p in set(args["packages"]) | set(extra) if deployment(p))
+        args.setdefault("remove", []).extend(r for r in applied["remove"] if r not in args["remove"])
+        for user in steam_users():  # uninstalled games leave every account's library
+            remove_from_library(user, args.get("remove", []), result)
+        for user in users:
+            update_library(user, args["packages"], result)
+        if service or args.get("restart", True):
+            start_steam(service)
+            lost = shortcuts_lost(users, args["packages"])
+            if lost:  # Steam wrote its old copy back over ours (it was still saving): once more, then the devkit entry
+                result["retried"] = lost
+                service = stop_steam()
+                for user in users:
+                    update_library(user, lost, {"added": [], "errors": result["errors"]})
+                start_steam(service)
+                for pkg in shortcuts_lost(users, lost):
+                    result["added"] = [a for a in result["added"] if a["package"] != pkg]
+                    add_devkit_entry(pkg, result)
+    except Exception as exc:  # noqa: BLE001
+        result["state"] = "failed"
+        result["errors"].append(str(exc))
+        run(["systemctl", "--user", "start", "steam.service"])
+    if result["state"] == "done" and not result["errors"]:
+        if applied is not None:
+            consume_pending(applied)
+        drop_library_hooks_if_idle()
+    try:
+        os.remove(RESTART_REQUEST_FILE)
+    except OSError:
+        pass
+    result["finished"] = time.time()
+    with open(STATUS_FILE, "w") as f:
+        json.dump(result, f)
+
+
+def add_devkit_entry(pkg, result):
+    """Steam dropped the game's shortcuts.vdf entry twice: this Frame's Steam ignores FramePort's entries (GitHub #41),
+    so add it the way Valve's devkit tool does (Steam is running again). That entry is the one Steam keeps."""
+    try:
+        appid = devkit_register(pkg)
+    except Exception as exc:  # noqa: BLE001
+        result["errors"].append(f"{pkg}: Steam removed the new library entry again after restarting, and the devkit "
+                                f"entry failed too: {exc}")
+        return
+    result["added"].append({"package": pkg, "appid": appid, "expected": (deployment(pkg) or {}).get("appid"),
+                            "via": "devkit"})
+
+
+def remove_from_library(user, remove, result):
+    """Remove uninstalled games' shortcuts + grid art from one Steam account (Steam is closed)."""
+    vdf = os.path.join(STEAM, "userdata", user, "config/shortcuts.vdf")
+    grid = os.path.join(os.path.dirname(vdf), "grid")
+    for r in remove:
+        try:
+            if remove_shortcut(vdf, r["exe"]):
+                result.setdefault("removed", []).append(r["exe"])
+            for art in grid_files(grid, r.get("appid") or ""):
+                os.remove(art)
+        except Exception as exc:  # noqa: BLE001
+            result["errors"].append(f"{r.get('exe')}: {exc}")
+
+
+def update_library(user, packages, result, shortcuts=True):
+    """Add/update installed games' shortcuts + grid art in one Steam account (Steam is closed; shortcuts=False: only
+    the grid art of shortcuts that are already right, while Steam runs). A game's devkit entry (the Play fallback)
+    gets the same art: on Frames where Steam ignores shortcuts.vdf it is the one in the library (GitHub #41)."""
+    for pkg in packages:
+        gameid = devkit_gameid(pkg)
+        appid = devkit_appid(gameid) if gameid else None
+        if appid:
+            try:
+                copy_grid_art(pkg, appid, [user])
+            except OSError as exc:
+                result.setdefault("errors", []).append(f"{pkg}: devkit art: {exc}")
+    vdf = os.path.join(STEAM, "userdata", user, "config/shortcuts.vdf")
+    grid = os.path.join(os.path.dirname(vdf), "grid")
+    os.makedirs(grid, exist_ok=True)
+    for pkg in packages:
+        try:
+            anchor = os.path.join(ANCHORS, pkg)
+            dep = json.load(open(os.path.join(anchor, "deployment.json")))
+            exe, title, start, icon, tag, tags, openvr = shortcut_args(pkg)
+            got = upsert_shortcut(vdf, exe, title, start, icon, tag, tags=tags, openvr=openvr, write=shortcuts)
+            got = got[0] if not shortcuts else got
+            for kind, suffix in (("portrait", "p"), ("landscape", ""), ("hero", "_hero"), ("logo", "_logo")):
+                img = next(iter(glob.glob(os.path.join(anchor, f"artwork/{kind}.*"))), None)
+                if not img:
+                    continue
+                for old in glob.glob(os.path.join(grid, f"{got}{suffix}.*")):
+                    os.remove(old)
+                shutil.copy(img, os.path.join(grid, f"{got}{suffix}{os.path.splitext(img)[1]}"))
+            if not any(a["package"] == pkg for a in result["added"]):
+                result["added"].append({"package": pkg, "appid": got, "expected": dep["appid"]})
+        except Exception as exc:  # noqa: BLE001
+            result["errors"].append(f"{pkg}: {exc}")
+
+
+def cmd_shortcut_status(args):
+    try:
+        return json.load(open(STATUS_FILE))
+    except (OSError, ValueError):
+        return {"state": "none"}
+
+
+# ------------------------------------------------------------------------------------------ drives (GitHub #90)
+# Games can live on another drive (a microSD card): their files go to <mount>/FramePort/<pkg>; the anchor (launch.sh,
+# deployment.json, artwork) always stays on internal storage, so the Steam shortcut never changes. SteamOS mounts
+# removable drives under /run/media/<user>/<label or uuid>.
+PROC_MOUNTS = "/proc/mounts"
+MEDIA_ROOT = "/run/media"
+DRIVE_DIR = "FramePort"
+# Lepton's container data and Proton prefixes need Unix permissions, owners and symlinks: these can't hold them
+UNUSABLE_FS = ("vfat", "msdos", "exfat", "ntfs", "ntfs3", "fuseblk")
+MOVE_STATUS = os.path.join(HOME, ".cache/frameport-move.json")
+MOVE_HEADROOM = 512 << 20
+# what stays in the anchor when a game's files live there too (base == anchor): never moved
+ANCHOR_ITEMS = ("launch.sh", "launch.sh.tmp", "deployment.json", "deployment.json.tmp", "artwork", "plays.log")
+
+
+def _unescape_mount(field):
+    """/proc/mounts writes spaces, tabs, newlines and backslashes in paths as octal escapes (\\040 ...)."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), field)
+
+
+def mounts(path=None):
+    """[(device, mount point, fstype, options)] from /proc/mounts."""
+    out = []
+    try:
+        with open(path or PROC_MOUNTS, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 4:
+                    out.append((_unescape_mount(p[0]), _unescape_mount(p[1]), p[2], p[3].split(",")))
+    except OSError:
+        pass
+    return out
+
+
+def _inside(path, root):
+    path, root = os.path.normpath(path), os.path.normpath(root)
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def mount_of(path, table=None):
+    """The mount entry holding `path` (longest mount point prefix), or None."""
+    best = None
+    for m in mounts() if table is None else table:
+        if _inside(path, m[1]) and (best is None or len(m[1]) > len(best[1])):
+            best = m
+    return best
+
+
+def _space(path):
+    try:
+        st = os.statvfs(path)
+    except OSError:
+        return None, None
+    return st.f_bavail * st.f_frsize, st.f_blocks * st.f_frsize
+
+
+def _drive(path, install_dir, m, internal=False, steam_library=False):
+    fstype = m[2] if m else ""
+    free, total = _space(path)
+    reason = ""
+    if not internal:
+        if fstype in UNUSABLE_FS:
+            reason = (f"{fstype} can't hold game data (no Unix permissions or symlinks); format the drive in SteamOS "
+                      f"to install games on it")
+        elif m and "ro" in m[3]:
+            reason = "mounted read-only"
+        elif free is None:
+            reason = "can't be read"
+    return {"id": "internal" if internal else path, "path": path, "install_dir": install_dir,
+            "label": "Internal storage" if internal else (os.path.basename(path.rstrip("/")) or path),
+            "fstype": fstype, "device": m[0] if m else "", "internal": internal,
+            "read_only": bool(m and "ro" in m[3]),
+            "removable": not internal and _inside(path, MEDIA_ROOT), "steam_library": steam_library,
+            "free_bytes": free, "total_bytes": total, "usable": not reason, "reason": reason}
+
+
+def list_drives(table=None):
+    """Internal storage, every drive mounted under /run/media and the drives of Steam library folders."""
+    table = mounts() if table is None else table
+    home_m = mount_of(HOME, table)
+    libs = [os.path.dirname(lib) for lib in steam_libraries()]
+    drives = [_drive(HOME, ANCHORS, home_m, internal=True, steam_library=any(_inside(lib, HOME) for lib in libs))]
+    seen = {home_m[1] if home_m else HOME}
+    for m in sorted(table, key=lambda m: m[1]):
+        if _inside(m[1], MEDIA_ROOT) and m[1] != os.path.normpath(MEDIA_ROOT) and m[1] not in seen \
+                and os.path.isdir(m[1]):
+            seen.add(m[1])
+            drives.append(_drive(m[1], os.path.join(m[1], DRIVE_DIR), m,
+                                 steam_library=any(_inside(lib, m[1]) for lib in libs)))
+    for lib in libs:  # a Steam library on a drive mounted elsewhere
+        m = mount_of(lib, table)
+        if m and m[1] not in seen and m[1] != "/" and not _inside(HOME, m[1]):
+            seen.add(m[1])
+            drives.append(_drive(m[1], os.path.join(m[1], DRIVE_DIR), m, steam_library=True))
+    return drives
+
+
+def cmd_drives(args):
+    """Where games can be installed: internal storage and other drives (microSD), with free space and whether they can
+    hold games (`usable`, else `reason`); `games` = how many installed games each holds."""
+    drives = list_drives()
+    games = cmd_list_installed({})["games"]
+    for d in drives:
+        d["games"] = sum(1 for g in games if drive_path(g["base"], drives) == d["path"])
+    return {"drives": drives}
+
+
+def drive_path(base, drives):
+    """The path of the listed drive holding `base` (internal storage: HOME), or None."""
+    best = None
+    for d in drives:
+        if not d["internal"] and _inside(base, d["path"]) and (best is None or len(d["path"]) > len(best)):
+            best = d["path"]
+    return best or (HOME if _inside(base, HOME) else None)
+
+
+def drive_missing(base, table=None):
+    """A game's files are on a drive that isn't there now (the microSD card was taken out)."""
+    if _inside(base, HOME):
+        return False
+    m = mount_of(base, table)
+    return m is None or m[1] == "/" or not os.path.isdir(base)
+
+
+def resolve_dest(dest, table=None):
+    """The install dir for new games: internal storage (None, "", "internal", ~/Applications/quest-frame) or a drive's
+    FramePort folder (its mount point is accepted too). A drive that isn't mounted is an error, never a silent
+    fallback to internal storage."""
+    if not dest or dest == "internal":
+        return ANCHORS
+    dest = os.path.normpath(os.path.expanduser(dest))
+    if dest == ANCHORS:
+        return ANCHORS
+    if not os.path.isabs(dest):
+        raise AgentError(f"bad install location {dest!r}")
+    for d in list_drives(table):
+        if d["internal"] or not _inside(dest, d["path"]):
+            continue
+        if not d["usable"]:
+            raise AgentError(f"{d['label']}: {d['reason']}")
+        if dest == d["path"]:
+            dest = d["install_dir"]
+        try:
+            os.makedirs(dest, exist_ok=True)
+        except OSError as exc:
+            raise AgentError(f"can't create {dest} on {d['label']}: {exc.strerror or exc}") from exc
+        return dest
+    raise AgentError(f"{dest}: that drive isn't inserted (or not mounted)")
+
+
+def check_base_present(base, title):
+    if drive_missing(base):
+        raise AgentError(f"{title}'s files are on a drive that isn't inserted ({base})")
+
+
+def new_base(args, pkg, dep):
+    """(base, free bytes there) for prepare*: an installed game keeps its base; a new one goes to args["dest"]."""
+    if dep:
+        check_base_present(dep["base"], dep.get("title") or pkg)
+        base = dep["base"]
+        probe = base
+        while not os.path.exists(probe) and probe != os.path.dirname(probe):
+            probe = os.path.dirname(probe)
+    else:
+        dest = resolve_dest(args.get("dest"))
+        base = os.path.join(dest, pkg)
+        probe = dest if os.path.exists(dest) else HOME
+    st = os.statvfs(probe)
+    return base, st.f_bavail * st.f_frsize
+
+
+# ------------------------------------------------------------------------------------------ install
+def deployment(pkg):
+    path = os.path.join(ANCHORS, pkg, "deployment.json")
+    try:
+        dep = json.load(open(path))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(dep, dict):
+        return None
+    dep.setdefault("base", os.path.dirname(path))
+    dep.setdefault("title", pkg)
+    return dep
+
+
+def write_deployment(pkg, dep):
+    path = os.path.join(ANCHORS, pkg, "deployment.json")
+    with open(path + ".tmp", "w") as f:
+        json.dump(dep, f, indent=2)
+    os.replace(path + ".tmp", path)
+
+
+def is_overlay(dep):
+    """An installed SteamVR overlay app (runs next to games: no launch test, not a "running game")."""
+    return bool(isinstance(dep, dict) and dep.get("overlay"))
+
+
+def deployment_summary(dep):
+    """Keep routine connection/monitor samples small; detailed data manifests are fetched only for an update."""
+    return {key: value for key, value in dep.items()
+            if key not in ("data_manifest", "configuration", "managed_config_files")}
+
+
+def cmd_list_installed(args):
+    games = []
+    table = mounts()
+    selected = check_pkg(args["package"]) if args.get("package") else "*"
+    for dep_path in sorted(glob.glob(os.path.join(ANCHORS, selected, "deployment.json"))):
+        try:
+            dep = json.load(open(dep_path))
+        except (OSError, ValueError):
+            continue
+        # incomplete records (an interrupted install, another tool's files in this folder) are skipped or completed
+        # instead of failing every connection with a KeyError (GitHub #40)
+        if not isinstance(dep, dict) or not dep.get("package") or not dep.get("appid"):
+            continue
+        dep.setdefault("base", os.path.dirname(dep_path))
+        dep.setdefault("title", dep["package"])
+        dep.setdefault("kind", "quest")
+        dep["anchor"] = os.path.dirname(dep_path)  # its artwork/ feeds the Steam grid (shortcuts)
+        # GitHub #90: games on another drive (microSD); drive_missing = that drive isn't inserted now
+        dep["drive_missing"] = drive_missing(dep["base"], table)
+        if _inside(dep["base"], HOME):
+            dep["drive"] = {"internal": True, "path": HOME, "label": "Internal storage"}
+        else:
+            m = mount_of(dep["base"], table)
+            mp = m[1] if m and m[1] != "/" and not dep["drive_missing"] else \
+                os.path.dirname(os.path.dirname(dep["base"].rstrip("/")))  # <mount>/FramePort/<pkg>
+            dep["drive"] = {"internal": False, "path": mp, "label": os.path.basename(mp.rstrip("/")) or mp}
+        if dep["kind"] == "linux":
+            exe = os.path.join(dep["base"], "app", dep.get("exe", ""))
+            dep["apk_present"] = os.path.isfile(exe)
+            dep["apk_size"] = sum((dep.get("files") or {}).get("app", {}).values())
+            dep.pop("files", None)
+        elif dep["kind"] == "pcvr":
+            exe = os.path.join(dep["base"], "game", dep.get("exe", ""))
+            dep["apk_present"] = os.path.isfile(exe)
+            dep["apk_size"] = sum((dep.get("files") or {}).get("game", {}).values())
+            dep.pop("files", None)  # large; not needed by the PC
+        else:
+            apk = os.path.join(dep["base"], "lepton-app/game.apk")
+            dep["apk_present"] = os.path.exists(apk)
+            dep["apk_size"] = os.path.getsize(apk) if dep["apk_present"] else 0
+        dep["last_play"] = last_play(dep["anchor"])  # agent v70: the PC triages a finished play session's log
+        games.append(dep if args.get("details") else deployment_summary(dep))
+    return {"games": games}
+
+
+def steam_gameid(appid):
+    """steam://rungameid/ id of a non-Steam shortcut: the 32-bit shortcut appid in the high word, type 0x02000000."""
+    return (int(appid) << 32) | 0x02000000
+
+
+NOT_IN_LIBRARY = "not in the Frame's Steam library"
+
+# Fallback library entry (GitHub #21/#30): on some Frames Steam never picks up the shortcuts FramePort writes into
+# shortcuts.vdf (Play: "Game configuration unavailable", Steam's log: RequestingLicense → AppError_9), while games
+# registered through Steam's devkit interface work there (Valve's Devkit Management Tool, MIT: the same pipe command,
+# ~/devkit-game/<gameid>/ + <gameid>-argv.json/-settings.json). Steam adds those live, without a restart, and runs
+# argv[0] relative to the game's folder: a link to the game's launch.sh. Steam names them "Devkit Game: <gameid>"
+# (no spaces allowed in the id), so they're only used where the normal entry fails.
+DEVKIT_GAMES = os.path.join(HOME, "devkit-game")
+
+
+def devkit_request(command, timeout=15):
+    """Send a devkit-1 command to the running Steam (its command pipe + session token) and wait for its answer file.
+    Returns the answer text; AgentError on an error answer or no answer."""
+    import tempfile
+    from urllib.parse import quote_plus
+
+    try:
+        token = open(os.path.join(HOME, ".steam/steam.token")).read().strip()
+    except OSError:
+        raise AgentError("Steam isn't running on the Frame (no session token)") from None
+    with tempfile.TemporaryDirectory(prefix="frameport-devkit") as tmp:
+        resp = os.path.join(tmp, "response")
+        line = f"devkit-1 steam://devkit-1/{token}/{command.format(response=quote_plus(resp))}\n"
+        with open(os.path.realpath(os.path.join(HOME, ".steam/steam.pipe")), "wb", 0) as pipe:
+            pipe.write(line.encode())
+        for _ in range(timeout * 4):
+            time.sleep(0.25)
+            if os.path.exists(resp + ".error"):
+                raise AgentError(f"Steam: {open(resp + '.error', errors='replace').read().strip()}")
+            if os.path.exists(resp) and not os.path.exists(resp + ".lock"):
+                return open(resp, errors="replace").read()
+    raise AgentError("Steam didn't answer the devkit request")
+
+
+def devkit_gameid(pkg):
+    """The devkit game id whose launcher links to this game's launch.sh, if it has one."""
+    target = os.path.join(ANCHORS, pkg, "launch.sh")
+    try:
+        names = sorted(os.listdir(DEVKIT_GAMES))
+    except OSError:
+        return None
+    for name in names:
+        link = os.path.join(DEVKIT_GAMES, name, "launch.sh")
+        if os.path.islink(link) and os.readlink(link) == target:
+            return name
+    return None
+
+
+def devkit_appid(gameid):
+    """The appid Steam gave a devkit game (it picks it itself), from any account's shortcuts.vdf."""
+    for user in steam_users():
+        vdf = os.path.join(STEAM, "userdata", user, "config/shortcuts.vdf")
+        try:
+            root = vdf_decode(open(vdf, "rb").read()) if os.path.exists(vdf) else {}
+        except (OSError, AgentError):
+            continue
+        for v in (root.get("shortcuts") or {}).values():
+            if isinstance(v, dict) and v.get("DevkitGameID") == gameid and v.get("appid"):
+                return v["appid"] & 0xFFFFFFFF
+    return devkit_appid_from_log(gameid)
+
+
+def devkit_appid_from_log(gameid):
+    """The appid Steam picked for a devkit game, from its console log ('sanitize shortcut app id "<dir>/<id>/launch.sh":
+    replacing 0 with N'). Steam adds the entry live but may never save it (GitHub #41/#42), so the log of the running
+    Steam session is the fallback (console_log.previous.txt is the session before, whose live entries are gone). The
+    newest line wins."""
+    exe = os.path.join(DEVKIT_GAMES, gameid, "launch.sh")
+    pat = re.compile(r'sanitize shortcut app id "' + re.escape(exe) + r'": replacing \d+ with (\d+)')
+    found = None
+    for name in ("console_log.txt",):  # this Steam session only: entries added live are gone after a restart
+        try:
+            with open(os.path.join(STEAM, "logs", name), errors="replace") as f:
+                for line in f:
+                    if "sanitize shortcut app id" in line:
+                        m = pat.search(line)
+                        if m:
+                            found = int(m.group(1)) & 0xFFFFFFFF
+        except OSError:
+            continue
+    return found
+
+
+def devkit_register(pkg):
+    """Add the game to Steam through the devkit interface (Steam must run); copies its art. Returns the appid."""
+    dep = deployment(pkg) or {}
+    gameid = devkit_gameid(pkg)
+    if not gameid:
+        # Steam only accepts ids like identifiers: a letter first, then letters, digits and "_" (no spaces or "-")
+        slug = re.sub(r"[^A-Za-z0-9]+", "_", dep.get("title") or "").strip("_")[:60] or pkg.replace(".", "_")
+        slug = re.sub(r"[^A-Za-z0-9_]", "_", slug)
+        if not slug[:1].isalpha():
+            slug = "Game_" + slug
+        gameid, n = slug, 2
+        while os.path.exists(os.path.join(DEVKIT_GAMES, gameid)):
+            gameid, n = f"{slug}_{n}", n + 1
+    folder = os.path.join(DEVKIT_GAMES, gameid)
+    os.makedirs(folder, exist_ok=True)
+    link = os.path.join(folder, "launch.sh")
+    if os.path.lexists(link):
+        os.remove(link)
+    os.symlink(os.path.join(ANCHORS, pkg, "launch.sh"), link)
+    with open(os.path.join(DEVKIT_GAMES, f"{gameid}-argv.json"), "w") as f:
+        json.dump(["launch.sh"], f)
+    with open(os.path.join(DEVKIT_GAMES, f"{gameid}-settings.json"), "w") as f:
+        json.dump({"steam_play": "0", "compat_tool": ""}, f)
+    from urllib.parse import quote_plus
+
+    try:
+        devkit_request("create-shortcut?response={response}&gameid=" + gameid + "&directory=" +
+                       quote_plus(DEVKIT_GAMES))
+    except AgentError:
+        _devkit_remove_files(gameid)
+        raise
+    appid = None
+    for _ in range(20):  # Steam writes the new entry to shortcuts.vdf right after answering
+        appid = devkit_appid(gameid)
+        if appid:
+            break
+        time.sleep(0.5)
+    if not appid:
+        raise AgentError("Steam added the devkit entry but didn't save it")
+    copy_grid_art(pkg, appid)
+    return appid
+
+
+def copy_grid_art(pkg, appid, users=None):
+    """The game's Steam art (portrait, landscape, hero, logo) as grid/<appid>* in every (or the given) account."""
+    anchor = os.path.join(ANCHORS, pkg)
+    for user in users if users is not None else steam_users():
+        grid = os.path.join(STEAM, "userdata", user, "config/grid")
+        os.makedirs(grid, exist_ok=True)
+        for kind, suffix in (("portrait", "p"), ("landscape", ""), ("hero", "_hero"), ("logo", "_logo")):
+            img = next(iter(glob.glob(os.path.join(anchor, f"artwork/{kind}.*"))), None)
+            if img:
+                for old in grid_files(grid, appid):
+                    if re.match(rf"^{appid}{re.escape(suffix)}\.", os.path.basename(old)):
+                        os.remove(old)
+                shutil.copy(img, os.path.join(grid, f"{appid}{suffix}{os.path.splitext(img)[1]}"))
+
+
+def devkit_unregister(pkg, steam_running=True):
+    """Remove the game's devkit entry: Steam's entry (live when Steam runs; else from shortcuts.vdf), its art and
+    the ~/devkit-game files. Returns whether there was one."""
+    gameid = devkit_gameid(pkg)
+    if not gameid:
+        return False
+    appid = devkit_appid(gameid)
+    exe = f'"{os.path.join(DEVKIT_GAMES, gameid, "launch.sh")}"'
+    if steam_running:
+        try:
+            devkit_request("delete-shortcut?response={response}&gameid=" + gameid)
+        except AgentError:
+            pass
+    else:
+        for user in steam_users():
+            remove_shortcut(os.path.join(STEAM, "userdata", user, "config/shortcuts.vdf"), exe)
+    if appid:
+        for user in steam_users():
+            for art in grid_files(os.path.join(STEAM, "userdata", user, "config/grid"), appid):
+                os.remove(art)
+    _devkit_remove_files(gameid)
+    return True
+
+
+def _devkit_remove_files(gameid):
+    remove_tree(os.path.join(DEVKIT_GAMES, gameid))
+    for suffix in ("argv", "settings", "env"):
+        p = os.path.join(DEVKIT_GAMES, f"{gameid}-{suffix}.json")
+        if os.path.exists(p):
+            os.remove(p)
+
+
+def cmd_launch(args):
+    """Start an installed game the way the headset's library does: ask the running Steam to launch its shortcut, so
+    it gets Steam's VR session, overlay and controller setup (unlike launch_test's direct, headless start)."""
+    pkg = check_pkg(args["package"])
+    dep = deployment(pkg)
+    if not dep or not dep.get("appid"):
+        raise AgentError(f"{pkg} is not installed")
+    if dep.get("base"):
+        check_base_present(dep["base"], dep.get("title") or pkg)
+    if run(["pgrep", "-x", "steam"]).returncode != 0:
+        raise AgentError("Steam isn't running on the Frame")
+    mode = library_mode(args)
+    if mode == "off" or (mode == "later" and pkg in pending_library()["packages"]):
+        # Detached from SSH/FramePort. The launcher keeps Lepton/Proton's environment; SteamVR must be running.
+        unit = f"frameport-play-{dep['appid']}"
+        if game_is_running(dep) or run(["systemctl", "--user", "is-active", "--quiet", unit]).returncode == 0:
+            raise AgentError("the game is already running")  # (or its launcher is still starting it)
+        run(["systemctl", "--user", "reset-failed", unit])  # a failed earlier start would block the unit name
+        p = run(["systemd-run", "--user", "--collect", "--quiet", f"--unit={unit}",
+                 os.path.join(ANCHORS, pkg, "launch.sh")])
+        if p.returncode:
+            raise AgentError("could not start the launcher: " + p.stderr[-300:])
+        return {"package": pkg, "title": dep.get("title"), "via": "direct"}
+    devkit = devkit_gameid(pkg)
+    appid = devkit_appid(devkit) if devkit else None  # this Frame needed the fallback entry before: use it
+    if devkit and not appid:
+        # Steam forgot the devkit entry (it never saves it on some Frames, and a restart drops it, GitHub #41): add it
+        # again live instead of reporting NOT_IN_LIBRARY, whose repair restarts Steam
+        try:
+            appid = devkit_register(pkg)
+        except AgentError:
+            appid = None
+    via = "devkit" if appid else "shortcut"
+    appid = appid or shortcut_appid_for(f'"{os.path.join(ANCHORS, pkg)}/launch.sh"')
+    if appid is None:  # Steam would only say "Game configuration unavailable"
+        raise AgentError(f"{NOT_IN_LIBRARY}: {dep.get('title') or pkg}")
+    steam = steam_launch(appid, args.get("wait", 10))
+    out = {"package": pkg, "gameid": steam_gameid(appid), "title": dep.get("title"), "via": via, "steam": steam}
+    if steam["result"] == "error" and steam.get("code") == 9 and args.get("fallback", True):
+        # Steam doesn't know the shortcut at all (it tried to license a store app with that id): devkit entry. A devkit
+        # entry Steam never saved is gone after a Steam restart (every install restarts it, GitHub #41): add it again
+        try:
+            appid = devkit_register(pkg)
+        except AgentError as exc:
+            out["fallback_error"] = str(exc)
+            return out
+        out.update(via="devkit", gameid=steam_gameid(appid), first_try=steam,
+                   steam=steam_launch(appid, args.get("wait", 10)))
+    return out
+
+
+def steam_launch(appid, wait=10):
+    """Ask the running Steam to start shortcut `appid`; what its log says about it (steam_launch_result)."""
+    log = os.path.join(STEAM, "logs/console_log.txt")
+    start = os.path.getsize(log) if os.path.exists(log) else 0
+    # systemd-run: the launch request must outlive this SSH session
+    run(["systemd-run", "--user", "--collect", "--quiet", f"--unit=frameport-launch-{time.time_ns()}",
+         "steam", "-ifrunning", f"steam://rungameid/{steam_gameid(appid)}"])
+    return steam_launch_result(log, start, appid, wait=wait)
+
+
+STEAM_LAUNCH_ERROR = re.compile(r"launch error (\d+) (\d+)(.*)")
+STEAM_APP_ERROR = re.compile(r"LaunchApp failed with AppError_(\d+)")
+
+
+def steam_launch_result(log, start, appid, wait=10):
+    """What Steam's console log says about the launch of shortcut `appid` (lines written after byte `start`): "started"
+    (Steam created the process), "error" (e.g. "launch error 9 <appid>" = Steam's "Game configuration unavailable",
+    GitHub #21/#30), "silent" (Steam logged nothing about this app: it didn't know the shortcut) or "unknown"."""
+    tag, lines = f"[AppID {appid},", []
+    deadline = time.time() + wait
+    while True:
+        try:
+            with open(log, "rb") as f:
+                f.seek(start)
+                new = f.read(1 << 20).decode("utf-8", "replace").splitlines()
+        except OSError:
+            return {"result": "unknown", "lines": []}
+        lines = [ln for ln in new if tag in ln or "launch error" in ln or "rungameid" in ln][-40:]
+        mine = [ln for ln in lines if tag in ln]
+        err = next((m for m in map(STEAM_LAUNCH_ERROR.search, lines) if m and m.group(2) == str(appid)), None)
+        if err:
+            return {"result": "error", "code": int(err.group(1)), "detail": err.group(3).strip(), "lines": lines}
+        # e.g. "GameAction [AppID 3554078061, ActionID 3] : LaunchApp failed with AppError_9" (GitHub #21)
+        failed = next((m for m in map(STEAM_APP_ERROR.search, mine) if m), None)
+        if failed:
+            return {"result": "error", "code": int(failed.group(1)), "detail": failed.group(0), "lines": lines}
+        if any(tag in ln and ("CreatingProcess" in ln or "WaitingGameWindow" in ln or "Completed" in ln)
+               for ln in lines):
+            return {"result": "started", "lines": lines}
+        if time.time() >= deadline:
+            return {"result": "silent" if not any(tag in ln for ln in lines) else "unknown", "lines": lines}
+        time.sleep(1)
+
+
+LEPTON_LINK = re.compile(r'ln -s "\$\{HOME\}/([^"/]+)" "\$\{TARGET_PATH\}/([^"/]+)"')
+SHARED_DEFAULT = (("Documents", "Documents"), ("Downloads", "Download"), ("Videos", "Movies"))
+
+
+def lepton_shared_folders():
+    """(home folder, Android folder) pairs Lepton links into every app's storage (read from Lepton's mounting.sh;
+    it only links folders that exist when an app starts)."""
+    lepton, _app = lepton_path()
+    text = ""
+    if lepton:
+        try:
+            text = open(os.path.join(os.path.dirname(lepton), "liblepton", "mounting.sh"), errors="replace").read()
+        except OSError:
+            pass
+    pairs = LEPTON_LINK.findall(text)
+    return pairs or list(SHARED_DEFAULT)
+
+
+# Folders Android itself creates in every app's /sdcard; anything else at the top level was made by the app.
+ANDROID_STORAGE_DIRS = {"alarms", "android", "audiobooks", "dcim", "documents", "download", "movies", "music",
+                        "notifications", "pictures", "podcasts", "recordings", "ringtones", "screenshots"}
+
+
+def app_media_dirs(ext):
+    """The app's own top-level folders in its /sdcard (e.g. 4XVR's 4XPlayer, which its "Internal Storage" list shows
+    instead of /sdcard/Movies): real folders only (not Lepton's links to the shared folders), not hidden."""
+    try:
+        names = sorted(os.listdir(ext))
+    except OSError:
+        return []
+    return [n for n in names if not n.startswith(".") and n.lower() not in ANDROID_STORAGE_DIRS
+            and os.path.isdir(os.path.join(ext, n)) and not os.path.islink(os.path.join(ext, n))]
+
+
+def lepton_external(pkg):
+    dep = deployment(pkg)
+    if not dep or dep.get("kind") == "pcvr":
+        raise AgentError(f"{pkg} is not an installed Quest (Lepton) game")
+    return os.path.join(dep["base"], "lepton-data", "external")
+
+
+def cmd_storage_targets(args):
+    """Where files for Lepton apps go: shared folders (seen by every app, e.g. ~/Videos = /sdcard/Movies) and, with a
+    package, that app's own storage (/sdcard) and its files folder. Creates missing shared folders (Lepton links only
+    existing ones). Android's media index doesn't work in Lepton, so apps must browse folders to find files."""
+    out = []
+    for home_name, android in lepton_shared_folders():
+        path = os.path.join(HOME, home_name)
+        os.makedirs(path, exist_ok=True)
+        out.append({"id": home_name.lower(), "path": path, "android": "/sdcard/" + android, "shared": True})
+    pkg = args.get("package")
+    if pkg:
+        pkg = check_pkg(pkg)
+        ext = lepton_external(pkg)
+        files = os.path.join(ext, "Android", "data", pkg, "files")
+        os.makedirs(files, exist_ok=True)
+        out.append({"id": "app", "path": ext, "android": "/sdcard", "shared": False})
+        out.append({"id": "app-files", "path": files, "android": f"/sdcard/Android/data/{pkg}/files", "shared": False})
+        for i, name in enumerate(app_media_dirs(ext)):  # the app's own folders (e.g. a video player's library)
+            out.append({"id": "app-media" if i == 0 else f"app-media:{name}", "path": os.path.join(ext, name),
+                        "android": f"/sdcard/{name}", "shared": False, "folder": name})
+    return {"targets": out}
+
+
+def cmd_link_media(args):
+    """Make files from the shared folders (e.g. ~/Videos) appear in an app's own folder too, as hard links (no copy,
+    no extra space). For players that list their own folder rather than /sdcard/Movies (4XVR: 4XPlayer). args:
+    package, files (paths under ~/Videos, ~/Downloads, ~/Documents), folder (optional; default: the app's first own
+    folder, see app_media_dirs). Returns {folder, android, linked, existing, missing}; folder None when the app has no
+    own folder (it then finds the files in the shared folders)."""
+    pkg = check_pkg(args["package"])
+    ext = lepton_external(pkg)
+    folder = args.get("folder") or next(iter(app_media_dirs(ext)), None)
+    if not folder:
+        return {"folder": None, "android": None, "linked": [], "existing": [], "missing": []}
+    if "/" in folder or folder in (".", ".."):
+        raise AgentError(f"bad folder {folder!r}")
+    dest = os.path.join(ext, folder)
+    os.makedirs(dest, exist_ok=True)
+    shared = [os.path.realpath(os.path.join(HOME, h)) for h, _a in lepton_shared_folders()]
+    linked, existing, missing = [], [], []
+    for path in args.get("files") or []:
+        real = os.path.realpath(path)
+        if not any(real == s or real.startswith(s + os.sep) for s in shared):
+            raise AgentError(f"{path} is not in a shared folder ({', '.join(shared)})")
+        if not os.path.isfile(real):
+            missing.append(path)
+            continue
+        target = os.path.join(dest, os.path.basename(real))
+        if os.path.exists(target):
+            if os.path.samefile(target, real):
+                existing.append(os.path.basename(real))
+                continue
+            os.remove(target)  # an older file of the same name: show the one just sent
+        try:
+            os.link(real, target)
+        except OSError:
+            shutil.copy2(real, target)  # different file system (not the case with Lepton's layout)
+        linked.append(os.path.basename(real))
+    return {"folder": folder, "android": f"/sdcard/{folder}", "linked": linked, "existing": existing,
+            "missing": missing}
+
+
+def cmd_list_files(args):
+    """Every file of an installed game on the Frame, for the PC's file browser: {roots: [{name, path, files:
+    [[rel, size], ...]}], missing: [[rel, expected size, actual size or None], ...], truncated}. Roots are the install
+    folder (game files, Proton prefix / Lepton data) and, when separate, the launcher folder (launch.sh, artwork).
+    `missing` compares against the file list recorded at install time (PC VR games)."""
+    pkg = check_pkg(args["package"])
+    dep = deployment(pkg)
+    if not dep:
+        raise AgentError(f"{pkg} is not installed")
+    limit = int(args.get("limit", 200000))
+    anchor = os.path.join(ANCHORS, pkg)
+    roots, count, truncated = [], 0, False
+    for name, root in (("Install folder", dep["base"]), ("Launcher", anchor)):
+        if not os.path.isdir(root) or any(os.path.realpath(root) == os.path.realpath(r["path"]) for r in roots):
+            continue
+        files = []
+        for r, dirs, names in os.walk(root):
+            dirs.sort()
+            for n in sorted(names):
+                if count >= limit:
+                    truncated = True
+                    break
+                p = os.path.join(r, n)
+                try:
+                    files.append([os.path.relpath(p, root), os.lstat(p).st_size])
+                except OSError:
+                    continue
+                count += 1
+        roots.append({"name": name, "path": root, "files": files})
+    missing = []
+    for t, manifest in (dep.get("files") or {}).items():
+        for rel, size in manifest.items():
+            p = os.path.join(dep["base"], t, rel)
+            actual = os.path.getsize(p) if os.path.isfile(p) else None
+            if actual is None and rel.lower().endswith("crashreportclient.exe") and os.path.isfile(p + ".disabled"):
+                continue  # renamed by the no-crash-reporter patch
+            if actual != size:
+                missing.append([f"{t}/{rel}", size, actual])
+    return {"roots": roots, "missing": missing[:1000], "truncated": truncated, "kind": dep.get("kind", "quest")}
+
+
+# ------------------------------------------------------------------------------------------ screenshots
+STEAMVR_APPID = "250820"  # the Frame files every headset screenshot under SteamVR, whatever game was shown
+PLAYS_LOG = "plays.log"  # <anchor>/plays.log: "start <unix>" / "end <unix>" lines written by launch.sh
+OPEN_SESSION = 12 * 3600  # a session without an "end" (Proton launchers exec the game; power loss) lasts at most this
+SESSION_GRACE = 5  # s after "end": the screenshot's time can trail the key press slightly
+SHOT_NAME = re.compile(r"^(\d{14})_\d+\.(jpe?g|png)$", re.I)
+KV_TOKEN = re.compile(r'"((?:[^"\\]|\\.)*)"|([{}])|//[^\n]*|([^\s"{}]+)')
+
+
+def kv_parse(text):
+    """Steam's text KeyValues (screenshots.vdf, ...) as nested dicts. Tolerant: an unbalanced or cut-off file gives
+    what was read so far."""
+    root, stack, key = {}, [], None
+    cur = root
+    for m in KV_TOKEN.finditer(text):
+        quoted, brace, bare = m.groups()
+        if brace == "{":
+            new = {}
+            if key is not None:
+                cur[key] = new
+            stack.append(cur)
+            cur, key = new, None
+        elif brace == "}":
+            if not stack:
+                break
+            cur, key = stack.pop(), None
+        elif quoted is not None or bare is not None:
+            tok = quoted.replace('\\"', '"').replace("\\\\", "\\") if quoted is not None else bare
+            if key is None:
+                key = tok
+            else:
+                cur[key], key = tok, None
+    return root
+
+
+def play_sessions():
+    """[(start, end, package)] from every FramePort game's plays.log, by start time. A start without an end (Proton
+    launchers exec the game, so they log no end; a crash or power loss) lasts until the next game's start (one game
+    runs at a time), at most OPEN_SESSION."""
+    events = []
+    for path in glob.glob(os.path.join(ANCHORS, "*", PLAYS_LOG)):
+        pkg = os.path.basename(os.path.dirname(path))
+        try:
+            lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] in ("start", "end") and parts[1].isdigit():
+                events.append((int(parts[1]), parts[0], pkg))
+    sessions, open_ = [], {}  # open_: pkg -> start
+    for t, kind, pkg in sorted(events):
+        if kind == "start":
+            if pkg in open_:  # an earlier start never ended: it ended by this one
+                sessions.append([open_[pkg], t, pkg])
+            open_[pkg] = t
+        elif pkg in open_:
+            sessions.append([open_.pop(pkg), t, pkg])
+    sessions += [[s, None, pkg] for pkg, s in open_.items()]
+    sessions.sort(key=lambda s: s[0])
+    for i, s in enumerate(sessions):
+        if s[1] is None:
+            later = [x[0] for x in sessions[i + 1:] if x[0] > s[0]]
+            s[1] = min([s[0] + OPEN_SESSION] + later)
+    return [tuple(s) for s in sessions]
+
+
+TEST_MARK_WINDOW = 60  # s: a "test <unix>" line in plays.log marks a session starting this soon after as a launch test
+
+
+def last_play(anchor):
+    """The newest play session in <anchor>/plays.log: {start, end (None while it runs, and for Proton launchers, which
+    exec the game), test (started by a launch test, not by the player)}, or None."""
+    text = _tail(os.path.join(anchor, PLAYS_LOG), 8192)
+    if not text:
+        return None
+    start = end = None
+    tests = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            continue
+        t = int(parts[1])
+        if parts[0] == "start":
+            start, end = t, None
+        elif parts[0] == "end" and start is not None and t >= start:
+            end = t
+        elif parts[0] == "test":
+            tests.append(t)
+    if start is None:
+        return None
+    return {"start": start, "end": end, "test": any(0 <= start - t <= TEST_MARK_WINDOW for t in tests)}
+
+
+def mark_launch_test(anchor):
+    """A launch test runs the game's launcher, which logs a play session: mark it so the PC doesn't triage it as one."""
+    try:
+        with open(os.path.join(anchor, PLAYS_LOG), "a") as f:
+            f.write(f"test {int(time.time())}\n")
+    except OSError:
+        pass
+
+
+def session_game(t, sessions):
+    """Package whose play session contains time t (the latest start wins), else None."""
+    hit = None
+    for start, end, pkg in sessions:
+        if start <= t <= end + SESSION_GRACE:
+            hit = pkg
+    return hit
+
+
+def shot_time_from_name(name):
+    m = SHOT_NAME.match(name)
+    if not m:
+        return None
+    try:
+        return int(time.mktime(time.strptime(m[1], "%Y%m%d%H%M%S")))  # Steam names the files in local time
+    except (ValueError, OverflowError):
+        return None
+
+
+def _int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def user_screenshots(user):
+    """Every screenshot file of one Steam account: [{path, thumb, time, width, height, appid}]. screenshots.vdf gives
+    times and sizes; files it doesn't list (Steam writes it at exit) come from the folders, timed by their name."""
+    remote = os.path.join(STEAM, "userdata", user, "760", "remote")
+    shots, seen = [], set()
+
+    def under(rel):
+        p = os.path.normpath(os.path.join(remote, rel)) if isinstance(rel, str) else None
+        return p if p and p.startswith(remote + os.sep) and os.path.isfile(p) else None
+    try:
+        text = open(os.path.join(STEAM, "userdata", user, "760", "screenshots.vdf"), encoding="utf-8",
+                    errors="replace").read()
+    except OSError:
+        text = ""
+    entries = (kv_parse(text).get("screenshots") or {})
+    for game in entries.values() if isinstance(entries, dict) else ():
+        for e in game.values() if isinstance(game, dict) else ():
+            path = under(e.get("filename")) if isinstance(e, dict) else None
+            if not path or path in seen:
+                continue  # deleted (Steam lists it until it rewrites the file)
+            seen.add(path)
+            shots.append({"path": path, "thumb": under(e.get("thumbnail")),
+                          "time": _int(e.get("creation")) or shot_time_from_name(os.path.basename(path)),
+                          "width": _int(e.get("width")), "height": _int(e.get("height")),
+                          "appid": os.path.relpath(path, remote).split(os.sep)[0]})
+    for path in sorted(glob.glob(os.path.join(remote, "*", "screenshots", "*"))):
+        name = os.path.basename(path)
+        if path in seen or not SHOT_NAME.match(name) or not os.path.isfile(path):
+            continue
+        thumb = os.path.join(os.path.dirname(path), "thumbnails", name)
+        shots.append({"path": path, "thumb": thumb if os.path.isfile(thumb) else None,
+                      "time": shot_time_from_name(name) or int(os.path.getmtime(path)), "width": None,
+                      "height": None, "appid": os.path.relpath(path, remote).split(os.sep)[0]})
+    return shots
+
+
+def shortcut_names(user):
+    """{shortcut appid (str): name} of an account's non-Steam shortcuts."""
+    try:
+        data = vdf_decode(open(os.path.join(STEAM, "userdata", user, "config", "shortcuts.vdf"), "rb").read())
+    except (OSError, ValueError, IndexError, struct.error, AgentError):
+        return {}
+    out = {}
+    for e in (data.get("shortcuts") or {}).values():
+        if isinstance(e, dict) and isinstance(e.get("appid"), int):
+            out[str(e["appid"] & 0xFFFFFFFF)] = e.get("AppName") or e.get("appname") or ""
+    return out
+
+
+def cmd_list_screenshots(args):
+    """Steam screenshots on the Frame (every account), newest first: {shots: [{path, thumb, time, width, height, size,
+    account, appid, package, title}], total, games: [{package, title, count}]}. The Frame files every headset
+    screenshot under SteamVR (250820), so those are matched to the FramePort game whose play session (plays.log)
+    contains their time; the rest stay "SteamVR" (package null). args: offset, limit, package (a package, or "" for
+    the shots of no FramePort game); `total` and `games` count before offset/limit."""
+    titles, by_appid = {}, {}
+    for dep_path in glob.glob(os.path.join(ANCHORS, "*/deployment.json")):
+        try:
+            dep = json.load(open(dep_path))
+        except (OSError, ValueError):
+            continue
+        pkg = os.path.basename(os.path.dirname(dep_path))
+        titles[pkg] = dep.get("title") or pkg
+        if dep.get("appid") is not None:
+            by_appid[str(int(dep["appid"]) & 0xFFFFFFFF)] = pkg
+    sessions = play_sessions()
+    shots, names = [], {}
+    for user in steam_users():
+        names.update(shortcut_names(user))
+        for s in user_screenshots(user):
+            pkg = by_appid.get(s["appid"])
+            if pkg is None and s["appid"] == STEAMVR_APPID and s["time"]:
+                pkg = session_game(s["time"], sessions)
+            if pkg:
+                title = titles.get(pkg, pkg)
+            elif s["appid"] == STEAMVR_APPID:
+                title = "SteamVR"
+            else:
+                app = find_app_id(s["appid"]) if s["appid"] not in names else None
+                title = names.get(s["appid"]) or (app or {}).get("name") or f"App {s['appid']}"
+            try:
+                size = os.path.getsize(s["path"])
+            except OSError:
+                continue
+            shots.append({**s, "size": size, "account": user, "package": pkg, "title": title})
+    shots.sort(key=lambda s: (-(s["time"] or 0), s["path"]))
+    games = {}
+    for s in shots:
+        g = games.setdefault(s["package"] or s["title"], {"package": s["package"], "title": s["title"], "count": 0})
+        g["count"] += 1
+    want = args.get("package")
+    if want is not None:
+        shots = [s for s in shots if (s["package"] or "") == want]
+    offset = max(0, int(args.get("offset") or 0))
+    limit = int(args.get("limit") or 0)
+    return {"shots": shots[offset:offset + limit] if limit > 0 else shots[offset:], "total": len(shots),
+            "games": sorted(games.values(), key=lambda g: g["title"].lower())}
+
+
+def screenshot_file(path):
+    """`path` if it is a screenshot image in a Steam account's screenshot folder (userdata/<id>/760/remote/<appid>/
+    screenshots/<name>), else AgentError. Links and '..' are refused: nothing outside those folders can be deleted."""
+    if not isinstance(path, str) or "\0" in path or not path.startswith("/"):
+        raise AgentError(f"not a screenshot: {path!r}")
+    norm = os.path.normpath(path)
+    parts = os.path.relpath(norm, os.path.join(STEAM, "userdata")).split(os.sep)
+    if (norm != path or len(parts) != 6 or not parts[0].isdigit() or parts[1:3] != ["760", "remote"]
+            or not parts[3].isdigit() or parts[4] != "screenshots" or not SHOT_NAME.match(parts[5])):
+        raise AgentError(f"not a screenshot: {path}")
+    if os.path.islink(norm) or not os.path.isfile(norm) or not inside_userdata(os.path.dirname(norm)):
+        raise AgentError(f"not a screenshot file: {path}")
+    return norm
+
+
+def inside_userdata(folder):
+    """The folder, links resolved, is inside Steam's userdata (a linked screenshots folder could point anywhere)."""
+    return os.path.realpath(folder).startswith(os.path.realpath(os.path.join(STEAM, "userdata")) + os.sep)
+
+
+def cmd_delete_screenshots(args):
+    """Delete screenshots (+ their thumbnails); only image files in Steam's screenshot folders (screenshot_file; every
+    path is checked before anything is deleted). screenshots.vdf is left alone: Steam keeps it in memory and rewrites
+    it at exit, so an edit would be lost; Steam drops entries whose file is gone, list_screenshots skips them. Steam's
+    own screenshot list may show the deleted ones until Steam restarts."""
+    paths = [screenshot_file(p) for p in args.get("paths") or []]
+    deleted = []
+    for p in paths:
+        os.unlink(p)
+        deleted.append(p)
+        stem, ext = os.path.splitext(p)
+        try:  # a VR screenshot's stereo copy (<name>_vr.jpg) next to it goes too
+            os.unlink(stem + "_vr" + ext)
+        except FileNotFoundError:
+            pass
+        thumbs = os.path.join(os.path.dirname(p), "thumbnails")
+        if inside_userdata(thumbs):
+            try:
+                os.unlink(os.path.join(thumbs, os.path.basename(p)))
+            except FileNotFoundError:
+                pass
+    return {"deleted": deleted}
+
+
+# Headset screenshots through OpenVR's IVRScreenshots (SteamVR's own libopenvr_api.so via ctypes, no build step):
+# connect as a background app (never starts SteamVR), RequestScreenshot(stereo) = SteamVR captures what the wearer
+# sees into two files (a flat preview + the stereo image), SubmitScreenshot = the Steam client adds them to its
+# library like a shot taken in the headset (under SteamVR, 250820). Verified on the device 2026-10-08. (SteamVR's
+# dashboard debug command `screenshot_request` over its web mailbox did nothing here.) While the headset sleeps the
+# compositor captures nothing.
+OPENVR_LIBS = ("/opt/steamvr/bin/linuxarm64/libopenvr_api.so", "/opt/steamvr/bin/linux64/libopenvr_api.so")
+VR_APP_BACKGROUND = 3
+VR_SHOT_STEREO = 2
+HMD_STATE = re.compile(r"\[CCVTrackedHmdDriver\] in State(\w+)")
+
+
+def hmd_state():
+    """The headset's state from SteamVR's driver log ("Normal", "Standby", ... ; None = unknown)."""
+    try:
+        with open(os.path.join(STEAM, "logs", "vrserver.txt"), "rb") as f:
+            f.seek(max(0, os.path.getsize(f.name) - 400_000))
+            text = f.read().decode(errors="replace")
+    except OSError:
+        return None
+    found = HMD_STATE.findall(text)
+    return found[-1] if found else None
+
+
+def steamvr_shot_files():
+    return set(glob.glob(os.path.join(STEAM, "userdata", "*", "760", "remote", STEAMVR_APPID, "screenshots", "*")))
+
+
+def vr_screenshot(capture_wait=6.0):
+    """Ask SteamVR for a stereo screenshot and hand it to Steam. Returns None when submitted, else why not:
+    "steamvr" (not running / no OpenVR), "capture" (nothing captured: the headset sleeps), or an error text."""
+    import ctypes
+    import tempfile
+
+    lib = next((p for p in OPENVR_LIBS if os.path.isfile(p)), None)
+    if lib is None:
+        return "steamvr"
+    vr = ctypes.CDLL(lib)
+    vr.VR_InitInternal2.restype = ctypes.c_uint32
+    vr.VR_InitInternal2.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_char_p]
+    vr.VR_GetGenericInterface.restype = ctypes.c_void_p
+    vr.VR_GetGenericInterface.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
+    vr.VR_ShutdownInternal.restype = None
+    err = ctypes.c_int(0)
+    vr.VR_InitInternal2(ctypes.byref(err), VR_APP_BACKGROUND, None)
+    if err.value:
+        return "steamvr"
+    tmp = tempfile.mkdtemp(prefix="frameport-shot-")
+    try:
+        request = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_uint32), ctypes.c_int, ctypes.c_char_p,
+                                   ctypes.c_char_p)
+        submit = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint32, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p)
+
+        class Table(ctypes.Structure):  # openvr_capi.h VR_IVRScreenshots_FnTable (IVRScreenshots_001)
+            _fields_ = [("RequestScreenshot", request), ("HookScreenshot", ctypes.c_void_p),
+                        ("GetScreenshotPropertyType", ctypes.c_void_p),
+                        ("GetScreenshotPropertyFilename", ctypes.c_void_p),
+                        ("UpdateScreenshotProgress", ctypes.c_void_p), ("TakeStereoScreenshot", ctypes.c_void_p),
+                        ("SubmitScreenshot", submit)]
+
+        ierr = ctypes.c_int(0)
+        ptr = vr.VR_GetGenericInterface(b"FnTable:IVRScreenshots_001", ctypes.byref(ierr))
+        if not ptr:
+            return f"no screenshot interface ({ierr.value})"
+        table = Table.from_address(ptr)
+        base = os.path.join(tmp, "shot")
+        handle = ctypes.c_uint32(0)
+        r = table.RequestScreenshot(ctypes.byref(handle), VR_SHOT_STEREO, (base + "_preview").encode(),
+                                    (base + "_vr").encode())
+        if r:
+            return f"SteamVR refused the screenshot ({r})"
+        preview, full = base + "_preview.png", base + "_vr.png"
+        deadline = time.time() + capture_wait
+        while time.time() < deadline and not (os.path.isfile(preview) and os.path.isfile(full)):
+            time.sleep(0.2)
+        if not (os.path.isfile(preview) and os.path.isfile(full)):
+            return "capture"
+        time.sleep(0.4)  # the second file can still be being written
+        r = table.SubmitScreenshot(handle.value, VR_SHOT_STEREO, preview.encode(), full.encode())
+        if r:
+            return f"Steam didn't take the screenshot ({r})"
+        time.sleep(1.5)  # Steam copies the files: keep them until it has
+        return None
+    finally:
+        vr.VR_ShutdownInternal()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def cmd_take_screenshot(args):
+    """A headset screenshot now (vr_screenshot), saved by Steam under SteamVR; waits up to `wait` s for its file:
+    {taken, path, reason, hmd}. reason: "steamvr" (SteamVR not running), "capture" (the headset sleeps), other text =
+    an error."""
+    wait = float(args.get("wait") or 8)
+    before = steamvr_shot_files()
+    reason = vr_screenshot()
+    if reason is None:
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            new = [p for p in steamvr_shot_files() - before if SHOT_NAME.match(os.path.basename(p))]
+            if new:
+                return {"taken": True, "path": max(new, key=os.path.getmtime), "reason": None, "hmd": hmd_state()}
+            time.sleep(0.4)
+        reason = "not saved"
+    return {"taken": False, "path": None, "reason": reason, "hmd": hmd_state()}
+
+
+# ------------------------------------------------------------------------------------------ SteamVR overlay apps (v75)
+# OpenVR overlay applications (VRApplication_Overlay: fpsVR, wrist watches, ...) draw no scene; SteamVR's compositor
+# draws their overlays over whatever runs, Lepton (Quest) games and Proton (PC VR) games included (verified on the
+# device 2026-10-10, docs/FRAME_RUNTIME.md "Overlay apps"). FramePort installs one like a PC VR game (Proton) or a
+# Linux app and registers an application manifest with SteamVR (IVRApplications, live: SteamVR keeps the path in its
+# appconfig.json) whose binary is the app's launch.sh, so SteamVR can start it, also at every SteamVR start
+# ("autostart" = SteamVR's own auto-launch flag). The app's Steam shortcut still starts it from the library.
+OVERLAY_MANIFEST = "frameport-overlay.vrmanifest"
+VR_APP_UTILITY = 4
+# openvr_capi.h VR_IVRApplications_FnTable (IVRApplications_007) slots used here
+VR_APPS = {"AddApplicationManifest": 0, "RemoveApplicationManifest": 1, "IsApplicationInstalled": 2,
+           "LaunchApplication": 6, "GetApplicationProcessId": 12, "GetApplicationsErrorNameFromEnum": 13,
+           "SetApplicationAutoLaunch": 17, "GetApplicationAutoLaunch": 18}
+
+
+def overlay_key(pkg, app=None):
+    """The overlay's SteamVR application key: the app's own (from its bundled manifest, so registering it by hand
+    too can't make a second entry), else "frameport.<package>"."""
+    key = (app or {}).get("app_key")
+    if isinstance(key, str) and re.fullmatch(r"[A-Za-z0-9_.-]{3,100}", key):
+        return key
+    return "frameport." + re.sub(r"[^a-z0-9_.-]", "_", pkg.lower())
+
+
+def overlay_app_dir(dep):
+    """Where the app's files are on the Frame (its bundled manifest's paths are relative to manifest_dir there)."""
+    tree = "app" if dep.get("kind") == "linux" else "game"
+    rel = os.path.normpath((dep.get("overlay") or {}).get("manifest_dir") or ".")
+    if rel.startswith("..") or os.path.isabs(rel):
+        rel = "."
+    return os.path.normpath(os.path.join(dep["base"], tree, rel))
+
+
+def overlay_manifest(anchor, pkg, dep):
+    """SteamVR application manifest for an installed overlay app: the app's own bundled manifest entry (key, name,
+    image) when it has one, with its binary replaced by FramePort's launch.sh (Proton or the Linux launcher, which
+    set up the environment) and every path absolute."""
+    title = dep.get("title") or pkg
+    app = dict((dep.get("overlay") or {}).get("app") or {})
+    src = overlay_app_dir(dep)
+    image = app.get("image_path")
+    image = os.path.join(src, image) if isinstance(image, str) and image else ""
+    if not (image and os.path.isfile(image)):
+        image = os.path.join(anchor, "artwork", "icon.png")
+    strings = app.get("strings") if isinstance(app.get("strings"), dict) else \
+        {"en_us": {"name": title, "description": f"{title} (installed by FramePort)"}}
+    # SteamVR on the Frame (linuxarm64) only reads binary_path_linux_arm ("must specify binary_path for launch_type
+    # binary. Skipping" for a manifest with binary_path_linux alone); both for SteamVR builds that read the other
+    launcher = os.path.join(anchor, "launch.sh")
+    entry = {"app_key": overlay_key(pkg, app), "launch_type": "binary",
+             "binary_path_linux_arm": launcher, "binary_path_linux": launcher, "working_directory": anchor,
+             "is_dashboard_overlay": True, "image_path": image, "strings": strings}
+    if dep.get("kind") == "linux" and app.get("arguments"):  # the Linux launcher passes them on ("$@")
+        entry["arguments"] = app["arguments"]
+    return {"source": "builtin", "applications": [entry]}
+
+
+class SteamVRApps:
+    """IVRApplications of the running SteamVR, through its libopenvr_api.so (ctypes) as a utility app (never starts
+    SteamVR). `None` from open() = SteamVR isn't running."""
+
+    interface = b"FnTable:IVRApplications_007"
+    table_size = 31
+
+    @classmethod
+    def open(cls):
+        import ctypes
+
+        lib = next((p for p in OPENVR_LIBS if os.path.isfile(p)), None)
+        if lib is None:
+            return None
+        vr = ctypes.CDLL(lib)
+        vr.VR_InitInternal2.restype = ctypes.c_uint32
+        vr.VR_InitInternal2.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_char_p]
+        vr.VR_GetGenericInterface.restype = ctypes.c_void_p
+        vr.VR_GetGenericInterface.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
+        vr.VR_IsRuntimeInstalled.restype = ctypes.c_bool
+        vr.VR_ShutdownInternal.restype = None
+        err = ctypes.c_int(0)
+        vr.VR_InitInternal2(ctypes.byref(err), VR_APP_UTILITY, None)
+        if err.value:
+            return None
+        ptr = vr.VR_GetGenericInterface(cls.interface, ctypes.byref(err))
+        if not ptr:
+            vr.VR_ShutdownInternal()
+            return None
+        self = cls()
+        self.vr, self.ct = vr, ctypes
+        self.table = (ctypes.c_void_p * cls.table_size).from_address(ptr)
+        return self
+
+    def fn(self, name, restype, *argtypes):
+        return self.ct.CFUNCTYPE(restype, *argtypes)(self.table[VR_APPS[name]])
+
+    def error(self, code):
+        if not code:
+            return None
+        name = self.fn("GetApplicationsErrorNameFromEnum", self.ct.c_char_p, self.ct.c_int)(code)
+        return (name or b"").decode() or str(code)
+
+    def add(self, path):
+        return self.error(self.fn("AddApplicationManifest", self.ct.c_int, self.ct.c_char_p, self.ct.c_bool)(
+            path.encode(), False))
+
+    def remove(self, path):
+        return self.error(self.fn("RemoveApplicationManifest", self.ct.c_int, self.ct.c_char_p)(path.encode()))
+
+    def installed(self, key):
+        return bool(self.fn("IsApplicationInstalled", self.ct.c_bool, self.ct.c_char_p)(key.encode()))
+
+    def set_autolaunch(self, key, on):
+        return self.error(self.fn("SetApplicationAutoLaunch", self.ct.c_int, self.ct.c_char_p, self.ct.c_bool)(
+            key.encode(), bool(on)))
+
+    def autolaunch(self, key):
+        return bool(self.fn("GetApplicationAutoLaunch", self.ct.c_bool, self.ct.c_char_p)(key.encode()))
+
+    def launch(self, key):
+        return self.error(self.fn("LaunchApplication", self.ct.c_int, self.ct.c_char_p)(key.encode()))
+
+    def pid(self, key):
+        return int(self.fn("GetApplicationProcessId", self.ct.c_uint32, self.ct.c_char_p)(key.encode()))
+
+    def close(self):
+        self.vr.VR_ShutdownInternal()
+
+
+def register_overlay(pkg, autostart=False):
+    """Write the overlay app's manifest next to its launcher and register it with SteamVR (live). Returns
+    {key, manifest, registered, autostart, error}; registered False + error "steamvr" = SteamVR isn't running (the
+    deployment keeps "overlay" and ensure_host_fixes registers it at the next connection)."""
+    dep = deployment(pkg)
+    if not dep:
+        raise AgentError(f"{pkg} is not installed")
+    anchor = os.path.join(ANCHORS, pkg)
+    path = os.path.join(anchor, OVERLAY_MANIFEST)
+    manifest = overlay_manifest(anchor, pkg, dep)
+    with open(path + ".tmp", "w") as f:
+        json.dump(manifest, f, indent=2)
+    os.replace(path + ".tmp", path)
+    key = manifest["applications"][0]["app_key"]
+    out = {"key": key, "manifest": path, "registered": False, "autostart": False, "error": None}
+    apps = SteamVRApps.open()
+    if apps is None:
+        out["error"] = "steamvr"
+        return out
+    try:
+        out["error"] = apps.add(path)
+        out["registered"] = apps.installed(key)
+        if out["registered"]:
+            out["error"] = apps.set_autolaunch(key, autostart) or out["error"]
+            out["autostart"] = apps.autolaunch(key)
+    finally:
+        apps.close()
+    return out
+
+
+def dep_overlay_key(pkg, dep=None):
+    dep = dep if dep is not None else deployment(pkg)
+    return overlay_key(pkg, ((dep or {}).get("overlay") or {}).get("app"))
+
+
+def unregister_overlay(pkg):
+    """Remove the overlay app's manifest from SteamVR (and the file). True when SteamVR was reached."""
+    anchor = os.path.join(ANCHORS, pkg)
+    path = os.path.join(anchor, OVERLAY_MANIFEST)
+    key = None
+    try:
+        key = json.load(open(path))["applications"][0]["app_key"]
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        key = dep_overlay_key(pkg)
+    apps = SteamVRApps.open()
+    reached = apps is not None
+    if apps is not None:
+        try:
+            apps.set_autolaunch(key, False)
+            apps.remove(path)
+        finally:
+            apps.close()
+    if os.path.exists(path):
+        os.remove(path)
+    return reached
+
+
+def overlay_entry(app):
+    """The overlay application entry of an app's bundled .vrmanifest (validated; None if there is none)."""
+    if not isinstance(app, dict):
+        return None
+    keep = {k: app[k] for k in ("app_key", "image_path", "strings", "arguments") if k in app}
+    if not isinstance(keep.get("image_path", ""), str) or not isinstance(keep.get("arguments", ""), str):
+        return None
+    return keep
+
+
+def cmd_register_vr_overlay(args):
+    """Register an installed app as a SteamVR overlay app: {package, autostart, app (its bundled manifest's overlay
+    entry, optional), manifest_dir (that manifest's folder in the app's files)} → register_overlay()'s result. The
+    deployment records it (overlay apps skip launch tests and don't count as a running game)."""
+    pkg = check_pkg(args["package"])
+    dep = deployment(pkg)
+    if not dep:
+        raise AgentError(f"{pkg} is not installed")
+    old = dep.get("overlay") or {}
+    app = overlay_entry(args["app"]) if "app" in args else old.get("app")
+    dep["overlay"] = {"autostart": bool(args.get("autostart")), "app": app,
+                      "manifest_dir": args.get("manifest_dir", old.get("manifest_dir")) or ".", "registered": False}
+    dep["overlay"]["key"] = overlay_key(pkg, app)
+    if old.get("key") and old["key"] != dep["overlay"]["key"]:
+        unregister_overlay(pkg)
+    write_deployment(pkg, dep)
+    out = register_overlay(pkg, bool(args.get("autostart")))
+    dep["overlay"]["registered"] = out["registered"]
+    write_deployment(pkg, dep)
+    out["service"] = overlay_service_quiet()
+    return out
+
+
+def cmd_unregister_vr_overlay(args):
+    pkg = check_pkg(args["package"])
+    reached = unregister_overlay(pkg)
+    dep = deployment(pkg)
+    if dep and "overlay" in dep:
+        dep.pop("overlay")
+        write_deployment(pkg, dep)
+    overlay_service_quiet()
+    return {"unregistered": True, "steamvr": reached}
+
+
+def cmd_launch_vr_overlay(args):
+    """Start an installed overlay app through SteamVR (LaunchApplication of its manifest), not as a Steam game, so a
+    game can be played next to it. {started, pid, error}."""
+    pkg = check_pkg(args["package"])
+    dep = deployment(pkg)
+    if not dep or not dep.get("overlay"):
+        raise AgentError(f"{pkg} is not installed as an overlay app")
+    if not dep["overlay"].get("registered"):
+        register_overlay(pkg, dep["overlay"].get("autostart"))
+    apps = SteamVRApps.open()
+    if apps is None:
+        raise AgentError("SteamVR isn't running on the Frame")
+    try:
+        key = dep_overlay_key(pkg, dep)
+        if not apps.installed(key):
+            apps.add(os.path.join(ANCHORS, pkg, OVERLAY_MANIFEST))
+        err = apps.launch(key)
+        pid = 0
+        for _ in range(20):
+            pid = apps.pid(key)
+            if pid or err:
+                break
+            time.sleep(0.5)
+    finally:
+        apps.close()
+    return {"started": not err, "pid": pid or None, "error": err}
+
+
+def overlay_service_quiet():
+    """ensure_overlay_service() after an overlay app's autostart flag changed; a systemd problem never fails the
+    command (ensure_host_fixes tries again at the next connection)."""
+    try:
+        return ensure_overlay_service()
+    except Exception as exc:  # noqa: BLE001
+        return f"error: {exc}"
+
+
+def overlay_registrations():
+    """Register overlay apps whose registration is missing (SteamVR wasn't running at install, or forgot it)."""
+    done = []
+    for dep_path in glob.glob(os.path.join(ANCHORS, "*/deployment.json")):
+        try:
+            dep = json.load(open(dep_path))
+        except (OSError, ValueError):
+            continue
+        ov = dep.get("overlay") if isinstance(dep, dict) else None
+        if not ov or not dep.get("package"):
+            continue
+        apps = SteamVRApps.open()
+        if apps is None:
+            return done
+        try:
+            ok = apps.installed(dep_overlay_key(dep["package"], dep))
+        finally:
+            apps.close()
+        if not ok:
+            r = register_overlay(dep["package"], ov.get("autostart"))
+            if r["registered"]:
+                ov["registered"] = True
+                write_deployment(dep["package"], dep)
+                done.append(dep["package"])
+    return done
+
+
+# ------------------------------------------------------------------------------------------ overlay autostart (v76)
+# SteamVR's own auto-launch flag (SetApplicationAutoLaunch) was accepted on the dev Frame but never written to
+# steamvr.vrsettings, and a registered watch didn't start by itself (2026-10-10). FramePort's deployment flag
+# (overlay.autostart) is the source of truth: a small user service (only while at least one installed overlay app has
+# autostart on) notices every new vrserver process (SteamVR start or restart, boot), waits until SteamVR answers,
+# gives SteamVR's own auto-launch a moment, then starts each autostart overlay app that isn't running yet, the same
+# way launch_vr_overlay does (LaunchApplication: SteamVR spawns it, in its own environment). Off for every app: the
+# flag file VR_OVERLAY_DISABLED or FRAMEPORT_NO_OVERLAY_AUTOSTART=1 (the service is then removed).
+VR_OVERLAY_UNIT = "frameport-vr-overlays"
+SYSTEMD_USER_DIR = os.path.join(HOME, ".config/systemd/user")
+VR_OVERLAY_UNIT_PATH = os.path.join(SYSTEMD_USER_DIR, VR_OVERLAY_UNIT + ".service")
+VR_OVERLAY_DISABLED = os.path.join(HOME, ".local/share/frameport/vr-overlays.disabled")
+VR_OVERLAY_LOG = os.path.join(HOME, ".local/share/frameport/vr-overlays.log")
+VR_OVERLAY_STATE = os.path.join(HOME, ".cache/frameport-vr-overlays.json")
+VR_OVERLAY_LOG_MAX = 128 * 1024
+VR_OVERLAY_POLL = 5  # s between /proc scans (nothing else happens while SteamVR keeps running)
+VR_OVERLAY_READY_WAIT = 180  # s for a new SteamVR to answer IVRApplications
+VR_OVERLAY_GRACE = 15  # s after SteamVR answers: its own auto-launch may start the app first
+
+
+def overlay_autostart_disabled():
+    return os.environ.get("FRAMEPORT_NO_OVERLAY_AUTOSTART", "0") not in ("", "0") or \
+        os.path.exists(VR_OVERLAY_DISABLED)
+
+
+def autostart_overlays():
+    """Installed overlay apps whose deployment has autostart on: [(package, deployment)]."""
+    found = []
+    for dep_path in sorted(glob.glob(os.path.join(ANCHORS, "*/deployment.json"))):
+        try:
+            dep = json.load(open(dep_path))
+        except (OSError, ValueError):
+            continue
+        if isinstance(dep, dict) and dep.get("package") and (dep.get("overlay") or {}).get("autostart"):
+            dep.setdefault("base", os.path.dirname(dep_path))
+            found.append((dep["package"], dep))
+    return found
+
+
+def systemd_quote(arg):
+    """One ExecStart= word (systemd's own quoting: double quotes, % and $ doubled)."""
+    arg = arg.replace("%", "%%").replace("$", "$$")
+    if re.fullmatch(r"[A-Za-z0-9_./+:=@-]+", arg):
+        return arg
+    return '"' + arg.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def vr_overlay_unit():
+    """The user service's unit text (the agent's path and Python are written in: the agent lives in AGENT_HOME)."""
+    agent = os.path.abspath(__file__)
+    return ("[Unit]\n"
+            "Description=FramePort: start SteamVR overlay apps with SteamVR\n"
+            "\n[Service]\n"
+            "Type=simple\n"
+            f"ExecStart={systemd_quote(sys.executable or '/usr/bin/python3')} {systemd_quote(agent)} "
+            "_vr_overlay_watch\n"
+            "Restart=always\n"
+            "RestartSec=10\n"
+            "Nice=10\n"
+            "\n[Install]\n"
+            "WantedBy=default.target\n")
+
+
+def user_systemctl(*args):
+    return run(["systemctl", "--user", *args])
+
+
+def ensure_overlay_service():
+    """Install (or update) the overlay autostart service when an installed overlay app has autostart on, remove it
+    when none has (or the kill switch is set). Returns "installed", "updated", "removed" or None (no change)."""
+    want = bool(autostart_overlays()) and not overlay_autostart_disabled()
+    text = vr_overlay_unit()
+    try:
+        current = open(VR_OVERLAY_UNIT_PATH).read()
+    except OSError:
+        current = None
+    if not want:
+        if current is None:
+            return None
+        user_systemctl("disable", "--now", VR_OVERLAY_UNIT + ".service")
+        try:
+            os.remove(VR_OVERLAY_UNIT_PATH)
+        except OSError:
+            pass
+        user_systemctl("daemon-reload")
+        user_systemctl("reset-failed", VR_OVERLAY_UNIT + ".service")
+        return "removed"
+    if current == text:
+        if user_systemctl("is-active", "--quiet", VR_OVERLAY_UNIT + ".service").returncode == 0:
+            return None
+        user_systemctl("enable", "--now", VR_OVERLAY_UNIT + ".service")
+        return "started"
+    os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
+    tmp = VR_OVERLAY_UNIT_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, VR_OVERLAY_UNIT_PATH)
+    user_systemctl("daemon-reload")
+    user_systemctl("enable", VR_OVERLAY_UNIT + ".service")
+    user_systemctl("restart", VR_OVERLAY_UNIT + ".service")
+    return "installed" if current is None else "updated"
+
+
+def overlay_log(msg):
+    try:
+        os.makedirs(os.path.dirname(VR_OVERLAY_LOG), exist_ok=True)
+        if os.path.exists(VR_OVERLAY_LOG) and os.path.getsize(VR_OVERLAY_LOG) > VR_OVERLAY_LOG_MAX:
+            os.replace(VR_OVERLAY_LOG, VR_OVERLAY_LOG + ".1")
+        with open(VR_OVERLAY_LOG, "a") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except OSError:
+        pass
+
+
+def vrserver_ident(pid):
+    """"<pid>:<start ticks>" when process `pid` is a vrserver (the start time tells a reused pid apart), else None."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+    except OSError:
+        return None
+    if stat[stat.find("(") + 1:stat.rfind(")")] != "vrserver":
+        return None
+    return f"{pid}:{stat[stat.rfind(')') + 2:].split()[19]}"
+
+
+def vrserver_process(known=None):
+    """The running vrserver's vrserver_ident, None if none. `known` (the last one seen) is checked first: while
+    SteamVR keeps running a poll reads one file instead of scanning /proc."""
+    if known and vrserver_ident(known.split(":")[0]) == known:
+        return known
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            found = vrserver_ident(d)
+            if found:
+                return found
+    return None
+
+
+def overlay_running(pkg, dep, apps=None):
+    """The overlay app runs already: a process of its install folder or launcher (also when Steam or SteamVR started
+    it), or SteamVR knows its process (GetApplicationProcessId)."""
+    if pcvr_pids(dep.get("base") or os.path.join(ANCHORS, pkg)) or pcvr_pids(os.path.join(ANCHORS, pkg)):
+        return True
+    if apps is not None:
+        try:
+            return bool(apps.pid(dep_overlay_key(pkg, dep)))
+        except Exception:  # noqa: BLE001
+            return False
+    return False
+
+
+def overlay_autostart_round():
+    """One new SteamVR: wait until it answers, give its own auto-launch a moment, then start each autostart overlay
+    app that isn't running. Returns {package: "started" | "running" | error text}; {} without SteamVR."""
+    deadline = time.time() + VR_OVERLAY_READY_WAIT
+    apps = SteamVRApps.open()
+    while apps is None and time.time() < deadline:
+        time.sleep(3)
+        apps = SteamVRApps.open()
+    if apps is None:
+        overlay_log("SteamVR didn't answer: nothing started")
+        return {}
+    try:
+        time.sleep(VR_OVERLAY_GRACE)
+        todo = [(pkg, dep) for pkg, dep in autostart_overlays() if not overlay_running(pkg, dep, apps)]
+        result = {pkg: "running" for pkg, _ in autostart_overlays() if pkg not in dict(todo)}
+    finally:
+        apps.close()
+    for pkg, _ in todo:
+        try:
+            r = cmd_launch_vr_overlay({"package": pkg})
+            result[pkg] = "started" if r.get("started") else (r.get("error") or "not started")
+        except Exception as exc:  # noqa: BLE001
+            result[pkg] = str(exc) or type(exc).__name__
+    return result
+
+
+def overlay_watch_tick(state):
+    """One poll of the watcher: a vrserver not handled before (state["vrserver"]) gets one autostart round. Returns
+    the round's result, or None when there was nothing to do."""
+    if overlay_autostart_disabled():
+        return None
+    proc = vrserver_process(state.get("vrserver"))
+    if not proc or proc == state.get("vrserver"):
+        return None
+    state["vrserver"] = proc
+    overlay_save_state(state)  # a restarted watcher (agent update) doesn't start apps the user closed again
+    if not autostart_overlays():
+        return None
+    overlay_log(f"new SteamVR (vrserver {proc.split(':')[0]})")
+    result = run_overlay_round()
+    for pkg, what in result.items():
+        overlay_log(f"{pkg}: {what}" if what in ("started", "running") else f"{pkg}: couldn't start it: {what}")
+    state["last"] = {"time": time.time(), "result": result}
+    overlay_save_state(state)
+    return result
+
+
+def run_overlay_round():
+    """overlay_autostart_round() in a child process (_vr_overlay_round): OpenVR is loaded only there, and a SteamVR
+    that never answers can't hang the watcher (timeout)."""
+    try:
+        p = subprocess.run([sys.executable, os.path.abspath(__file__), "_vr_overlay_round"], capture_output=True,
+                           text=True, errors="replace", timeout=VR_OVERLAY_READY_WAIT + VR_OVERLAY_GRACE + 120)
+    except subprocess.TimeoutExpired:
+        return {"*": "timed out"}
+    try:
+        out = json.loads(p.stdout.strip().splitlines()[-1])
+        return out if isinstance(out, dict) else {}
+    except (ValueError, IndexError):
+        return {"*": (p.stderr.strip().splitlines() or [f"exit {p.returncode}"])[-1]}
+
+
+def overlay_save_state(state):
+    try:
+        os.makedirs(os.path.dirname(VR_OVERLAY_STATE), exist_ok=True)
+        with open(VR_OVERLAY_STATE + ".tmp", "w") as f:
+            json.dump(state, f)
+        os.replace(VR_OVERLAY_STATE + ".tmp", VR_OVERLAY_STATE)
+    except OSError:
+        pass
+
+
+def vr_overlay_watch():
+    """The service's loop (_vr_overlay_watch): a /proc scan every VR_OVERLAY_POLL s. Exits when its own file changes
+    (an agent update: systemd starts the new one)."""
+    me = os.path.abspath(__file__)
+    try:
+        mine = os.path.getmtime(me)
+    except OSError:
+        mine = None
+    try:
+        state = json.load(open(VR_OVERLAY_STATE))
+        state = state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        state = {}
+    overlay_log(f"watching (agent v{AGENT_VERSION}, overlay apps with autostart: "
+                f"{', '.join(p for p, _ in autostart_overlays()) or 'none'})")
+    while True:
+        try:
+            if os.path.getmtime(me) != mine:
+                overlay_log("agent updated: restarting")
+                return
+        except OSError:
+            return
+        try:
+            overlay_watch_tick(state)
+        except Exception as exc:  # noqa: BLE001 (keep watching)
+            overlay_log(f"error: {exc}")
+        time.sleep(VR_OVERLAY_POLL)
+
+
+def cmd_prepare(args):
+    """Where to upload, and what the Frame already has (so unchanged data is not re-sent)."""
+    pkg = check_pkg(args["package"])
+    title = args["title"]
+    ensure_host_fixes()
+    anchor = os.path.join(ANCHORS, pkg)
+    dep = deployment(pkg)
+    base, free = new_base(args, pkg, dep)
+    appid = dep["appid"] if dep else shortcut_appid(f'"{anchor}/launch.sh"', title)
+    if container_running(appid):
+        raise AgentError(f"{title} is running on the Frame. Close it first.")
+    incoming = os.path.join(base, "incoming")
+    os.makedirs(os.path.join(incoming, "obb"), exist_ok=True)
+    app = os.path.join(base, "lepton-app")
+    existing = obb_manifest(os.path.join(app, "obb"))  # an unpacked OBB image counts as the image (unpack_obb)
+    existing.update(tree_manifest(os.path.join(incoming, "obb")))  # uploaded before an interruption
+    apk = os.path.join(app, "game.apk")
+    want_sha = args.get("apk_sha256")
+    same_apk = bool(want_sha and os.path.exists(apk) and os.path.getsize(apk) == args.get("apk_size")
+                    and sha256_file(apk) == want_sha)
+    lepton, _ = lepton_path()
+    return {"package": pkg, "base": base, "anchor": anchor, "appid": appid, "incoming": incoming,
+            "installed": bool(dep), "same_apk": same_apk, "existing_obb": existing,
+            "free_bytes": free, "lepton": lepton}
+
+
+# Valve's Lepton pastes the game's paths unquoted into shell commands (liblepton mounting.sh: `sh -c "... ln -s
+# ${STEAM_COMPAT_DATA_PATH}/internal/<pkg> /data/data/<pkg>"`, `lepton_basename ${APK}`), so a game on a drive whose
+# name has a space ("Steam Frame 512g") never gets its internal storage: no saves, no SharedPreferences, and e.g. Epic's
+# EOS SDK retries its keychain forever (GitHub #213/#214/#215/#221). Such games reach Lepton through a link without
+# spaces, made again at every start (a card can be mounted elsewhere); deployment.json keeps the real path.
+LEPTON_PATHS = os.path.join(HOME, ".local/share/frameport/lepton-paths")
+LEPTON_SAFE_RE = re.compile(r"[A-Za-z0-9._/+@%=:,-]+")
+APP_DIR_RE = re.compile(r"^(?:mkdir -p \S*lepton-paths\S* && ln -sfn .*\n)?app_dir=(.*)$", re.M)
+
+
+def app_dir_lines(base, pkg):
+    """The launcher's app_dir line for a game in `base` (a link line first when Lepton can't take that path)."""
+    if LEPTON_SAFE_RE.fullmatch(base):
+        return "app_dir=" + shlex.quote(base)
+    link = os.path.join(LEPTON_PATHS, pkg)
+    return (f"mkdir -p {shlex.quote(LEPTON_PATHS)} && ln -sfn {shlex.quote(base)} {shlex.quote(link)}"
+            f"  # Lepton can't take paths with spaces\napp_dir={shlex.quote(link)}")
+
+
+def remove_lepton_path(pkg):
+    try:
+        os.remove(os.path.join(LEPTON_PATHS, pkg))
+    except OSError:
+        pass
+
+
+def set_app_dir(text, base, pkg):
+    """launch.sh with its app_dir line(s) for `base`; (text, False) when it has none."""
+    text, n = APP_DIR_RE.subn(lambda m: app_dir_lines(base, pkg), text, count=1)
+    return text, bool(n)
+
+
+def launcher_base(text, pkg):
+    """The game folder a Quest launcher points at (the link's target when it goes through LEPTON_PATHS), or None."""
+    m = APP_DIR_RE.search(text)
+    if not m:
+        return None
+    try:
+        words = shlex.split(m.group(0).splitlines()[0], comments=True)
+    except ValueError:
+        return None
+    if m.group(0).startswith("mkdir -p ") and len(words) >= 8 and words[3:6] == ["&&", "ln", "-sfn"]:
+        return words[6]
+    value = shlex.split(m.group(1)) if m.group(1) else []
+    return value[0] if len(value) == 1 else None
+
+
+LAUNCH_SH = (r"""#!/usr/bin/env bash
+# Steam Frame launcher for {title} ({pkg}). Generated by FramePort.
+set -euo pipefail
+{app_dir}
+[[ -d "$app_dir/lepton-app" ]] || {{ echo "Game files missing at $app_dir (storage not mounted?)" >&2; exit 1; }}
+{single}
+# Some games (Unreal cloud saves, SUPERHOT's cloud/data: mode 1700) create folders without write/search permission
+# for the app inside Lepton (it writes through the folder's group), which breaks saving or makes the game quit.
+# Repair them before and during every launch.
+fix_perms() {{ find "$app_dir/lepton-data/external" -type d \( ! -perm -u+rwx -o ! -perm -g+rwx \) """
+r"""-exec chmod u+rwx,g+rwx {{}} + 2>/dev/null ||"""
+r""" true; }}
+# Android can't create an app's external files/cache folders inside Lepton ("Invalid mkdirs path ... not a known app
+# path"): getExternalCacheDir() then returns nothing, which breaks e.g. Whirligig's video player cache. Create them"""
+r""" here.
+mkdir -p "$app_dir/lepton-data/external/Android/data/{pkg}/files" """
+r""""$app_dir/lepton-data/external/Android/data/{pkg}/cache" 2>/dev/null || true
+# Prepare cloud saves before startup: a newly created cloud folder can have mode 1700, and the game may try to
+# create its data subfolder before the permission watchdog repairs it (Jurassic World Aftermath, GitHub #239).
+{cloud_dirs}
+fix_perms
+{watchdog}
+export SteamAppId={appid}
+export STEAM_COMPAT_INSTALL_PATH="$app_dir/lepton-app"
+export STEAM_COMPAT_DATA_PATH="$app_dir/lepton-data"
+export STEAM_COMPAT_SHADER_PATH="$app_dir/lepton-shaders"
+export STEAM_COMPAT_LIBRARY_PATHS="$app_dir"
+export LEPTON_ENV_FRAMEBRIDGE_CONFIG="$app_dir/settings.conf"
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+export IS_PARENT=true
+{extra_env}
+{video_codec}
+child=''
+stop() {{
+    trap - EXIT INT TERM
+    kill $permfix 2>/dev/null || true
+    [[ -n "$child" ]] && kill -TERM -- "-$child" 2>/dev/null || true
+    podman kill "lepton-steamlaunch-$SteamAppId" >/dev/null 2>&1 || true
+    {plays_end}
+    {save_snapshot}
+}}
+trap stop EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+{plays_start}
+setsid {lepton_q} start >"$app_dir/launch.log" 2>&1 &
+child=$!
+{dashboard}
+{logcat}
+{restart}
+""")
+
+
+# Every 2 s: repair folder permissions, and end the game when whoever started this launcher is gone. Steam starts it
+# under its "reaper"; when Steam stops only the reaper (seen: SIGTERM to the reaper left launch.sh, Lepton and the
+# container running), the game used to keep running with nothing in Steam to close it (GitHub #36).
+OLD_WATCHDOG = "( while sleep 2 && kill -0 $$ 2>/dev/null; do fix_perms; done ) & permfix=$!"
+# SteamVR's dashboard (Resume game / controller / VR options) is open when a FramePort game starts and has to be closed
+# by hand (also when Lepton shows its Android launcher first). Once the game's first VR frames are logged, the agent
+# closes it through Steam's UI (_dashboard_worker); opt out per game with FRAMEPORT_KEEP_DASHBOARD=1.
+DASHBOARD_LINE = ('[[ -n "${{FRAMEPORT_KEEP_DASHBOARD:-}}" ]] || python3 {agent_q} _dashboard_worker '
+                  '"$app_dir/launch.log" $$ >"$app_dir/dashboard.log" 2>&1 9>&- &')
+WATCHDOG = ("parent=$PPID\n"
+            "( while sleep 2 && kill -0 $$ 2>/dev/null; do fix_perms;"
+            " if [[ $parent -gt 1 ]] && ! kill -0 $parent 2>/dev/null; then kill -TERM $$; fi; done )"
+            " 9>&- & permfix=$!")
+
+
+# One launcher per game: Play pressed again while Lepton still boots (~10 s with nothing to see) made the second Lepton
+# stop the first one's container, and both died (Vader Immortal, BattleSisters). The lock is held by Lepton's process
+# (inherited fd), so it is released when the game ends.
+SINGLE_LINE = ('exec 9>"$app_dir/.launch.lock"; flock -n 9 || '
+               '{ echo "$(date +%s) already starting or running: second launch ignored" >>"$app_dir/launch-dup.log"; '
+               'exit 0; }')
+
+
+# Lepton mirrors the game's logcat into launch.log, and that reader sometimes fails: it dies right after the game
+# starts ("logcat: Unexpected EOF!", Vader Immortal on Lepton 3.0.5, Under Cover on 2.8.14), can't read ("Logcat read
+# failure"), or runs and writes nothing (Lepton 3.0.5, 2026-10-14). The game runs on, but launch.log stays empty: no
+# dashboard auto-hide, no launch-test result, no session triage. _logcat_keeper then reads the container's logcat
+# itself and appends it to launch.log.
+LOGCAT_LINE = ('python3 {agent_q} _logcat_keeper "$app_dir/launch.log" "$SteamAppId" $$ '
+               '>"$app_dir/logcat-keeper.log" 2>&1 9>&- &')
+
+CLOUD_DIRS_LINE = 'mkdir -p "$app_dir/lepton-data/external/Android/data/{pkg}/files/cloud/data" 2>/dev/null || true'
+
+
+def cloud_dirs_line(pkg):
+    return CLOUD_DIRS_LINE.format(pkg=pkg)
+
+
+def dashboard_line():
+    return DASHBOARD_LINE.format(agent_q=shlex.quote(os.path.abspath(__file__)))
+
+
+# Steam's own Exit game pauses the game first (exit_hook_worker, GitHub #480); off with FRAMEPORT_NO_EXIT_HOOK=1.
+# (the whole list redirected: its subshell must not hold the launcher's stdout open)
+EXIT_HOOK_LINE = ('{{ [[ -n "${{FRAMEPORT_NO_EXIT_HOOK:-}}" ]] || '
+                  'python3 {agent_q} _exit_hook {pkg_q} "$SteamAppId" $$; }} >"$app_dir/exit-hook.log" 2>&1 9>&- &')
+
+
+def set_exit_hook_line(text, pkg):
+    """A Lepton launcher starts the Exit game hook's worker once Lepton and its helpers are started, right before it
+    waits for Lepton (once; the line follows the template). It outlives a restart (RESTART_BLOCK): it ends with the
+    launcher."""
+    text = "".join(line for line in text.splitlines(True) if " _exit_hook " not in line)
+    if "export LEPTON_ENV_FRAMEBRIDGE_CONFIG=" not in text:
+        return text
+    line = EXIT_HOOK_LINE.format(agent_q=shlex.quote(os.path.abspath(__file__)), pkg_q=shlex.quote(pkg))
+    for wait in ('\nrc=0; wait "$child"', '\nwait "$child"'):
+        if wait in text:
+            return text.replace(wait, f"\n{line}{wait}", 1)
+    return text
+
+
+# Unreal (4.21+, r.ProgramBinaryCache.RestartAndroidAfterPrecompile) restarts the app once after its first-run shader
+# precompile (the "optimizing" screen): it starts its own launcher activity and exits. Lepton ends the container when
+# the first process exits, the restarted game with it (Sports Scramble stopped after its first start; skipping the
+# restart left it on that screen). The launcher then starts Lepton once more, in the same Steam launch
+# (_restart_requested reads the two logs). FRAMEPORT_NO_RESTART=1 turns it off.
+RESTART_BLOCK = """rc=0; wait "$child" || rc=$?
+if [[ -z "${{FRAMEPORT_NO_RESTART:-}}" ]] && python3 {agent_q} _restart_requested "$app_dir/launch.log" "$SteamAppId" \\
+        {pkg_q} 9>&-; then
+    mv -f "$app_dir/launch.log" "$app_dir/launch-before-restart.log" 2>/dev/null || true
+    setsid {lepton_q} start >"$app_dir/launch.log" 2>&1 &
+    child=$!
+    {dashboard}
+    rc=0; wait "$child" || rc=$?
+fi
+exit $rc"""
+
+
+def restart_block(pkg, lepton):
+    return RESTART_BLOCK.format(agent_q=shlex.quote(os.path.abspath(__file__)), pkg_q=shlex.quote(pkg),
+                                lepton_q=shlex.quote(lepton), dashboard=dashboard_line())
+
+
+LOGCAT_TIME = re.compile(r"^(?:\x1b\[[0-9;]*m)?(\d\d-\d\d \d\d:\d\d:\d\d\.\d{3})")
+
+
+def restart_requested(log, appid, pkg, max_gap=5.0):
+    """Whether the game that just ended asked to be started again (RESTART_BLOCK): in Lepton's system log (dumped to
+    lepton-logcats/steamlaunch-<appid>/ when the container ends) the app itself (uid >= 10000; Lepton's own start is
+    uid 0) started its LAUNCHER activity by package, and at most max_gap s later the game's process called
+    System.exit(0) (launch.log; Android's WebView helper does too at every boot)."""
+    def when(line):
+        m = LOGCAT_TIME.match(line)
+        if not m:
+            return None
+        try:
+            t = time.strptime("2000-" + m.group(1)[:14], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+        return time.mktime(t) + float(m.group(1)[14:])
+    try:
+        with open(log, errors="replace") as f:
+            exits = [when(ln) for ln in f if "System.exit called, status: 0" in ln and "WebViewLoader" not in ln]
+        syslog = os.path.join(STEAM, "logs", "lepton-logcats", f"steamlaunch-{appid}", "logcat-system.log")
+        with open(syslog, errors="replace") as f:
+            starts = []
+            for ln in f:
+                m = re.search(r"ActivityTaskManager: START u0 \{act=android\.intent\.action\.MAIN "
+                              r"cat=\[android\.intent\.category\.LAUNCHER\][^}]* pkg=" + re.escape(pkg)
+                              + r"[ }][^\n]* from uid (\d+)", ln)
+                if m and int(m.group(1)) >= 10000:
+                    starts.append(when(ln))
+    except OSError:
+        return False
+    for e in exits:
+        if e is not None and any(s is not None and 0 <= e - s <= max_gap for s in starts):
+            try:
+                with open(log, "a") as f:
+                    f.write("FramePort: the game restarted itself (e.g. Unreal after its first-run shader "
+                            "precompile): starting it again\n")
+            except OSError:
+                pass
+            return True
+    return False
+
+
+def logcat_line():
+    return LOGCAT_LINE.format(agent_q=shlex.quote(os.path.abspath(__file__)))
+
+
+def plays_lines(anchor):
+    """launch.sh lines that log play sessions to <anchor>/plays.log (screenshots are matched to games by time: the
+    Frame files every headset screenshot under SteamVR). Never fail the launcher."""
+    q = shlex.quote(os.path.join(anchor, PLAYS_LOG))
+    return (f'echo "start $(date +%s)" >>{q} 2>/dev/null || true',
+            f'echo "end $(date +%s)" >>{q} 2>/dev/null || true')
+
+
+def snapshot_line(pkg):
+    return (f"timeout -k 5 90 python3 {shlex.quote(os.path.abspath(__file__))} _snapshot_close "
+            f"{shlex.quote(pkg)} >>\"$app_dir/save-snapshot.log\" 2>&1 || true")
+
+
+LEPTON_SHIMS = os.path.join(HOME, ".local/share/frameport/lepton-shims")
+# Lepton sets the container's time zone from a bare `readlink /etc/localtime` minus "/usr/share/zoneinfo/", but on
+# SteamOS that link is relative (../usr/share/zoneinfo/Zone): every game got an invalid zone and ran on UTC (GitHub
+# #429). Launchers put this folder first on PATH; its readlink answers that one call with the resolved path.
+TZ_LINE = 'export PATH="$HOME/.local/share/frameport/lepton-shims:$PATH"  # time zone for Lepton (GitHub #429)'
+READLINK_SHIM = """#!/bin/sh
+# FramePort (GitHub #429): Lepton reads the time zone with a bare readlink of /etc/localtime, which is relative here
+if [ "$#" = 1 ] && [ "$1" = /etc/localtime ]; then exec /usr/bin/readlink -f /etc/localtime; fi
+exec /usr/bin/readlink "$@"
+"""
+
+
+def ensure_lepton_shims():
+    """Write the readlink shim TZ_LINE puts first on Lepton launchers' PATH."""
+    path = os.path.join(LEPTON_SHIMS, "readlink")
+    if os.path.isfile(path) and open(path).read() == READLINK_SHIM:
+        return False
+    os.makedirs(LEPTON_SHIMS, exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        f.write(READLINK_SHIM)
+    os.chmod(path + ".tmp", 0o755)
+    os.replace(path + ".tmp", path)
+    return True
+
+
+def set_tz_line(text):
+    """A Lepton launcher with the time zone PATH line after `export IS_PARENT=true` (once)."""
+    if TZ_LINE in text or "\nexport IS_PARENT=true\n" not in text:
+        return text
+    return text.replace("\nexport IS_PARENT=true\n", "\nexport IS_PARENT=true\n" + TZ_LINE + "\n", 1)
+
+
+# GitHub #480: games were ended with `podman kill` (and Lepton's own teardown `reboot -p` + `podman stop -t 0`) while
+# their activity was still resumed, so Android never paused them: Unity's OnApplicationPause(true) and the saves games
+# write there never ran (Just Dance VR lost all progress; a Quest always pauses an app before it closes). Before a
+# FramePort game is stopped, its activity is sent to the background inside the container: `am start` of the HOME
+# intent (Lepton's Launcher3; `input keyevent HOME` does nothing in Lepton's headless Android) pauses it at once and
+# stops it ~0.3 s later. The script waits for STOPPED, gives the app PAUSE_SETTLE s more, and is cut off after
+# PAUSE_LIMIT s in total (a hung container is never kept waiting longer). A game that isn't in front any more (its own
+# exit, the launcher already pressed) is left alone.
+PAUSE_LIMIT = 3
+PAUSE_SETTLE = 0.4
+PAUSE_SCRIPT = (
+    "p={pkg}; "
+    "st() {{ dumpsys activity activities | grep -E 'Hist #|state=' | grep -F -A1 \" $p/\" "
+    "| grep -o 'state=[A-Z_]*' | head -n 1; }}; "
+    "s=$(st); "
+    "case \"$s\" in state=RESUMED|state=PAUSING|state=PAUSED|state=STARTED|state=INITIALIZING) ;; "
+    "*) echo \"not in front (${{s:-no activity}})\"; exit 0;; esac; "
+    "am start -a android.intent.action.MAIN -c android.intent.category.HOME >/dev/null 2>&1; "
+    "i=0; while [ $i -lt {polls} ]; do sleep 0.1; s=$(st); "
+    "case \"$s\" in state=STOPPED|state=DESTROYED|state=FINISHING|'') "
+    "echo \"${{s:-gone}} after $i polls\"; sleep {settle}; exit 0;; esac; i=$((i+1)); done; "
+    "echo \"still $s\"")
+PAUSE_LINE = ('pause_game() {{ [[ -n "$child" ]] && kill -0 "$child" 2>/dev/null || return 0; '
+              '{{ echo "$(date +%T.%N) pausing"; timeout -k 1 {limit} podman exec "lepton-steamlaunch-$SteamAppId" '
+              'sh -c {script_q}; echo "$(date +%T.%N) done"; }} >"$app_dir/stop-pause.log" 2>&1 9>&- || true; }}'
+              '  # Android pauses the game before it ends (GitHub #480)')
+PAUSE_CALL = "    pause_game\n"
+
+
+def pause_script(pkg):
+    """The shell script (Android's sh, run in the game's container) that pauses `pkg`'s activity."""
+    if not re.fullmatch(r"[A-Za-z0-9._]+", pkg or ""):
+        raise AgentError(f"bad package name {pkg!r}")
+    return PAUSE_SCRIPT.format(pkg=shlex.quote(pkg), polls=20, settle=PAUSE_SETTLE)
+
+
+def pause_line(pkg):
+    return PAUSE_LINE.format(limit=PAUSE_LIMIT, script_q=shlex.quote(pause_script(pkg)))
+
+
+def set_pause_lines(text, pkg):
+    """A Lepton launcher whose stop() pauses the game (pause_game) before Lepton and the container are ended: the
+    function before stop(), its call before the `kill -TERM` of Lepton. Idempotent; the line follows the template."""
+    text = "\n".join(ln for ln in text.split("\n") if not ln.startswith("pause_game() {"))
+    text = text.replace("\n" + PAUSE_CALL, "\n")
+    term = '\n    [[ -n "$child" ]] && kill -TERM'
+    if "\nstop() {\n" not in text or term not in text:
+        return text
+    text = text.replace("\nstop() {\n", "\n" + pause_line(pkg) + "\nstop() {\n", 1)
+    return text.replace(term, "\n" + PAUSE_CALL + term[1:], 1)
+
+
+def pause_app(appid, pkg, limit=PAUSE_LIMIT):
+    """Pause a Lepton game's activity before it is stopped (see PAUSE_SCRIPT). Returns the script's last line, or
+    None when the container didn't answer (not running, hung: cut off after `limit` s)."""
+    try:
+        p = run(["podman", "exec", f"lepton-steamlaunch-{int(appid)}", "sh", "-c", pause_script(pkg)],
+                timeout=limit)
+    except (OSError, subprocess.TimeoutExpired, AgentError, ValueError):
+        return None
+    lines = p.stdout.strip().splitlines()
+    return lines[-1] if p.returncode == 0 and lines else None
+
+
+# device.shared_folder (GitHub #440): FRAMEPORT_SHARE="<other package>:<folder>". On a Quest every app sees one
+# /sdcard; in Lepton each game has its own. The folder becomes a link to the other game's copy, and that path joins
+# STEAM_COMPAT_LIBRARY_PATHS, which Lepton bind-mounts at the same path (as it does for ~/Documents behind its own
+# Documents link). A real folder of this game's with that name is kept beside it (<folder>.frameport-own).
+SHARE_LINES = r"""# FramePort: a folder shared with another game's storage (device.shared_folder)
+if [[ -n "${FRAMEPORT_SHARE:-}" ]]; then
+    share_pkg=${FRAMEPORT_SHARE%%:*}; share_dir=${FRAMEPORT_SHARE#*:}
+    share_base=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["base"])' \
+        "$HOME/Applications/quest-frame/$share_pkg/deployment.json" 2>/dev/null)
+    share_link="$HOME/.local/share/frameport/lepton-paths/$share_pkg"  # Lepton can't take paths with spaces
+    [[ -e "$share_link" ]] && share_base="$share_link"
+    if [[ -n "$share_base" && "$share_dir" != */* && "$share_dir" != .* ]]; then
+        share_src="$share_base/lepton-data/external/$share_dir"
+        share_dst="$app_dir/lepton-data/external/$share_dir"
+        mkdir -p "$share_src" "$app_dir/lepton-data/external"
+        if [[ -d "$share_dst" && ! -L "$share_dst" ]]; then
+            rmdir "$share_dst" 2>/dev/null || mv "$share_dst" "$share_dst.frameport-own"
+        fi
+        ln -sfn "$share_src" "$share_dst"
+        export STEAM_COMPAT_LIBRARY_PATHS="${STEAM_COMPAT_LIBRARY_PATHS:+$STEAM_COMPAT_LIBRARY_PATHS:}$share_src"
+        echo "FramePort: /sdcard/$share_dir is $share_pkg's"
+    else
+        echo "FramePort: can't share /sdcard/$share_dir: $share_pkg isn't installed on this Frame"
+    fi
+fi
+"""
+
+
+def set_share_lines(text, wanted):
+    """SHARE_LINES before the container starts (`child=''`), once, when the recipe shares a folder."""
+    if not wanted or SHARE_LINES in text or "\nchild=''\n" not in text:
+        return text
+    return text.replace("\nchild=''\n", "\n" + SHARE_LINES + "child=''\n", 1)
+
+
+# Game language follows Steam's (GitHub #530): a game whose recipe names no language (device.language) gets the Steam
+# client's language as Android's system language (persist.sys.locale, passed like device.language's own tag as a
+# second line of a LEPTON_GFXRECON_* value, see docs/FRAME_RUNTIME.md). Read at every launch, so a language changed in
+# Steam reaches the next start; a tag set by the recipe (an export before this line) wins. English (or no language
+# found) leaves Lepton's default (en-US). Off for one game: FRAMEPORT_NO_STEAM_LANGUAGE=1 in its launch options.
+LOCALE_LINE = ('[[ -n "${{LEPTON_GFXRECON_FP_LOCALE:-}}${{FRAMEPORT_NO_STEAM_LANGUAGE:-}}" ]] || '
+               '{{ fp_locale=$(python3 {agent_q} _steam_locale 2>/dev/null 9>&-) && [[ -n "$fp_locale" ]] && '
+               "export LEPTON_GFXRECON_FP_LOCALE=$'0\\npersist.sys.locale='\"$fp_locale\" && "
+               'echo "FramePort: game language follows Steam: $fp_locale"; }} || true')
+# Steam's language names (Steam Web API "language" values) -> Android language tags
+STEAM_LANGUAGES = {
+    "arabic": "ar-SA", "bulgarian": "bg-BG", "schinese": "zh-CN", "tchinese": "zh-TW", "czech": "cs-CZ",
+    "danish": "da-DK", "dutch": "nl-NL", "english": "en-US", "finnish": "fi-FI", "french": "fr-FR",
+    "german": "de-DE", "greek": "el-GR", "hungarian": "hu-HU", "indonesian": "id-ID", "italian": "it-IT",
+    "japanese": "ja-JP", "koreana": "ko-KR", "korean": "ko-KR", "norwegian": "nb-NO", "polish": "pl-PL",
+    "portuguese": "pt-PT", "brazilian": "pt-BR", "romanian": "ro-RO", "russian": "ru-RU", "spanish": "es-ES",
+    "latam": "es-MX", "swedish": "sv-SE", "thai": "th-TH", "turkish": "tr-TR", "ukrainian": "uk-UA",
+    "vietnamese": "vi-VN",
+}
+LOCALE_TAG_RE = re.compile(r"[a-z]{2,3}(-[A-Z][a-z]{3})?(-[A-Z]{2}|-[0-9]{3})?")
+
+
+def steam_language(paths=None):
+    """The Steam client's language name (e.g. "german") from its registry.vdf (Registry/HKCU/Software/Valve/Steam/
+    language; the Linux client keeps that file in ~/.steam), or None."""
+    for path in paths or (os.path.join(HOME, ".steam/registry.vdf"), os.path.join(STEAM, "registry.vdf"),
+                          os.path.join(HOME, ".steam/steam/registry.vdf")):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                node = kv_parse(f.read())
+        except OSError:
+            continue
+        for key in ("Registry", "HKCU", "Software", "Valve", "Steam", "language"):
+            node = next((v for k, v in node.items() if k.lower() == key.lower()), None) \
+                if isinstance(node, dict) else None
+        if isinstance(node, str) and node.strip():
+            return node.strip().lower()
+    return None
+
+
+def steam_locale(paths=None):
+    """The Android language tag for Steam's language, "" for English or an unknown/missing language."""
+    tag = STEAM_LANGUAGES.get(steam_language(paths) or "", "")
+    return "" if tag == "en-US" or not LOCALE_TAG_RE.fullmatch(tag) else tag
+
+
+def set_locale_line(text):
+    """A Lepton launcher with the Steam-language line (LOCALE_LINE) after `child=''` (after the recipe's exports and
+    the Podman wrapper lines, before Lepton starts); once. Other launchers are left alone."""
+    text = "".join(line for line in text.splitlines(True) if " _steam_locale " not in line)
+    if "export LEPTON_ENV_FRAMEBRIDGE_CONFIG=" not in text or "\nchild=''\n" not in text:
+        return text
+    line = LOCALE_LINE.format(agent_q=shlex.quote(os.path.abspath(__file__)))
+    return text.replace("\nchild=''\n", "\nchild=''\n" + line + "\n", 1)
+
+
+# An extra shared folder (device.extra_folder, Discussion #501): FRAMEPORT_FOLDER = a folder under the Frame's home
+# (relative to it, e.g. "ROMs" or "Games/ROMs"). Like device.shared_folder, /sdcard/<its name> becomes a link to it
+# and the folder joins STEAM_COMPAT_LIBRARY_PATHS, which Lepton bind-mounts at the same path (as for ~/Documents);
+# _extra_folder checks it (inside home, exists, no hidden folder, no link out of home) at every start.
+FOLDER_ENV = "FRAMEPORT_FOLDER"
+FOLDER_RECORD = "extra-folder.json"  # <base>/: the /sdcard link it made (removed when the setting goes)
+FOLDER_RESERVED = {"android", "movies", "download", "documents", "obb"}  # Lepton's own entries of /sdcard
+FOLDER_LINES = ('fp_folder=$(python3 {agent_q} _extra_folder "$app_dir" {pkg_q} 2>>"$app_dir/extra-folder.log" '
+                '9>&-) && [[ -n "$fp_folder" ]] && '
+                'export STEAM_COMPAT_LIBRARY_PATHS="${{STEAM_COMPAT_LIBRARY_PATHS:+$STEAM_COMPAT_LIBRARY_PATHS:}}'
+                '$fp_folder" || true  # FramePort: an extra shared folder (device.extra_folder)')
+
+
+def set_folder_lines(text, pkg, wanted):
+    """FOLDER_LINES after `child=''` (before Lepton starts), once, when the recipe names an extra folder."""
+    text = "".join(line for line in text.splitlines(True) if " _extra_folder " not in line)
+    if not wanted or "\nchild=''\n" not in text:
+        return text
+    line = FOLDER_LINES.format(agent_q=shlex.quote(os.path.abspath(__file__)), pkg_q=shlex.quote(pkg))
+    return text.replace("\nchild=''\n", "\nchild=''\n" + line + "\n", 1)
+
+
+def extra_folder_path(value, home=HOME):
+    """(the checked real path, the /sdcard name) of an extra folder setting: relative to home, ~/…, or an absolute
+    path in home. Raises AgentError for anything outside home, hidden, missing or not a folder."""
+    value = str(value or "").strip()
+    if not value or "\n" in value or "\0" in value or ":" in value:
+        raise AgentError(f"not a folder name: {value!r}")
+    home_real = os.path.realpath(home)
+    if value.startswith("~/"):
+        value = value[2:]
+    elif os.path.isabs(value):
+        norm = os.path.normpath(value)
+        if not (_inside(norm, home) or _inside(norm, home_real)):
+            raise AgentError(f"{value} isn't in the home folder")
+        value = os.path.relpath(norm, home if _inside(norm, home) else home_real)
+    parts = [p for p in value.replace("\\", "/").split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." or p.startswith(".") for p in parts):
+        raise AgentError(f"{value!r}: only visible folders in the home folder can be shared")
+    real = os.path.realpath(os.path.join(home, *parts))
+    rel = os.path.relpath(real, home_real)
+    if rel == "." or rel.startswith("..") or any(p.startswith(".") for p in rel.split(os.sep)):
+        raise AgentError(f"{value!r} leads out of the home folder or into a hidden folder ({real})")
+    if not os.path.isdir(real):
+        raise AgentError(f"{value!r} isn't a folder on this Frame")
+    return real, parts[-1]
+
+
+def extra_folder(app_dir, pkg, value, home=HOME, links=None):
+    """Prepare the extra folder for a game's start: /sdcard/<name> (<app_dir>/lepton-data/external/<name>) links to
+    it. Returns the path Lepton must bind-mount (the folder, or a link to it without spaces: Lepton breaks on paths
+    with spaces), or "" when the setting can't be used (the reason on stderr; the game starts without it)."""
+    def say(text):
+        print(f"{time.strftime('%F %T')} FramePort: {text}", file=sys.stderr)
+    try:
+        real, name = extra_folder_path(value, home)
+    except AgentError as exc:
+        say(f"extra folder not shared: {exc}")
+        return ""
+    if name.lower() in FOLDER_RESERVED:
+        say(f"extra folder not shared: /sdcard/{name} is Lepton's own")
+        return ""
+    mount = real
+    if re.search(r"[\s:,'\"\\$`]", real):
+        mount = os.path.join(links or os.path.join(HOME, ".local/share/frameport/lepton-paths"), f"{pkg}.folder")
+        os.makedirs(os.path.dirname(mount), exist_ok=True)
+        if os.path.lexists(mount):
+            if not os.path.islink(mount):
+                say(f"extra folder not shared: {mount} is in the way")
+                return ""
+            os.remove(mount)
+        os.symlink(real, mount)
+    external = os.path.join(app_dir, "lepton-data", "external")
+    dst = os.path.join(external, name)
+    os.makedirs(external, exist_ok=True)
+    if os.path.isdir(dst) and not os.path.islink(dst):
+        try:
+            os.rmdir(dst)
+        except OSError:
+            if os.path.lexists(dst + ".frameport-own"):
+                say(f"extra folder not shared: /sdcard/{name} and /sdcard/{name}.frameport-own both exist")
+                return ""
+            os.replace(dst, dst + ".frameport-own")  # the game's own folder of that name is kept beside it
+    elif os.path.lexists(dst) and not os.path.islink(dst):
+        say(f"extra folder not shared: /sdcard/{name} is a file")
+        return ""
+    if os.path.islink(dst):
+        os.remove(dst)
+    os.symlink(mount, dst)
+    try:
+        with open(os.path.join(app_dir, FOLDER_RECORD), "w") as f:
+            json.dump({"link": name, "target": mount, "folder": real}, f)
+    except OSError:
+        pass
+    say(f"/sdcard/{name} is {real}")
+    return mount
+
+
+def extra_folder_cleanup(base, value=None, home=HOME):
+    """At finalize: the /sdcard link of an extra folder the recipe no longer names (or names under another name) goes;
+    the game's own folder kept beside it comes back. Only FramePort's own link is touched."""
+    record = os.path.join(base, FOLDER_RECORD)
+    try:
+        with open(record) as f:
+            old = json.load(f)
+        name = str(old["link"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return
+    if value:
+        try:
+            if extra_folder_path(value, home)[1] == name:
+                return
+        except AgentError:
+            pass
+    if "/" in name or name in ("", ".", ".."):
+        return
+    dst = os.path.join(base, "lepton-data", "external", name)
+    if os.path.islink(dst) and os.readlink(dst) == old.get("target"):
+        os.remove(dst)
+        if os.path.isdir(dst + ".frameport-own") and not os.path.lexists(dst):
+            os.replace(dst + ".frameport-own", dst)
+    try:
+        os.remove(record)
+    except OSError:
+        pass
+
+
+# A game without network (device.offline, Discussion #505): Lepton keeps its own container network (pasta), because it
+# installs the APK at every start over it (`adb connect localhost:<port>` through pasta's -t port forward; with
+# --network=none `adb wait-for-device` hung for good). Once the container is up, _offline_guard adds an nftables table
+# to the container's network namespace (entered from the host: `podman unshare nsenter -t <pid> -n nft`, so it needs
+# no tool or capability inside Lepton's Android): its output chain accepts loopback, ICMP and replies (conntrack
+# established/related: adb's connections come in through the port forward) and rejects every new outbound connection,
+# DNS included. Android's own iptables rules (netd) live in other tables and can't remove it. Without nft the host's
+# iptables/ip6tables do the same in the OUTPUT chain. The guard checks the table every OFFLINE_CHECK s and adds it
+# again to a new container (Unreal's self-restart) while the launcher runs. Log: <base>/offline.log.
+OFFLINE_ENV = "FRAMEPORT_OFFLINE"
+OFFLINE_LINE = ('[[ "${{FRAMEPORT_OFFLINE:-}}" != 1 ]] || python3 {agent_q} _offline_guard "$SteamAppId" $$ '
+                '>"$app_dir/offline.log" 2>&1 9>&- &  # FramePort: no network for this game (device.offline)')
+OFFLINE_TABLE = "frameport_offline"
+OFFLINE_NFT = f"""table inet {OFFLINE_TABLE} {{
+    chain out {{
+        type filter hook output priority -10; policy accept;
+        oifname "lo" accept
+        ct state established,related accept
+        meta l4proto {{ icmp, ipv6-icmp }} accept
+        meta l4proto tcp reject with tcp reset
+        reject
+    }}
+}}
+"""
+OFFLINE_IPT = [["-o", "lo", "-j", "ACCEPT"], ["-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
+               ["-p", "tcp", "-j", "REJECT", "--reject-with", "tcp-reset"], ["-j", "REJECT"]]
+OFFLINE_CHECK = 10
+
+
+def set_offline_line(text, wanted):
+    """OFFLINE_LINE after `child=''` (before Lepton starts), once, when the recipe has device.offline."""
+    text = "".join(line for line in text.splitlines(True) if " _offline_guard " not in line)
+    if not wanted or "\nchild=''\n" not in text:
+        return text
+    line = OFFLINE_LINE.format(agent_q=shlex.quote(os.path.abspath(__file__)))
+    return text.replace("\nchild=''\n", "\nchild=''\n" + line + "\n", 1)
+
+
+def container_pid(container, runner=run):
+    """The host pid of a running container's first process, or 0."""
+    try:
+        p = runner(["podman", "inspect", "--format", "{{.State.Pid}}", container], timeout=20)
+        return int(p.stdout.strip() or 0) if p.returncode == 0 else 0
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 0
+
+
+def netns_cmd(pid, cmd):
+    return ["podman", "unshare", "nsenter", "-t", str(int(pid)), "-n", *cmd]
+
+
+def block_network(pid, runner=run):
+    """Reject new outbound connections in the network namespace of `pid` (see OFFLINE_NFT): (method or None,
+    detail). Idempotent: an existing table is replaced."""
+    errors = []
+    try:
+        runner(netns_cmd(pid, ["nft", "delete", "table", "inet", OFFLINE_TABLE]), timeout=20)
+        p = runner(netns_cmd(pid, ["nft", "-f", "-"]), input=OFFLINE_NFT, timeout=20)
+        if p.returncode == 0:
+            return "nft", ""
+        errors.append(f"nft: {(p.stderr or p.stdout).strip()[:300]}")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        errors.append(f"nft: {exc}")
+    try:
+        for tool in ("iptables", "ip6tables"):
+            for rule in reversed(OFFLINE_IPT):  # -I 1 in reverse: the rules end up in OFFLINE_IPT's order, first
+                p = runner(netns_cmd(pid, [tool, "-I", "OUTPUT", "1", *rule]), timeout=20)
+                if p.returncode != 0:
+                    raise AgentError(f"{tool}: {(p.stderr or p.stdout).strip()[:300]}")
+        return "iptables", ""
+    except (OSError, subprocess.TimeoutExpired, AgentError) as exc:
+        errors.append(str(exc))
+    return None, "; ".join(errors)
+
+
+def network_blocked(pid, method, runner=run):
+    """Whether the rules `method` added are still in the namespace of `pid`."""
+    try:
+        if method == "nft":
+            return runner(netns_cmd(pid, ["nft", "list", "table", "inet", OFFLINE_TABLE]), timeout=20).returncode == 0
+        return runner(netns_cmd(pid, ["iptables", "-C", "OUTPUT", *OFFLINE_IPT[-1]]), timeout=20).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def offline_guard(appid, parent, runner=run, alive=None, sleep=time.sleep, now=time.monotonic):
+    """While the launcher (parent) runs: keep the game's container without outbound network (device.offline)."""
+    container = f"lepton-steamlaunch-{int(appid)}"
+    alive = alive or pid_alive
+
+    def say(text):
+        print(f"{time.strftime('%H:%M:%S')} {text}", flush=True)
+    blocked, method, checked, failed = 0, None, 0.0, None
+    while alive(int(parent)):
+        pid = container_pid(container, runner)
+        if pid and pid != blocked:
+            method, detail = block_network(pid, runner)
+            if method:
+                say(f"container {container} (pid {pid}): new outbound connections blocked ({method})")
+                blocked, checked = pid, now()
+            else:
+                if detail != failed:
+                    say(f"container {container} (pid {pid}): could NOT block its network: {detail}")
+                    failed = detail
+                sleep(5.0)
+                continue
+        elif pid and now() - checked >= OFFLINE_CHECK:
+            checked = now()
+            if not network_blocked(pid, method, runner):
+                say("the rules were gone: adding them again")
+                blocked = 0
+                continue
+        sleep(0.5 if pid != blocked else 3.0)
+
+
+def upgrade_launchers():
+    """Give launchers written by older agents the parent watchdog, the dashboard closer and the play-session log (in
+    place: a new file, so a running launcher keeps reading the old one). Returns the packages changed."""
+    changed = []
+    for path in glob.glob(os.path.join(ANCHORS, "*/launch.sh")):
+        try:
+            text = open(path).read()
+        except OSError:
+            continue
+        new = text
+        # the codec line follows the game's deployment (only Lepton launchers have this variable; Proton/Linux
+        # launchers are never touched). Running launchers keep reading their old file.
+        if "export LEPTON_ENV_FRAMEBRIDGE_CONFIG=" in new:
+            cloud = cloud_dirs_line(os.path.basename(os.path.dirname(path)))
+            if cloud not in new:
+                new = new.replace("\nfix_perms\n", "\n" + cloud + "\nfix_perms\n", 1)
+            new = set_codec_line(new, wants_hw_video(os.path.dirname(path)))
+            new = set_tz_line(new)
+            new = set_gamepad_line(new, wants_gamepad(os.path.dirname(path)))
+            new = set_features_line(new, "\nexport FRAMEPORT_FEATURES=" in new)
+            new = set_offline_line(new, "\nexport FRAMEPORT_OFFLINE=1\n" in new)
+            new = set_locale_line(new)
+            pkg = os.path.basename(os.path.dirname(path))
+            dep = deployment(pkg) or {}
+            new = set_openxr_manifest_line(new, pkg, dep.get("static_openxr_loader", False))
+            base = launcher_base(new, pkg)
+            if base:  # games on a drive whose path has a space reach Lepton through a link (agent v83)
+                new = set_app_dir(new, base, pkg)[0]
+        if "a Linux app. Generated by FramePort" in new and "FRAMEPORT_DESKTOP" not in new:
+            new = upgrade_linux_launcher(new)
+        if OLD_WATCHDOG in new and "parent=$PPID" not in new:
+            new = new.replace(OLD_WATCHDOG, WATCHDOG, 1)
+        if "_dashboard_worker" not in new and 'child=$!\nwait "$child"' in new:
+            new = new.replace('child=$!\nwait "$child"', 'child=$!\n' + dashboard_line() + '\nwait "$child"', 1)
+        if "_logcat_keeper" not in new and "_dashboard_worker" in new and '\nwait "$child"' in new:
+            new = new.replace('\nwait "$child"', '\n' + logcat_line() + '\nwait "$child"', 1)
+        guard = '[[ -d "$app_dir/lepton-app" ]] ||'
+        if ".launch.lock" not in new and guard in new:
+            i = new.index("\n", new.index(guard)) + 1
+            new = new[:i] + SINGLE_LINE + "\n" + new[i:]
+            # the lock belongs to Lepton only: helpers that outlive the game must not keep it
+            new = new.replace("; fi; done ) & permfix=$!", "; fi; done ) 9>&- & permfix=$!", 1)
+            new = new.replace('>"$app_dir/dashboard.log" 2>&1 &', '>"$app_dir/dashboard.log" 2>&1 9>&- &', 1)
+        if "_restart_requested" not in new and new.endswith('\nwait "$child"\n') and "_dashboard_worker" in new:
+            m = re.search(r'\nsetsid (\S+) start >', new)
+            pkg = os.path.basename(os.path.dirname(path))
+            try:
+                lepton = shlex.split(m.group(1))[0] if m else None
+            except ValueError:
+                lepton = None
+            if lepton:
+                new = new[:-len('wait "$child"\n')] + restart_block(pkg, lepton) + "\n"
+        if PLAYS_LOG not in new:
+            start, end = plays_lines(os.path.dirname(path))
+            if "\nsetsid " in new and "\n    trap - EXIT INT TERM\n" in new:  # Lepton launcher
+                new = new.replace("\nsetsid ", f"\n{start}\nsetsid ", 1)
+                new = new.replace("\n    trap - EXIT INT TERM\n", f"\n    trap - EXIT INT TERM\n    {end}\n", 1)
+            elif "\nexec " in new:  # Proton launcher: exec replaces the shell, so only the start is logged
+                new = new.replace("\nexec ", f"\n{start}\nexec ", 1)
+        if "export LEPTON_ENV_FRAMEBRIDGE_CONFIG=" in new:
+            # Normalize startup helpers after restoring the play log, so the first upgrade has the final order.
+            pkg = os.path.basename(os.path.dirname(path))
+            new = set_config_sync_line(new, pkg, wants_config_sync(os.path.dirname(path)))
+            new = set_room_sync_line(new, pkg, wants_scene_room(os.path.dirname(path)))
+            new = set_refresh_rate_line(new, pkg)
+            new = set_theater_line(new, pkg)
+        if "export LEPTON_ENV_FRAMEBRIDGE_CONFIG=" in new and "_snapshot_close" not in new:
+            # The end log follows podman kill in stop(), while the launcher still owns fd 9.
+            end = plays_lines(os.path.dirname(path))[1]
+            new = new.replace(end, end + "\n    " + snapshot_line(os.path.basename(os.path.dirname(path))), 1)
+        if "export LEPTON_ENV_FRAMEBRIDGE_CONFIG=" in new:
+            try:  # the game is paused before it is stopped (GitHub #480, agent v120)
+                new = set_pause_lines(new, os.path.basename(os.path.dirname(path)))
+            except AgentError:
+                pass
+            # ... also when Steam's own Exit game ends it (agent v121)
+            new = set_exit_hook_line(new, os.path.basename(os.path.dirname(path)))
+        if new == text:
+            continue
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(new)
+        os.chmod(tmp, os.stat(path).st_mode)
+        os.replace(tmp, path)
+        changed.append(os.path.basename(os.path.dirname(path)))
+    return changed
+
+
+def wants_hw_video(anchor):
+    """Whether this game's launcher gets the shared codec (frame.hw_video_decode): deployment.json's choice (written
+    at finalize), else its recipe's patches. A game that had agent <= 70's per-game codec (extracted from its APK:
+    Batman) keeps it; that choice is saved, since ensure_host_fixes then removes the old codec folder."""
+    path = os.path.join(anchor, "deployment.json")
+    try:
+        with open(path) as f:
+            dep = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(dep, dict):
+        return False
+    if "hw_video_decode" in dep:
+        return bool(dep["hw_video_decode"])
+    recipe = dep.get("recipe") if isinstance(dep.get("recipe"), dict) else {}
+    if HW_VIDEO_PATCH in (recipe.get("patches") or []):
+        return True
+    base = dep.get("base")
+    if isinstance(base, str) and os.path.exists(os.path.join(base, "frameport-codec/bin/podman")):
+        dep["hw_video_decode"] = True
+        with open(path + ".tmp", "w") as f:
+            json.dump(dep, f, indent=2)
+        os.replace(path + ".tmp", path)
+        return True
+    return False
+
+
+def set_codec_line(text, want):
+    """A Lepton launcher with the current codec line (+ the decoder users line) where it belongs (want) or none;
+    earlier lines are dropped."""
+    text = text.replace(DECODER_USERS_LINE + "\n", "")
+    at = -1
+    for line in (VIDEO_CODEC_LINE, *OLD_CODEC_LINES):
+        i = text.find(line + "\n")
+        while i >= 0:
+            text = text[:i] + text[i + len(line) + 1:]
+            at = i if at < 0 else min(at, i)  # the earliest one's place (text before it is unchanged)
+            i = text.find(line + "\n")
+    if want:
+        if at < 0:
+            for anchor in ("\nchild=''\n", "\nsetsid "):
+                if anchor in text:
+                    at = text.index(anchor) + 1
+                    break
+        if at >= 0:
+            text = text[:at] + VIDEO_CODEC_LINE + "\n" + DECODER_USERS_LINE + "\n" + text[at:]
+    return text
+
+
+def wants_gamepad(anchor):
+    """Whether this game's launcher passes Steam Input's virtual gamepad into its container (device.steam_gamepad):
+    deployment.json's choice (written at finalize), else its recipe's patches."""
+    try:
+        with open(os.path.join(anchor, "deployment.json")) as f:
+            dep = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(dep, dict):
+        return False
+    if "steam_gamepad" in dep:
+        return bool(dep["steam_gamepad"])
+    recipe = dep.get("recipe") if isinstance(dep.get("recipe"), dict) else {}
+    return GAMEPAD_PATCH in (recipe.get("patches") or [])
+
+
+def wrapper_lines(hw_video, gamepad, features=False):
+    """The launcher's Podman wrapper lines (none, some or all). FramePort's lines (gamepad, features) come last, so
+    its wrapper is first on PATH and hands on to the codec wrapper."""
+    return "\n".join(line for line, want in ((VIDEO_CODEC_LINE, hw_video), (DECODER_USERS_LINE, hw_video),
+                                             (GAMEPAD_LINE, gamepad), (FEATURES_LINE, features)) if want)
+
+
+def set_features_line(text, want):
+    """A Lepton launcher with the features line (want) or without it: after the gamepad line, else after the codec
+    lines, else where they would be. A launcher that has it after those lines keeps it where it is."""
+    here = text.find(FEATURES_LINE + "\n")
+    if want and here >= 0 and all(text.find(line + "\n") < here
+                                  for line in (GAMEPAD_LINE, DECODER_USERS_LINE, VIDEO_CODEC_LINE)):
+        return text
+    for line in (FEATURES_LINE, *OLD_FEATURES_LINES):
+        text = text.replace(line + "\n", "")
+    if not want:
+        return text
+    at = -1
+    for line in (GAMEPAD_LINE, DECODER_USERS_LINE, VIDEO_CODEC_LINE):
+        i = text.find(line + "\n")
+        if i >= 0:
+            at = i + len(line) + 1
+            break
+    if at < 0:
+        at = next((text.index(a) + 1 for a in ("\nchild=''\n", "\nsetsid ") if a in text), -1)
+    return text if at < 0 else text[:at] + FEATURES_LINE + "\n" + text[at:]
+
+
+def set_gamepad_line(text, want):
+    """A Lepton launcher with the gamepad line (want) or without it. It always follows the codec line (when there is
+    one), else stands where the codec line would."""
+    for line in (GAMEPAD_LINE, *OLD_GAMEPAD_LINES):
+        text = text.replace(line + "\n", "")
+    if not want:
+        return text
+    i = text.find(VIDEO_CODEC_LINE + "\n")
+    if i >= 0:
+        at = i + len(VIDEO_CODEC_LINE) + 1
+        if text.startswith(DECODER_USERS_LINE + "\n", at):  # the codec line's companion stays next to it
+            at += len(DECODER_USERS_LINE) + 1
+    else:
+        at = next((text.index(a) + 1 for a in ("\nchild=''\n", "\nsetsid ") if a in text), -1)
+    return text if at < 0 else text[:at] + GAMEPAD_LINE + "\n" + text[at:]
+
+
+# Android's layout for an Xbox 360 pad (AOSP's Vendor_045e_Product_028e.kl, with Select as BUTTON_SELECT instead of
+# BACK, which would close many apps): Steam's virtual pad reports Valve's ids, so Android would fall back to Generic.kl
+# (triggers on Z/RZ, right stick on RX/RY: games then mix up the right stick and the triggers). The D-pad keys
+# (BTN_DPAD_*, as AOSP's Generic.kl) cover a pad that sends its D-pad as buttons rather than the hat axes: the Frame's
+# left controller has a D-pad; which inputs reach a 2D app still depends on its Steam Input layout (GitHub #162).
+GAMEPAD_KL = """# Steam Input virtual gamepad (Xbox 360 layout). Written by FramePort (device.steam_gamepad).
+key 304   BUTTON_A
+key 305   BUTTON_B
+key 307   BUTTON_X
+key 308   BUTTON_Y
+key 310   BUTTON_L1
+key 311   BUTTON_R1
+key 314   BUTTON_SELECT
+key 315   BUTTON_START
+key 316   BUTTON_MODE
+key 317   BUTTON_THUMBL
+key 318   BUTTON_THUMBR
+key 544   DPAD_UP
+key 545   DPAD_DOWN
+key 546   DPAD_LEFT
+key 547   DPAD_RIGHT
+axis 0x00 X flat 4096
+axis 0x01 Y flat 4096
+axis 0x03 Z flat 4096
+axis 0x04 RZ flat 4096
+axis 0x02 LTRIGGER
+axis 0x05 RTRIGGER
+axis 0x10 HAT_X
+axis 0x11 HAT_Y
+"""
+BTN_SOUTH = 0x130  # BTN_A / BTN_GAMEPAD: Linux's gamepad button range starts here
+# A game's own button layout (device.steam_gamepad's options, GitHub #162: Steam Input's per-game remapping doesn't
+# reach a 2D app): its launcher exports FRAMEPORT_GAMEPAD_LAYOUT (comma list: swap_sticks = the right stick is
+# Android's main stick, which Android's own D-pad navigation follows; swap_ab) and FRAMEPORT_GAMEPAD_KEYS (Android .kl
+# lines separated by ';', each replacing the line for the same key code or axis), read by podman_run_args.
+KL_LINE = re.compile(r"(key [0-9]{1,4} [A-Z][A-Z0-9_]{0,40}( (FUNCTION|WAKE))?"
+                     r"|axis 0x[0-9a-f]{1,2} (invert )?[A-Z][A-Z0-9_]{0,40}( flat [0-9]{1,5})?)")
+
+
+def gamepad_kl(layout="", keys=""):
+    """GAMEPAD_KL with a game's layout options and own lines (invalid ones left out); the text and what was left out."""
+    lines = {}
+    for line in GAMEPAD_KL.splitlines()[1:]:
+        kind, code = line.split()[:2]
+        lines[(kind, code if kind == "axis" else str(int(code)))] = line
+    opts = {o.strip() for o in (layout or "").split(",") if o.strip()}
+    if "swap_sticks" in opts:
+        lines[("axis", "0x00")], lines[("axis", "0x03")] = "axis 0x00 Z flat 4096", "axis 0x03 X flat 4096"
+        lines[("axis", "0x01")], lines[("axis", "0x04")] = "axis 0x01 RZ flat 4096", "axis 0x04 Y flat 4096"
+    if "swap_ab" in opts:
+        lines[("key", "304")], lines[("key", "305")] = "key 304   BUTTON_B", "key 305   BUTTON_A"
+    skipped = []
+    for line in (keys or "").split(";"):
+        line = " ".join(line.split())
+        if not line:
+            continue
+        if not KL_LINE.fullmatch(line):
+            skipped.append(line)
+            continue
+        kind, code = line.split()[:2]
+        lines[(kind, code if kind == "axis" else str(int(code)))] = line
+    head = GAMEPAD_KL.splitlines()[0] + (f" Options: {layout or '-'}; own lines: {keys}" if opts or keys else "")
+    return "\n".join([head, *lines.values()]) + "\n", skipped
+
+
+def has_key_bit(caps, code):
+    """Whether a sysfs capabilities/key bitmap (hex words, most significant first, one per long) has `code`."""
+    words = caps.split()
+    bits = 8 * struct.calcsize("l")  # the kernel's long (64 on the Frame); words aren't zero-padded
+    index = len(words) - 1 - code // bits
+    try:
+        return index >= 0 and bool(int(words[index], 16) >> (code % bits) & 1)
+    except ValueError:
+        return False
+
+
+def steam_gamepads(sys_root="/sys", dev_root="/dev"):
+    """Steam Input's virtual gamepads ([{event, product, name}]): input devices Steam creates through uinput
+    (/sys/devices/virtual/input) with Valve's vendor id (28de) and gamepad buttons. Steam names them "Microsoft X-Box
+    360 pad N" (seen on the Frame; older clients "Steam Virtual Gamepad"); Valve's other virtual devices (e.g.
+    steamos-manager's keys, 28de:0000) have no gamepad buttons."""
+    pads = []
+    for sys_event in sorted(glob.glob(os.path.join(sys_root, "class/input/event*")),
+                            key=lambda p: int(re.sub(r"\D", "", os.path.basename(p)) or 0)):
+        event = os.path.basename(sys_event)
+        device = os.path.join(sys_event, "device")
+
+        def read(rel, device=device):
+            try:
+                with open(os.path.join(device, rel)) as f:
+                    return f.read().strip()
+            except OSError:
+                return ""
+        if read("id/vendor").lower() != "28de" or not has_key_bit(read("capabilities/key"), BTN_SOUTH):
+            continue
+        if "/devices/virtual/" not in os.path.realpath(device) + "/":
+            continue  # Valve hardware itself (a Steam Deck's controls): Steam Input reads it and makes a virtual pad
+        node = os.path.join(dev_root, "input", event)
+        if not os.path.exists(node) or not os.access(node, os.R_OK | os.W_OK):
+            continue
+        pads.append({"event": event, "product": read("id/product").lower() or "0000", "name": read("name")})
+    return pads
+
+
+def podman_run_args(args, env, sys_root="/sys", dev_root="/dev"):
+    """FramePort's Podman wrapper (PODMAN_WRAPPER) for `podman run`: the game's own container
+    (lepton-steamlaunch-<SteamAppId>, launcher env) gets the host's /dev/input at PAD_DIR and the gamepad key layout
+    when its launcher asked for them (FRAMEPORT_GAMEPAD=1, the gamepad line); _gamepad_links then links Steam's pads
+    into the container's /dev/input. Anything else: the arguments unchanged. Lepton mounts a tmpfs over /dev, so a
+    `--device` node would vanish under it, and its /dev/input holds its own Wayland input pipes: a bind mount next to
+    it, like Lepton's own GPU nodes. System features the launcher names (FRAMEPORT_FEATURES, the features line) are
+    added as a permissions file in the container's /system/etc/permissions (device.hybrid_app)."""
+    if args[:1] != ["run"]:
+        return args
+    gamepad = env.get("FRAMEPORT_GAMEPAD") == "1" and env.get("FRAMEPORT_NO_GAMEPAD", "0") in ("", "0")
+    features = system_features(env.get("FRAMEPORT_FEATURES", ""))
+    if not gamepad and not features:
+        return args
+    appid = env.get("SteamAppId", "")
+    name = None
+    for i, arg in enumerate(args):
+        if arg == "--name" and i + 1 < len(args):
+            name = args[i + 1]
+        elif arg.startswith("--name="):
+            name = arg.partition("=")[2]
+    if not re.fullmatch(r"[0-9]+", appid) or name != f"lepton-steamlaunch-{appid}":
+        return args
+    taken = set()
+    for i, arg in enumerate(args):  # destinations Lepton mounts itself (a future Lepton passing pads through)
+        spec = args[i + 1] if arg == "--mount" and i + 1 < len(args) else arg.partition("=")[2] \
+            if arg.startswith("--mount=") else ""
+        for item in spec.split(","):
+            key, _, value = item.partition("=")
+            if key in ("destination", "target", "dst"):
+                taken.add(value)
+    extra = []
+    if gamepad:
+        extra += gamepad_mounts(env, taken, sys_root, dev_root)
+    if features and FEATURES_TARGET not in taken:
+        extra += ["--mount", f"type=bind,source={features_file(features)},destination={FEATURES_TARGET},ro"]
+        print(f"FramePort: system features for this container: {', '.join(features)}", file=sys.stderr)
+    return [args[0], *extra, *args[1:]] if extra else args
+
+
+def gamepad_mounts(env, taken, sys_root="/sys", dev_root="/dev"):
+    """podman_run_args' mounts for Steam Input's virtual gamepad: the host's /dev/input and the key layout."""
+    pads = steam_gamepads(sys_root, dev_root)
+    extra = []
+    if PAD_DIR not in taken:
+        extra += ["--mount", f"type=bind,source={os.path.join(dev_root, 'input')},destination={PAD_DIR},rw"]
+    text, skipped = gamepad_kl(env.get("FRAMEPORT_GAMEPAD_LAYOUT", ""), env.get("FRAMEPORT_GAMEPAD_KEYS", ""))
+    layout = gamepad_layout_file(text) if extra else ""
+    if skipped:
+        print(f"FramePort gamepad: key layout lines left out (not .kl syntax): {'; '.join(skipped)}", file=sys.stderr)
+    if text != GAMEPAD_KL:
+        print(f"FramePort gamepad: own button layout ({env.get('FRAMEPORT_GAMEPAD_LAYOUT') or '-'}"
+              f"{'; ' + env['FRAMEPORT_GAMEPAD_KEYS'] if env.get('FRAMEPORT_GAMEPAD_KEYS') else ''})", file=sys.stderr)
+    for product in sorted({"11ff", *(p["product"] for p in pads)}):  # 11ff: Steam's pad, also when it comes later
+        target = f"/system/usr/keylayout/Vendor_28de_Product_{product}.kl"
+        if layout and target not in taken and re.fullmatch(r"[0-9a-f]{4}", product):
+            extra += ["--mount", f"type=bind,source={layout},destination={target},ro"]
+    if ignore_pointer(env) and POINTER_PIPE not in taken:
+        extra += ["--mount", f"type=bind,source={os.path.join(dev_root, 'null')},destination={POINTER_PIPE}"]
+        print(f"FramePort gamepad: the laser pointer is ignored in this container (/dev/null at {POINTER_PIPE})",
+              file=sys.stderr)
+    names = ", ".join(f"{p['event']} ({p['name']}, 28de:{p['product']})" for p in pads) or "none"
+    print(f"FramePort gamepad: Steam Input virtual gamepads for this container: {names}", file=sys.stderr)
+    return extra
+
+
+def ignore_pointer(env):
+    """Whether the launcher asked to leave the laser pointer out of the container (POINTER_ENV)."""
+    return str(env.get(POINTER_ENV, "")) == "1"
+
+
+def system_features(value):
+    """The feature names in FRAMEPORT_FEATURES (comma-separated); anything that isn't a feature name is left out."""
+    return sorted({f for f in (part.strip() for part in str(value or "").split(","))
+                   if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+", f) and len(f) <= 128})
+
+
+def features_file(features):
+    """The permissions file that declares `features` (one per distinct set, next to the Podman wrapper)."""
+    text = ('<?xml version="1.0" encoding="utf-8"?>\n<!-- Written by FramePort (device.hybrid_app). -->\n'
+            "<permissions>\n" + "".join(f'    <feature name="{f}" />\n' for f in features) + "</permissions>\n")
+    path = os.path.join(os.path.dirname(PODMAN_BIN),
+                        f"features-{hashlib.sha256(text.encode()).hexdigest()[:12]}.xml")
+    try:
+        with open(path) as f:
+            if f.read() == text:
+                return path
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+    return path
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
+def gamepad_link_script(want, linked):
+    """Shell for the container: /dev/input links to Steam's pads (want: event names) instead of linked ones."""
+    gone = sorted(set(linked) - set(want))
+    parts = [f"rm -f /dev/input/{e}" for e in gone if re.fullmatch(r"event[0-9]+", e)]
+    parts += [f"[ -e /dev/input/{e} ] || ln -s {PAD_DIR}/{e} /dev/input/{e}" for e in sorted(want)
+              if re.fullmatch(r"event[0-9]+", e)]
+    return "; ".join(parts) or "true"
+
+
+def gamepad_links(appid, parent, poll=1.0, refresh=15.0, exec_=None, pads=steam_gamepads, alive=pid_alive):
+    """While the launcher (parent) runs: keep the game's container's /dev/input links in step with Steam's virtual
+    pads (made when the Frame's controllers wake up, gone when they sleep). Re-applied every `refresh` s, so a
+    container Lepton started again gets them too."""
+    container = f"lepton-steamlaunch-{int(appid)}"
+    exec_ = exec_ or (lambda script: run(["podman", "exec", container, "sh", "-c", script], timeout=20))
+    linked, last = set(), 0.0
+    while alive(int(parent)):
+        want = {p["event"] for p in pads()}
+        now = time.monotonic()
+        if want != linked or (want and now - last >= refresh):
+            r = exec_(gamepad_link_script(want, linked))
+            if r.returncode == 0:
+                if want != linked:
+                    print(f"{time.strftime('%H:%M:%S')} pads: {', '.join(sorted(want)) or 'none'}", flush=True)
+                linked, last = want, now
+        time.sleep(poll)
+
+
+def gamepad_layout_file(text=GAMEPAD_KL):
+    """The key layout file for `text`: steam-gamepad.kl, or one per distinct own layout (steam-gamepad-<hash>.kl)."""
+    name = "steam-gamepad.kl" if text == GAMEPAD_KL else \
+        f"steam-gamepad-{hashlib.sha256(text.encode()).hexdigest()[:12]}.kl"
+    path = os.path.join(os.path.dirname(PODMAN_BIN), name)
+    try:
+        with open(path) as f:
+            if f.read() == text:
+                return path
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+    return path
+
+
+# FramePort's Podman wrapper (agent/bin/podman). Small on purpose: every Podman call Lepton makes goes through it while
+# a launcher has it on PATH, so only `run` loads the agent (podman_run_args); everything else, and any failure, goes
+# straight to the next Podman on PATH: the one after this folder (the codec wrapper of a game with hardware video
+# decoding, else Podman itself), with this folder taken off PATH so the next wrapper can't come back here.
+PODMAN_WRAPPER = r'''#!/usr/bin/python3
+"""FramePort's Podman wrapper (written by frameport_agent.py: ensure_podman_wrapper; see podman_run_args)."""
+import os
+import shutil
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+
+def chain():
+    """The next Podman (after this folder on PATH, else the first other one) and PATH without this folder."""
+    own = os.path.realpath(__file__)
+    entries = os.environ.get("PATH", os.defpath).split(os.pathsep)
+    mine = [i for i, e in enumerate(entries) if os.path.realpath(e or os.curdir) == HERE]
+    order = entries[mine[0] + 1:] if mine else entries
+    for entry in order + ["/usr/local/bin", "/usr/bin", "/bin"]:
+        folder = os.path.realpath(entry or os.curdir)
+        found = shutil.which("podman", path=folder) if folder != HERE else None
+        if found and os.path.realpath(found) != own:
+            return found, os.pathsep.join(e for i, e in enumerate(entries) if i not in mine)
+    sys.exit("FramePort: no Podman found after its wrapper")
+
+
+podman, path = chain()
+args = sys.argv[1:]
+env = dict(os.environ, PATH=path)
+if args[:1] == ["run"]:
+    try:
+        sys.path.insert(0, os.path.dirname(HERE))
+        import frameport_agent
+        args = frameport_agent.podman_run_args(args, env)
+    except Exception as exc:  # a gamepad problem must never stop the game's container from starting
+        print(f"FramePort: Podman wrapper left the arguments unchanged: {exc}", file=sys.stderr)
+        args = sys.argv[1:]
+os.execve(podman, [podman, *args], env)
+'''
+
+
+def ensure_podman_wrapper():
+    """Write FramePort's Podman wrapper (PODMAN_BIN/podman) when it is missing or differs; returns whether it was
+    written. Launchers only use it while their gamepad line is there."""
+    path = os.path.join(PODMAN_BIN, "podman")
+    try:
+        with open(path) as f:
+            if f.read() == PODMAN_WRAPPER and os.access(path, os.X_OK):
+                return False
+    except OSError:
+        pass
+    os.makedirs(PODMAN_BIN, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        f.write(PODMAN_WRAPPER)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, path)
+    return True
+
+
+def remove_old_codec_dirs():
+    """Agent <= 70 extracted a per-game codec into <base>/frameport-codec; the shared codec replaced it. Removed
+    once the game's launcher no longer uses it (upgrade_launchers converted it; the choice is in deployment.json or
+    the recipe's patches)."""
+    removed = []
+    for dep_path in glob.glob(os.path.join(ANCHORS, "*/deployment.json")):
+        try:
+            with open(dep_path) as f:
+                dep = json.load(f)
+            base = dep.get("base")
+        except (OSError, ValueError, AttributeError):
+            continue
+        old = os.path.join(base, "frameport-codec") if isinstance(base, str) else ""
+        if not old or not os.path.isdir(old) or os.path.islink(old):
+            continue
+        try:
+            with open(os.path.join(os.path.dirname(dep_path), "launch.sh")) as f:
+                launcher = f.read()
+        except OSError:
+            launcher = ""
+        if "frameport-codec" in launcher:
+            continue  # its launcher hasn't been converted yet
+        shutil.rmtree(old, ignore_errors=True)
+        removed.append(dep.get("package") or os.path.basename(os.path.dirname(dep_path)))
+    return removed
+
+
+def cmd_video_codec_switch(args):
+    """FramePort's setting "Hardware video decoding" for every game on this Frame: off writes VIDEO_CODEC_DIR/disabled,
+    which launchers and the wrapper check at every start (no launcher rewrite, running games keep what they have)."""
+    flag = os.path.join(VIDEO_CODEC_DIR, "disabled")
+    if args.get("enabled", True):
+        if os.path.exists(flag):
+            os.remove(flag)
+    else:
+        os.makedirs(VIDEO_CODEC_DIR, exist_ok=True)
+        with open(flag, "w") as f:
+            f.write("switched off in FramePort\n")
+    return cmd_video_codec_status({})
+
+
+def upgrade_linux_launcher(text):
+    """A Linux app's launcher from before agent v63, made fit for Desktop Mode's menu entry (GitHub #84): no Steam
+    parent watchdog and no display taken from Steam when FRAMEPORT_DESKTOP is set."""
+    old_if = 'if [[ -z "${DISPLAY:-}" ]]; then'
+    if old_if in text:
+        text = text.replace(old_if, 'if [[ -z "${FRAMEPORT_DESKTOP:-}" && -z "${DISPLAY:-}" ]]; then', 1)
+    if "\nparent=$PPID\n" in text:
+        text = text.replace("\nparent=$PPID\n",
+                            '\nparent=$PPID\n[[ -n "${FRAMEPORT_DESKTOP:-}${FRAMEPORT_OVERLAY:-}" ]] && parent=1\n', 1)
+    return text
+
+
+def set_openxr_manifest_line(text, pkg, enabled):
+    line = (f"python3 {shlex.quote(os.path.abspath(__file__))} _openxr_manifest {shlex.quote(pkg)}")
+    text = "\n".join(ln for ln in text.split("\n") if " _openxr_manifest " not in ln)
+    if enabled:
+        text = text.replace("\nfix_perms\n", "\n" + line + "\nfix_perms\n", 1)
+    return text
+
+
+def write_launcher(anchor, base, pkg, title, appid, lepton, env, hw_video=False, gamepad=False,
+                   config_sync=False, static_openxr=False, scene_room=False, features=False):
+    extra = "".join(f"export {k}={shlex.quote(str(v))}\n" for k, v in (env or {}).items()
+                    if re.fullmatch(r"[A-Z_][A-Z0-9_]*", k))
+    text = LAUNCH_SH.format(title=title.replace("\n", " "), pkg=pkg, app_dir=app_dir_lines(base, pkg), appid=appid,
+                            lepton_q=shlex.quote(lepton), extra_env=extra, watchdog=WATCHDOG,
+                            dashboard=dashboard_line(), logcat=logcat_line(), single=SINGLE_LINE,
+                            cloud_dirs=cloud_dirs_line(pkg),
+                            video_codec=wrapper_lines(hw_video, gamepad, features),
+                            plays_start=plays_lines(anchor)[0],
+                            plays_end=plays_lines(anchor)[1], save_snapshot=snapshot_line(pkg),
+                            restart=restart_block(pkg, lepton))
+    text = set_tz_line(text)
+    text = set_share_lines(text, bool((env or {}).get("FRAMEPORT_SHARE")))
+    text = set_folder_lines(text, pkg, bool((env or {}).get(FOLDER_ENV)))
+    text = set_locale_line(text)
+    text = set_offline_line(text, str((env or {}).get(OFFLINE_ENV, "")) == "1")
+    try:
+        ensure_lepton_shims()
+    except OSError:
+        pass
+    text = set_openxr_manifest_line(text, pkg, static_openxr)
+    text = set_config_sync_line(text, pkg, config_sync)
+    text = set_room_sync_line(text, pkg, scene_room)
+    text = set_refresh_rate_line(text, pkg)
+    text = set_theater_line(text, pkg)
+    text = set_pause_lines(text, pkg)
+    text = set_exit_hook_line(text, pkg)
+    path = os.path.join(anchor, "launch.sh")
+    with open(path + ".tmp", "w") as f:
+        f.write(text)
+    os.chmod(path + ".tmp", 0o755)
+    os.replace(path + ".tmp", path)
+
+
+def write_openxr_runtime_manifest(base, enabled):
+    """Lepton maps this per-game external root to /sdcard. Never follow a game's symlink."""
+    if not enabled:
+        return
+    root = os.path.join(base, "lepton-data", "external")
+    os.makedirs(root, exist_ok=True)
+    payload = {"file_format_version": "1.0.0",
+               "runtime": {"library_path": "libfp_xrruntime.so", "name": "FramePort"}}
+    for rel in ("fp_openxr_runtime.json", "fp/1/active_runtime.json"):
+        parent = os.path.dirname(os.path.join(root, rel))
+        if not _inside(os.path.realpath(parent), os.path.realpath(root)):
+            raise AgentError("refusing linked OpenXR manifest directory outside game storage")
+        os.makedirs(parent, exist_ok=True)
+        target = os.path.join(root, rel)
+        # Atomic replace repairs stale manifests without following the final symlink.
+        fd, tmp = tempfile.mkstemp(prefix=".fp-openxr-", dir=parent)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(payload, f, separators=(",", ":"))
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, target)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+
+
+def data_files_dir(base, pkg):
+    return os.path.join(base, "lepton-data/external/Android/data", pkg, "files")
+
+
+# ------------------------------------------------- saved game settings in step with the eye buffers (agent v78)
+# device.config_sync (per game, from its recipe; deployment.json "config_sync": {file relative to the game's
+# Android/data/<pkg>/files: {setting: expression}}). Some games save their render resolution and load it after they
+# created the headset's eye buffers: BlazeRush creates 2938x2938 buffers at scale 1.7, then loads its saved
+# user_config.xml (r_3dwidth/r_3dheight 1728, r_width/r_height 3072x1728) and draws a displaced, stretched picture with
+# black borders (Klownicle's guide, GitHub #57). The values are written while the game is stopped: at finalize, after
+# a Game settings change, and by the launcher before Lepton starts (the game rewrites its file when it exits, so a scale
+# changed while it ran is caught at the next start). The eye buffer = the runtime's recommended size (learned from the
+# game's last launch.log: FrameBridge logs it; older builds: the bridge's stereo= size divided by the logged scale)
+# times settings.conf's scale, rounded like FrameBridge does. Only existing numeric entries change; the previous file
+# is kept as <file>.frameport-backup and the new one replaces it atomically.
+CONFIG_EXPR_RE = re.compile(r"\s*([wh])\s*(?:\*\s*(\d+(?:\.\d+)?))?\s*(?:/\s*(\d+(?:\.\d+)?))?\s*")
+CONFIG_SYNC_LINE = 'python3 {agent_q} _config_sync {pkg_q} >"$app_dir/config-sync.log" 2>&1 9>&- || true'
+CONFIG_BACKUP = ".frameport-backup"
+RUNTIME_EYE_RE = re.compile(r"FrameBridge: runtime recommended eye size (\d+)x(\d+)")
+BRIDGE_STEREO_RE = re.compile(r"OVRPortVrApi: Initialized .*?stereo=(\d+)x(\d+)")
+ADAPTER_VIEW_RE = re.compile(r"FrameBridge: view 0 recommended (\d+)x(\d+)")
+ADAPTER_SCALE_RE = re.compile(r"FrameBridge: scale=([0-9.]+) ")
+
+
+def config_value(expr, w, h):
+    """An expression of the eye-buffer size: w, h, optionally *a and/or /b (for example h*16/9), rounded."""
+    m = CONFIG_EXPR_RE.fullmatch(str(expr))
+    if not m:
+        raise AgentError(f"bad config_sync expression {expr!r}")
+    value = (w if m.group(1) == "w" else h) * float(m.group(2) or 1) / float(m.group(3) or 1)
+    if not 0 < value < 1e6:
+        raise AgentError(f"config_sync expression {expr!r} out of range")
+    return int(value + 0.5)
+
+
+def settings_scale(base):
+    """FrameBridge's resolution scale for this game (settings.conf; out-of-range values are ignored like FrameBridge
+    does)."""
+    scale = 1.0
+    try:
+        for line in open(os.path.join(base, "settings.conf")):
+            k, _, v = line.strip().partition("=")
+            if k == "scale":
+                try:
+                    value = float(v)
+                except ValueError:
+                    continue
+                if 0.5 <= value <= 2.0:
+                    scale = value
+    except OSError:
+        pass
+    return scale
+
+
+def runtime_eye_size(base):
+    """(width, height) the Frame's runtime recommends per eye before FrameBridge's scale, from the game's last
+    launch.log / session.log, or None."""
+    for name in ("launch.log", "session.log"):
+        try:
+            with open(os.path.join(base, name), errors="replace") as f:
+                text = f.read(16 << 20)
+        except OSError:
+            continue
+        found = RUNTIME_EYE_RE.findall(text)
+        if found:
+            return int(found[-1][0]), int(found[-1][1])
+        scales = ADAPTER_SCALE_RE.findall(text)
+        sized = BRIDGE_STEREO_RE.findall(text) or ADAPTER_VIEW_RE.findall(text)
+        if sized and scales:
+            try:
+                scale = float(scales[-1])
+            except ValueError:
+                continue
+            if 0.5 <= scale <= 2.0:
+                return int(int(sized[-1][0]) / scale + 0.5), int(int(sized[-1][1]) / scale + 0.5)
+    return None
+
+
+def sync_config_text(text, values):
+    """(new text, {name: (old, new)}, [names not found]) with the numeric value of every named setting replaced; the
+    rest of the text stays byte for byte. Matches <x name="NAME" ... value="V">, <x value="V" ... name="NAME">,
+    <NAME value="V"/> and <NAME>V</NAME>."""
+    changed, missing = {}, []
+    num = r"-?\d+(?:\.\d+)?"
+    for name, new in values.items():
+        n = re.escape(name)
+        patterns = (rf"""(<[^<>]*\bname\s*=\s*["']{n}["'][^<>]*?\bvalue\s*=\s*["'])({num})(["'])""",
+                    rf"""(<[^<>]*?\bvalue\s*=\s*["'])({num})(["'][^<>]*\bname\s*=\s*["']{n}["'])""",
+                    rf"""(<{n}\b[^<>]*?\bvalue\s*=\s*["'])({num})(["'])""",
+                    rf"""(<{n}>\s*)({num})(\s*</{n}>)""")
+        for pattern in patterns:
+            m = re.search(pattern, text)
+            if m:
+                old = m.group(2)
+                if old != str(new):
+                    text = text[:m.start(2)] + str(new) + text[m.end(2):]
+                    changed[name] = (old, str(new))
+                break
+        else:
+            missing.append(name)
+    return text, changed, missing
+
+
+def sync_game_config(pkg, dep, check_running=True):
+    """Write the eye-buffer size into the game's saved settings (device.config_sync). Returns a report (None when the
+    game has no rules)."""
+    rules = (dep or {}).get("config_sync") or {}
+    if not isinstance(rules, dict) or not rules:
+        return None
+    base = dep["base"]
+    if check_running and dep.get("appid") and container_running(dep["appid"]):
+        return {"skipped": "the game is running (its next start corrects it)"}
+    runtime = runtime_eye_size(base)
+    if runtime and runtime != tuple(dep.get("eye_base") or ()):
+        dep["eye_base"] = list(runtime)
+        try:
+            write_deployment(pkg, dep)
+        except OSError:
+            pass
+    runtime = runtime or tuple(dep.get("eye_base") or ())
+    if len(runtime) != 2:
+        return {"skipped": "the Frame's eye-buffer size isn't known yet (it is after the game's first start)"}
+    scale = settings_scale(base)
+    w, h = int(runtime[0] * scale + 0.5), int(runtime[1] * scale + 0.5)
+    files_dir = os.path.realpath(data_files_dir(base, pkg))
+    out = {"eye": [w, h], "runtime": list(runtime), "scale": scale, "changed": {}, "missing": [], "files": []}
+    for rel, exprs in rules.items():
+        target = os.path.realpath(os.path.join(files_dir, str(rel)))
+        if not target.startswith(files_dir + os.sep) or not isinstance(exprs, dict):
+            out["missing"].append(str(rel))
+            continue
+        if not os.path.isfile(target):
+            out["files"].append({"file": rel, "exists": False})  # the game writes it itself, from the right size
+            continue
+        values = {str(k): config_value(v, w, h) for k, v in exprs.items()}
+        with open(target, encoding="utf-8", errors="surrogateescape", newline="") as f:
+            text = f.read()
+        new, changed, missing = sync_config_text(text, values)
+        out["missing"] += [f"{rel}:{k}" for k in missing]
+        out["files"].append({"file": rel, "exists": True, "changed": sorted(changed)})
+        if not changed:
+            continue
+        shutil.copy2(target, target + CONFIG_BACKUP)
+        tmp = target + ".frameport-tmp"
+        with open(tmp, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
+            f.write(new)
+        shutil.copymode(target, tmp)
+        os.replace(tmp, target)
+        out["changed"].update(changed)
+    return out
+
+
+def wants_config_sync(anchor):
+    try:
+        with open(os.path.join(anchor, "deployment.json")) as f:
+            dep = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return isinstance(dep, dict) and isinstance(dep.get("config_sync"), dict) and bool(dep["config_sync"])
+
+
+def set_config_sync_line(text, pkg, want):
+    """A Lepton launcher that brings the game's saved settings in step before Lepton starts (want), or without it."""
+    text = "".join(line for line in text.splitlines(True) if " _config_sync " not in line)
+    if not want or "\nsetsid " not in text:
+        return text
+    line = CONFIG_SYNC_LINE.format(agent_q=shlex.quote(os.path.abspath(__file__)), pkg_q=shlex.quote(pkg))
+    return text.replace("\nsetsid ", f"\n{line}\nsetsid ", 1)
+
+
+def config_sync_worker(pkg):
+    """launch.sh, before Lepton starts (the game isn't running: the launcher holds its launch lock)."""
+    dep = deployment(check_pkg(pkg))
+    print(json.dumps({"time": time.time(), "result": sync_game_config(pkg, dep, check_running=False) if dep else None}))
+
+
+def cmd_config_sync(args):
+    """Bring a game's saved settings in step with the eye buffers now (device.config_sync), unless it runs."""
+    pkg = check_pkg(args["package"])
+    dep = deployment(pkg)
+    if not dep:
+        raise AgentError(f"{pkg} is not installed")
+    return sync_game_config(pkg, dep)
+
+
+# SteamVR's OpenXR runtime only enumerates its current rate and rejects requests for any other rate. Select the
+# mode through the host's per-app setting before Lepton starts; the APK's refresh_rate setting alone cannot do it.
+class SteamVRSettings(SteamVRApps):
+    interface = b"FnTable:IVRSettings_003"
+    table_size = 11
+
+    def bool_setting(self, section, key, value=None):
+        """GetBool (after SetBool when `value` isn't None)."""
+        ct = self.ct
+        err = ct.c_int(0)
+        if value is not None:
+            ct.CFUNCTYPE(None, ct.c_char_p, ct.c_char_p, ct.c_bool, ct.POINTER(ct.c_int))(
+                self.table[1])(section.encode(), key.encode(), bool(value), ct.byref(err))  # SetBool
+            self._raise(err)
+        on = ct.CFUNCTYPE(ct.c_bool, ct.c_char_p, ct.c_char_p, ct.POINTER(ct.c_int))(
+            self.table[5])(section.encode(), key.encode(), ct.byref(err))  # GetBool
+        self._raise(err)
+        return bool(on)
+
+    def _raise(self, err):
+        if err.value:
+            name = self.ct.CFUNCTYPE(self.ct.c_char_p, self.ct.c_int)(self.table[0])(err.value)
+            raise AgentError((name or b"SteamVR settings error").decode())
+
+    def refresh_rate(self, appid, rate):
+        ct = self.ct
+        section, key = f"steam.app.{int(appid)}".encode(), b"preferredRefreshRate"
+        err = ct.c_int(0)
+        if rate > 0:
+            ct.CFUNCTYPE(None, ct.c_char_p, ct.c_char_p, ct.c_float, ct.POINTER(ct.c_int))(
+                self.table[3])(section, key, rate, ct.byref(err))  # SetFloat
+        else:
+            ct.CFUNCTYPE(None, ct.c_char_p, ct.c_char_p, ct.POINTER(ct.c_int))(
+                self.table[10])(section, key, ct.byref(err))  # RemoveKeyInSection: restore the game's choice
+        if err.value:
+            name = ct.CFUNCTYPE(ct.c_char_p, ct.c_int)(self.table[0])(err.value)
+            raise AgentError((name or b"SteamVR settings error").decode())
+
+
+REFRESH_RATE_MARKER = ".frameport-refresh-rate"
+
+
+def sync_refresh_rate(pkg, dep, check_running=True):
+    """Apply a saved Quest refresh rate to SteamVR. Retry from launch.sh when SteamVR wasn't available on save."""
+    if not dep or dep.get("kind", "quest") != "quest" or not dep.get("appid"):
+        return None
+    marker = os.path.join(dep["base"], REFRESH_RATE_MARKER)
+    rate = None
+    try:
+        for line in open(os.path.join(dep["base"], "settings.conf")):
+            key, _, value = line.strip().partition("=")
+            if key == "refresh_rate":
+                rate = float(value)
+    except (OSError, ValueError):
+        return {"skipped": "refresh rate settings missing or invalid"}
+    if rate is None and not os.path.exists(marker):
+        return None  # don't touch manually configured SteamVR preferences for games with no FramePort override
+    rate = rate or 0.0
+    if not (rate == 0 or 60 <= rate <= 144):
+        return {"skipped": "invalid refresh rate"}
+    if check_running and container_running(dep["appid"]):
+        return {"skipped": "the game is running (applied at its next start)"}
+    vr = None
+    try:
+        vr = SteamVRSettings.open()
+        if vr is None:
+            return {"skipped": "SteamVR unavailable (applied at the next start)"}
+        vr.refresh_rate(dep["appid"], rate)
+        if rate > 0:
+            with open(marker, "w") as f:
+                f.write(str(rate))
+        elif os.path.exists(marker):
+            os.remove(marker)
+        return {"refresh_rate": rate, "app_key": f"steam.app.{dep['appid']}"}
+    except (OSError, AgentError) as exc:
+        return {"skipped": str(exc)}
+    finally:
+        if vr is not None:
+            vr.close()
+
+
+THEATER_LINE = 'timeout 10s python3 {agent_q} _theater_hold {pkg_q} $$ >"$app_dir/theater.log" 2>&1 9>&- || true'
+
+
+def set_theater_line(text, pkg):
+    """Take the theater hold (vr_text_window games only; it checks) first thing, before the launcher's other steps."""
+    text = "".join(line for line in text.splitlines(True) if " _theater_hold " not in line)
+    if "\nexport SteamAppId=" not in text or "\nsetsid " not in text:
+        return text
+    line = THEATER_LINE.format(agent_q=shlex.quote(os.path.abspath(__file__)), pkg_q=shlex.quote(pkg))
+    return text.replace("\nexport SteamAppId=", f"\n{line}\nexport SteamAppId=", 1)
+
+
+def theater_hold_worker(pkg, launcher):
+    if vr_text_window(pkg):
+        print(f"{time.strftime('%H:%M:%S')} {theater_hold(launcher)}")
+
+
+def set_refresh_rate_line(text, pkg):
+    text = "".join(line for line in text.splitlines(True) if " _refresh_rate " not in line)
+    if "\nsetsid " not in text:
+        return text
+    agent = shlex.quote(os.path.abspath(__file__))
+    line = (f'timeout 10s python3 {agent} _refresh_rate {shlex.quote(pkg)} '
+            '>"$app_dir/refresh-rate.log" 2>&1 9>&- || true')
+    # Run before the wrappers, which are kept immediately ahead of child=''. Also stay ahead of the play log
+    # and config-sync steps so repairing those doesn't move this line on the next upgrade.
+    for anchor in ("\n" + VIDEO_CODEC_LINE + "\n", "\n" + GAMEPAD_LINE + "\n", "\nchild=''\n", "\nsetsid "):
+        if anchor in text:
+            return text.replace(anchor, f"\n{line}{anchor}", 1)
+    return text
+
+
+def refresh_rate_worker(pkg):
+    pkg = check_pkg(pkg)
+    print(json.dumps(sync_refresh_rate(pkg, deployment(pkg), check_running=False)))
+
+
+def cmd_video_codec_status(args):
+    """The shared codec installed on this Frame ({digest, revision}, {} if none or damaged) and whether FramePort's
+    setting switched it off for every game ("disabled")."""
+    status = video_codec_installed()
+    status["disabled"] = os.path.exists(os.path.join(VIDEO_CODEC_DIR, "disabled"))
+    return status
+
+
+def video_codec_installed():
+    path = os.path.join(VIDEO_CODEC_DIR, "current", "manifest.json")
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        manifest = json.loads(raw)
+        with open(os.path.join(os.path.dirname(path), "deployment.json")) as f:
+            config = json.load(f)
+        if not isinstance(config, dict) or config.get("scope") != "shared" or \
+                config.get("runtime_sha256") != manifest["runtime_sha256"]:
+            return {}
+        for name in VIDEO_CODEC_FILES:
+            local = "bin/podman" if name == "podman.py" else name
+            if sha256_file(os.path.join(os.path.dirname(path), local)) != manifest["files"][name]:
+                return {}
+        return {"digest": hashlib.sha256(raw).hexdigest(), "revision": manifest.get("revision", 1)}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
+def prune_video_codec_versions(versions, keep):
+    """Each revision is ~15 MB. Keep the active one and the one it replaced (a launch that resolved the old
+    'current' just before the switch still mounts its files); running containers hold their mounts anyway."""
+    for name in os.listdir(versions):
+        if name in keep or not re.fullmatch(r"[0-9a-f]{64}(\.previous-[0-9]+)?|\.install-.*", name):
+            continue
+        path = os.path.join(versions, name)
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def cmd_install_video_codec(args):
+    """Verify a shared payload, then publish its complete version in one step."""
+    encoded = args["bundle"]
+    if not isinstance(encoded, str) or len(encoded) > 32 * 1024 * 1024:
+        raise AgentError("oversized video codec bundle")
+    import io
+
+    raw = base64.b64decode(encoded, validate=True)
+    data = {}
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        if set(archive.namelist()) != {"manifest.json", *VIDEO_CODEC_FILES} or len(archive.infolist()) != 5:
+            raise AgentError("unexpected video codec bundle files")
+        for name in ("manifest.json", *VIDEO_CODEC_FILES):
+            if archive.getinfo(name).file_size > 16 * 1024 * 1024:
+                raise AgentError(f"oversized video codec asset: {name}")
+            data[name] = archive.read(name)
+    manifest = json.loads(data["manifest.json"])
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), dict) or \
+            not isinstance(manifest.get("revision", 1), int) or manifest.get("revision", 1) < 1:
+        raise AgentError("invalid video codec manifest")
+    digest = hashlib.sha256(data["manifest.json"]).hexdigest()
+    if digest != args["digest"]:
+        raise AgentError("video codec manifest checksum mismatch")
+    for name in VIDEO_CODEC_FILES:
+        if hashlib.sha256(data[name]).hexdigest() != manifest["files"][name]:
+            raise AgentError(f"video codec asset checksum mismatch: {name}")
+    # A second PC with older FramePort must not downgrade the shared codec.
+    os.makedirs(VIDEO_CODEC_DIR, exist_ok=True)
+    with open(os.path.join(VIDEO_CODEC_DIR, "install.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        current = video_codec_installed()
+        if current.get("digest") not in (None, digest) and current.get("revision", 0) >= manifest.get("revision", 1):
+            # another PC's FramePort installed this revision (or a newer one) built differently: keep it, two
+            # PCs mustn't replace each other's codec at every connection
+            return dict(current, kept=True)
+        versions = os.path.join(VIDEO_CODEC_DIR, "versions")
+        os.makedirs(versions, exist_ok=True)
+        version = os.path.join(versions, digest)
+        previous = os.path.basename(os.path.realpath(os.path.join(VIDEO_CODEC_DIR, "current")))
+        if current.get("digest") != digest:
+            stage = tempfile.mkdtemp(prefix=".install-", dir=versions)
+            try:
+                os.mkdir(os.path.join(stage, "bin"))
+                # Config first, executable last, then expose the entire version.
+                config = {"scope": "shared", "runtime_sha256": manifest["runtime_sha256"]}
+                with open(os.path.join(stage, "deployment.json"), "w") as f:
+                    json.dump(config, f)
+                for name in ("manifest.json", *[n for n in VIDEO_CODEC_FILES if n != "podman.py"], "podman.py"):
+                    target = os.path.join(stage, "bin/podman" if name == "podman.py" else name)
+                    with open(target, "wb") as f:
+                        f.write(data[name])
+                    os.chmod(target, 0o755 if name == "podman.py" else 0o644)
+                if os.path.lexists(version):
+                    # Preserve an interrupted/corrupt prior version for diagnosis.
+                    os.rename(version, version + f".previous-{time.time_ns()}")
+                os.rename(stage, version)
+                link = os.path.join(VIDEO_CODEC_DIR, f".current-{os.getpid()}")
+                if os.path.lexists(link):
+                    os.unlink(link)
+                os.symlink(os.path.join("versions", digest), link)
+                os.replace(link, os.path.join(VIDEO_CODEC_DIR, "current"))
+            finally:
+                if os.path.isdir(stage):
+                    shutil.rmtree(stage)
+        prune_video_codec_versions(versions, {digest, previous})
+        upgraded = upgrade_launchers()
+    return {"digest": digest, "revision": manifest.get("revision", 1), "launchers": upgraded}
+
+
+def set_flatscreen(app_dir, on):
+    """Lepton shows an app as a flat (2D) window only when its app folder holds this marker
+    (liblepton/app_metadata.sh); otherwise the app runs headless and only OpenXR output reaches the headset."""
+    marker = os.path.join(app_dir, "lepton-show-flatscreen")
+    if on:
+        open(marker, "a").close()
+    elif os.path.exists(marker):
+        os.remove(marker)
+
+
+# ---------------------------------------------------------------- mixed-reality room storage (format v1)
+# Standalone stdlib code: the PC validates the complete geometry; the agent also checks records and mesh sizes
+# before making an uploaded room current. Never import the desktop package on the Frame.
+ROOMS_DIR = os.path.join(HOME, ".local/share/frameport/rooms")
+ROOM_SCANNER = os.path.join(HOME, ".local/share/frameport/bin/fp_roomscan")
+ROOM_SYNC_LINE = ('python3 {agent_q} _room_sync {pkg_q} >"$app_dir/room-sync.log" 2>&1 9>&- || true '
+                  '# frameport-room-sync')
+# Scan clean-up (fp_roomscan's refinement + label rules): the owner's tuned defaults are compiled into the scanner;
+# refine.json holds only the settings that differ from them (PC: install/rooms.REFINE_DEFAULTS, same keys).
+ROOM_REFINE_FILE = os.path.join(ROOMS_DIR, "refine.json")
+ROOM_REFINE_DEFAULTS = {
+    "refine": 1, "walls": "panels", "band": 0.35, "facing_deg": 60, "band_in": 0.12, "floor_in": 0.08,
+    "ceil_in": 0.25, "top_strip": 0.5, "near": 0.03, "clip": 0.05, "clip_open": 0.10, "island": 0.20, "smooth": 8,
+    "tops": 0.10, "protect": 0, "tubes": 3.0, "tube_thick": 0.15, "walked": 0.40, "label_rules": 1,
+}
+ROOM_REFINE_LIMITS = {  # key -> (lowest, highest)
+    "refine": (0, 1), "band": (0, 2), "facing_deg": (1, 89), "band_in": (0, 2), "floor_in": (0, 2), "ceil_in": (0, 2),
+    "top_strip": (0, 3), "near": (0, 2), "clip": (0, 10), "clip_open": (0, 10), "island": (0, 10), "smooth": (0, 50),
+    "tops": (0, 1), "protect": (0, 1), "tubes": (0, 50), "tube_thick": (0, 2), "walked": (0, 3), "label_rules": (0, 1),
+}
+ROOM_REFINE_INTS = ("refine", "smooth", "protect", "label_rules")
+# besides room.txt + its mesh + scan.log: the scanner's unrefined output and its clean-up report, and the player's
+# own furniture / door edits (kept over a new clean-up)
+ROOM_EXTRA_FILES = {"room-raw.txt": 8 * 1024 * 1024, "room-mesh-raw.bin": 64 * 1024 * 1024,
+                    "scan.json": 8 * 1024 * 1024, "edits.txt": 1024 * 1024}
+
+
+def room_universe(value):
+    text = str(value)
+    if not re.fullmatch(r"[0-9]{1,20}", text) or int(text) >= 2**64:
+        raise AgentError("invalid chaperone universe")
+    return str(int(text))
+
+
+def room_universe_from_log(text):
+    """Last universe switch in vrserver.txt; 424242 is Valve's dummy universe (not a room)."""
+    found = None
+    for line in text.splitlines():
+        match = re.search(r"chaperone universe\s+(\d+)|Switch to\s+(?:.*?\s+)?universe\s*[:=]?\s*(\d+)", line, re.I)
+        if match:
+            found = int(match.group(1) or match.group(2))
+    return None if found is None else (0 if found == 424242 else int(room_universe(found)))
+
+
+def room_chaperone():
+    try:
+        with open(os.path.join(HOME, ".config/openvr/config/chaperone_info.vrchap")) as f:
+            return json.load(f).get("universes") or []
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def room_current_universe():
+    try:
+        with open(os.path.join(STEAM, "logs/vrserver.txt"), "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 2 * 1024 * 1024))
+            found = room_universe_from_log(f.read().decode("utf-8", "replace"))
+        if found is not None:
+            return found
+    except (OSError, ValueError, AgentError):
+        pass
+    universes = [u for u in room_chaperone() if str(u.get("universeID", "0")) not in ("0", "424242")]
+    if not universes:
+        return 0
+    newest = max(enumerate(universes), key=lambda item: (str(item[1].get("time", "")), item[0]))[1]
+    try:
+        return int(room_universe(newest["universeID"]))
+    except (KeyError, AgentError):
+        return 0
+
+
+def room_boundary(universes, current):
+    """Chaperone collision quads' bottom edges, in standing/STAGE space, chained into an outline."""
+    import math
+    candidates = [u for u in universes if str(u.get("universeID", "0")) not in ("0", "424242")]
+    if not candidates:
+        raise AgentError("No play area found. Set up a play area in SteamVR first.")
+    u = next((u for u in candidates if str(u.get("universeID")) == str(current)), None)
+    if u is None:
+        u = max(enumerate(candidates), key=lambda item: (str(item[1].get("time", "")), item[0]))[1]
+    edges = []
+    for quad in u.get("collision_bounds") or []:
+        if len(quad) != 4 or any(len(p) != 3 for p in quad):
+            raise AgentError("Invalid chaperone wall")
+        quad = [[float(v) for v in p] for p in quad]
+        if not all(math.isfinite(v) for p in quad for v in p):
+            raise AgentError("Invalid chaperone coordinate")
+        bottom = min(p[1] for p in quad)
+        pts = list(dict.fromkeys((p[0], p[2]) for p in quad if abs(p[1] - bottom) < .001))
+        if len(pts) != 2:
+            raise AgentError("Invalid chaperone wall edge")
+        edges.append(tuple(pts))
+    if len(edges) < 3:
+        raise AgentError("No play area outline found")
+    outline = list(edges.pop(0))
+    while edges:
+        for i, (a, b) in enumerate(edges):
+            if a == outline[-1] or b == outline[-1]:
+                outline.append(b if a == outline[-1] else a)
+                edges.pop(i)
+                break
+        else:
+            raise AgentError("Play area outline is not closed")
+    if outline[-1] != outline[0]:
+        raise AgentError("Play area outline is not closed")
+    return int(room_universe(u["universeID"])), outline[:-1]
+
+
+def room_default_circle(points):
+    import math
+    if len(points) != 20:
+        return False
+    cx = sum(p[0] for p in points) / 20
+    cz = sum(p[1] for p in points) / 20
+    radii = [math.hypot(x-cx, z-cz) for x, z in points]
+    return all(.85 <= r <= 1.15 for r in radii) and max(radii) - min(radii) < .05
+
+
+def room_records(text):
+    """Validate the wire format without desktop dependencies; return its status counts and mesh metadata."""
+    import math
+    lines = [line.split("#", 1)[0].split() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines or lines[0] != ["frameport-room", "1"]:
+        raise AgentError("expected frameport-room 1")
+    result = {"universe": 0, "source": "manual", "time": 0,
+              "summary": {"walls": 0, "volumes": {}, "planes": 0}}
+    outline, walls, floor, ceiling = [], [], 0, None
+    ids = set()
+    for row in lines[1:]:
+        k, v = row[0], row[1:]
+        try:
+            if k in ("room", "floor", "ceiling", "wall", "volume", "plane", "mesh"):
+                if not v or not re.fullmatch(r"[a-f0-9]{32}", v[0]) or v[0] in ids:
+                    raise ValueError("invalid or duplicate entity UUID")
+                ids.add(v[0])
+            if k == "universe":
+                if len(v) != 1:
+                    raise ValueError("expected universe")
+                result[k] = int(room_universe(v[0]))
+            elif k == "time":
+                if len(v) != 1 or not v[0].isdigit():
+                    raise ValueError("invalid time")
+                result[k] = int(v[0])
+            elif k == "source":
+                if len(v) != 1 or v[0] not in ("scan", "boundary", "box", "manual"):
+                    raise ValueError("invalid source")
+                result[k] = v[0]
+            elif k == "room":
+                if len(v) != 1:
+                    raise ValueError("invalid room")
+            elif k in ("floor", "ceiling", "wall", "volume", "plane", "outline"):
+                expected = {"floor": 2, "ceiling": 2, "wall": 7, "volume": 9, "plane": 11}
+                if k == "wall" and len(v) == 8:  # optional label: an edge the scanner closed itself
+                    if v[7] not in ("WALL_FACE", "INVISIBLE_WALL_FACE"):
+                        raise ValueError("invalid wall label")
+                    v = v[:7]
+                if k != "outline" and len(v) != expected[k]:
+                    raise ValueError("invalid field count")
+                nums = [float(x) for x in v[2 if k in ("volume", "plane") else 1:]]
+                if not all(math.isfinite(x) for x in nums):
+                    raise ValueError("nonfinite coordinate")
+                if k == "floor":
+                    floor = nums[0]
+                elif k == "ceiling":
+                    ceiling = nums[0]
+                elif k == "outline":
+                    if int(v[0]) < 3 or len(nums) != int(v[0]) * 2:
+                        raise ValueError("invalid outline")
+                    outline = list(zip(nums[::2], nums[1::2], strict=True))
+                elif k == "wall":
+                    if nums[5] <= nums[4] or nums[:2] == nums[2:4]:
+                        raise ValueError("invalid wall dimensions")
+                    walls.append(nums)
+                elif k in ("volume", "plane"):
+                    if not re.fullmatch(r"[A-Z][A-Z0-9_]*", v[1]) or min(nums[-3 if k == "volume" else -2:]) <= 0:
+                        raise ValueError("invalid label or dimensions")
+                    if k == "plane":
+                        if sum(x*x for x in nums[3:7]) < 1e-12:
+                            raise ValueError("zero quaternion")
+                        result["summary"]["planes"] += 1
+                    else:
+                        counts = result["summary"]["volumes"]
+                        counts[v[1]] = counts.get(v[1], 0) + 1
+            elif k == "mesh":
+                ident, name, nv, ni = v
+                nv, ni = int(nv), int(ni)
+                if (not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", name) or name in ("room.txt", "scan.log")
+                        or nv < 0 or ni < 0 or ni % 3 or ni > 600000):
+                    raise ValueError("invalid mesh record")
+                result["mesh"] = {"filename": name, "vertices": nv, "indices": ni}
+        except (ValueError, IndexError) as exc:
+            raise AgentError(f"Invalid room {k}: {exc}") from exc
+    if not outline and walls:
+        xs = [x for w in walls for x in (w[0], w[2])]
+        zs = [z for w in walls for z in (w[1], w[3])]
+        outline = [(min(xs), min(zs)), (max(xs), min(zs)), (max(xs), max(zs)), (min(xs), max(zs))]
+    area = abs(sum(x*b-a*z for (x, z), (a, b) in zip(outline, outline[1:]+outline[:1], strict=True))) / 2
+    height = (ceiling if ceiling is not None else floor + 2.5) - floor
+    if len(outline) < 3 or area < 1e-8 or height <= 0:
+        raise AgentError("Invalid room outline or ceiling")
+    result["summary"].update(walls=len(walls) or len(outline), floor_area=area, ceiling_height=height)
+    return result
+
+
+def room_validate_mesh(data, record):
+    import math
+    if len(data) < 16:
+        raise AgentError("truncated room mesh")
+    magic, version, nv, ni = struct.unpack_from("<4sIII", data)
+    if (magic != b"FPRM" or version != 1 or nv != record["vertices"] or ni != record["indices"]
+            or len(data) != 16 + 12*nv + 4*ni):
+        raise AgentError("invalid room mesh header or counts")
+    if any(not math.isfinite(v) for (v,) in struct.iter_unpack("<f", data[16:16+12*nv])):
+        raise AgentError("invalid room mesh coordinate")
+    if any(i >= nv for (i,) in struct.iter_unpack("<I", data[16+12*nv:])):
+        raise AgentError("invalid room mesh index")
+
+
+def room_selected(universe=None):
+    """The matching universe, otherwise current; never follow a link outside the room store."""
+    for name in (room_universe(room_current_universe() if universe is None else universe), "current"):
+        path = os.path.realpath(os.path.join(ROOMS_DIR, name))
+        if (os.path.dirname(path) == os.path.realpath(ROOMS_DIR) and os.path.basename(path).isdigit()
+                and os.path.isfile(os.path.join(path, "room.txt"))):
+            return path
+    return None
+
+
+def cmd_room_status(args):
+    current = room_current_universe()
+    selected = room_selected(current)
+    rooms = []
+    for path in glob.glob(os.path.join(ROOMS_DIR, "*")):
+        if not os.path.basename(path).isdigit() or os.path.islink(path):
+            continue
+        try:
+            with open(os.path.join(path, "room.txt")) as f:
+                record = room_records(f.read())
+            rooms.append(record)
+        except (OSError, AgentError):
+            continue
+    active = None
+    text = None
+    info = {}
+    if selected:
+        with open(os.path.join(selected, "room.txt")) as f:
+            text = f.read()
+        active = room_records(text)
+        info = room_scan_info(selected)
+    try:
+        _, points = room_boundary(room_chaperone(), current)
+        circle = room_default_circle(points)
+    except (AgentError, ValueError, TypeError):
+        circle = None
+    return {"rooms": sorted(rooms, key=lambda r: r["time"], reverse=True), "universe": current,
+            "room": active, "room_text": text,
+            "aligned": bool(active and current and active["universe"] == current),
+            "default_circle": circle, "scanner_installed": os.access(ROOM_SCANNER, os.X_OK),
+            # scan clean-up: the saved settings (non-defaults), what the last clean-up used, did and decided
+            "refine": room_refine_load(), "refine_used": info.get("refine"), "report": info.get("report"),
+            "labels": info.get("labels") or [], "suggestions": info.get("suggestions") or [],
+            "raw": bool(selected and os.path.isfile(os.path.join(selected, "room-raw.txt"))),
+            "edited": bool(selected and os.path.isfile(os.path.join(selected, "edits.txt")))}
+
+
+def room_refine_settings(settings):
+    """Validated clean-up settings, only the keys that differ from the defaults ({} = the defaults)."""
+    import math
+    if not isinstance(settings, dict):
+        raise AgentError("clean-up settings must be an object")
+    out = {}
+    for key, value in settings.items():
+        if key not in ROOM_REFINE_DEFAULTS:
+            raise AgentError(f"unknown clean-up setting: {key}")
+        if key == "walls":
+            if value not in ("off", "snap", "panels"):
+                raise AgentError("walls must be off, snap or panels")
+        else:
+            if isinstance(value, bool):
+                value = int(value)
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise AgentError(f"invalid clean-up setting: {key}")
+            lo, hi = ROOM_REFINE_LIMITS[key]
+            if not lo <= value <= hi:
+                raise AgentError(f"clean-up setting out of range: {key}")
+            if key in ROOM_REFINE_INTS:
+                if value != int(value):
+                    raise AgentError(f"{key} must be a whole number")
+                value = int(value)
+            else:
+                value = float(value)
+        if value != ROOM_REFINE_DEFAULTS[key]:
+            out[key] = value
+    return out
+
+
+def room_refine_load():
+    try:
+        with open(ROOM_REFINE_FILE) as f:
+            return room_refine_settings(json.load(f))
+    except (OSError, ValueError, AgentError):
+        return {}
+
+
+def room_refine_args(settings, erase=None):
+    """fp_roomscan options for the stored settings (only non-defaults: with none, an older scanner without the
+    clean-up still runs) and optional erase spheres [[x, y, z, r], ...] (or {x, y, z, r})."""
+    import math
+    args = []
+    for key, value in settings.items():
+        args += ["--" + key.replace("_", "-"), value if isinstance(value, str) else format(value, "g")]
+    if erase:
+        spots = []
+        for spot in erase:
+            if isinstance(spot, dict):
+                spot = [spot.get(k) for k in ("x", "y", "z", "r")]
+            if (not isinstance(spot, (list, tuple)) or len(spot) != 4
+                    or not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+                               for v in spot) or spot[3] <= 0):
+                raise AgentError("invalid erase spot")
+            spots.append(",".join(format(float(v), ".4g") for v in spot))
+        if len(spots) > 500:
+            raise AgentError("too many erase spots")
+        args += ["--erase", ";".join(spots)]
+    return args
+
+
+def room_extras(folder):
+    """The extra files of a room folder (ROOM_EXTRA_FILES) as name -> bytes."""
+    out = {}
+    for name, limit in ROOM_EXTRA_FILES.items():
+        path = os.path.join(folder, name)
+        if os.path.isfile(path) and not os.path.islink(path):
+            with open(path, "rb") as f:
+                data = f.read(limit + 1)
+            if len(data) <= limit:
+                out[name] = data
+    return out
+
+
+def room_scan_info(folder):
+    """scan.json's clean-up settings, report, label decisions and door/closet suggestions ({} when there's none)."""
+    try:
+        with open(os.path.join(folder, "scan.json")) as f:
+            info = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(info, dict):
+        return {}
+    out = {}
+    for key, kind in (("refine", dict), ("report", dict), ("labels", list), ("suggestions", list)):
+        if isinstance(info.get(key), kind):
+            out[key] = info[key]
+    return out
+
+
+def room_merge_edits(text, edits):
+    """The player's own furniture and doors/windows (volume + plane records) instead of the scanner's."""
+    keep = [line for line in text.splitlines() if line.split()[:1] not in (["volume"], ["plane"])]
+    mine = [line for line in edits.splitlines() if line.split()[:1] in (["volume"], ["plane"])]
+    merged = "\n".join(keep + mine) + "\n"
+    room_records(merged)
+    return merged
+
+
+def room_store(text, mesh=None, scan_log=None, extras=None):
+    record = room_records(text)
+    for name in extras or {}:
+        if name not in ROOM_EXTRA_FILES:
+            raise AgentError(f"unexpected room file: {name}")
+    if record.get("mesh"):
+        if mesh is None:
+            raise AgentError("room mesh sidecar is missing")
+        room_validate_mesh(mesh, record["mesh"])
+    elif mesh is not None:
+        raise AgentError("room has no mesh record")
+    universe = room_universe(record["universe"])
+    os.makedirs(ROOMS_DIR, exist_ok=True)
+    with open(os.path.join(ROOMS_DIR, ".lock"), "a") as lock:
+        if fcntl:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        dest = os.path.join(ROOMS_DIR, universe)
+        if os.path.islink(dest):
+            raise AgentError("refusing a linked room folder")
+        stage = tempfile.mkdtemp(prefix=".room-", dir=ROOMS_DIR)
+        previous = dest + ".previous"
+        try:
+            with open(os.path.join(stage, "room.txt"), "w") as f:
+                f.write(text)
+            if record.get("mesh"):
+                with open(os.path.join(stage, record["mesh"]["filename"]), "wb") as f:
+                    f.write(mesh)
+            if scan_log:
+                with open(os.path.join(stage, "scan.log"), "w") as f:
+                    f.write(scan_log)
+            for name, data in (extras or {}).items():
+                with open(os.path.join(stage, name), "wb") as f:
+                    f.write(data)
+            shutil.rmtree(previous, ignore_errors=True)
+            if os.path.isdir(dest):
+                os.rename(dest, previous)
+            try:
+                os.rename(stage, dest)
+            except OSError:
+                if os.path.isdir(previous):
+                    os.rename(previous, dest)
+                raise
+            link = os.path.join(ROOMS_DIR, ".current-new")
+            if os.path.lexists(link):
+                os.unlink(link)
+            os.symlink(universe, link)
+            os.replace(link, os.path.join(ROOMS_DIR, "current"))
+            shutil.rmtree(previous, ignore_errors=True)
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+    return record
+
+
+def cmd_room_put(args):
+    # PC uploads to a unique directory below the room store, not to a game's files or an arbitrary host path.
+    path = os.path.realpath(args["path"])
+    if not _inside(path, os.path.realpath(ROOMS_DIR)) or os.path.basename(path) != "room.txt":
+        raise AgentError("upload room.txt below the room store")
+    with open(path) as f:
+        text = f.read(8*1024*1024)
+    record = room_records(text)
+    mesh = None
+    if record.get("mesh"):
+        mesh_path = os.path.realpath(os.path.join(os.path.dirname(path), record["mesh"]["filename"]))
+        if os.path.dirname(mesh_path) != os.path.dirname(path):
+            raise AgentError("linked mesh outside upload folder")
+        with open(mesh_path, "rb") as f:
+            mesh = f.read(64*1024*1024)
+    extras = None
+    if args.get("edited"):
+        # the Room tab's furniture / door editor: the same room with the player's boxes. Keep the scan's raw files
+        # (a new clean-up starts from them) and remember the edits, so a new clean-up keeps them.
+        folder = os.path.join(ROOMS_DIR, room_universe(record["universe"]))
+        extras = room_extras(folder) if os.path.isdir(folder) and not os.path.islink(folder) else {}
+        extras["edits.txt"] = "".join(line + "\n" for line in text.splitlines()
+                                      if line.split()[:1] in (["volume"], ["plane"])).encode()
+    return {"room": room_store(text, mesh, extras=extras)}
+
+
+def cmd_room_delete(args):
+    selected = room_selected()
+    name = room_universe(args["universe"]) if "universe" in args else (os.path.basename(selected) if selected else None)
+    if name:
+        path = os.path.join(ROOMS_DIR, name)
+        if os.path.islink(path):
+            raise AgentError("refusing a linked room folder")
+        shutil.rmtree(path, ignore_errors=True)
+    current = os.path.join(ROOMS_DIR, "current")
+    if os.path.islink(current) and not os.path.exists(current):
+        os.unlink(current)
+        remaining = cmd_room_status({})["rooms"]
+        if remaining:
+            os.symlink(room_universe(remaining[0]["universe"]), current)
+    return cmd_room_status({})
+
+
+def cmd_room_from_boundary(args):
+    import math
+    import uuid
+    universe, outline = room_boundary(room_chaperone(), room_current_universe())
+    if room_default_circle(outline):
+        raise AgentError("Valve's default circle is not a room. Set up your play area in SteamVR first.")
+    height = float(args.get("height", 2.5))
+    if not math.isfinite(height) or height <= 0:
+        raise AgentError("room height must be positive")
+    area = sum(x*b-a*z for (x, z), (a, b) in zip(outline, outline[1:]+outline[:1], strict=True))
+    if area < 0:
+        outline.reverse()
+    rows = ["frameport-room 1", f"universe {universe}", "source boundary", f"time {int(time.time())}",
+            f"room {uuid.uuid4().hex}", f"floor {uuid.uuid4().hex} 0", f"ceiling {uuid.uuid4().hex} {height}",
+            "outline " + str(len(outline)) + " " + " ".join(str(v) for p in outline for v in p)]
+    rows += [f"wall {uuid.uuid4().hex} {x} {z} {a} {b} 0 {height}"
+             for (x, z), (a, b) in zip(outline, outline[1:]+outline[:1], strict=True)]
+    room_store("\n".join(rows) + "\n")
+    return cmd_room_status({})
+
+
+def cmd_room_build(args):
+    dump = os.path.realpath(args["dump"])
+    if not _inside(dump, os.path.realpath(ROOMS_DIR)):
+        raise AgentError("upload scan dump below the room store")
+    if not os.access(ROOM_SCANNER, os.X_OK):
+        raise AgentError("Room scanner is not installed")
+    universe = room_universe(args.get("universe", room_current_universe()))
+    with tempfile.TemporaryDirectory(prefix=".build-", dir=ROOMS_DIR) as out:
+        result = subprocess.run([ROOM_SCANNER, "--offline", dump, "--out", out, "--universe", universe, "--json",
+                                 *room_refine_args(room_refine_load())],
+                                capture_output=True, text=True, timeout=300)
+        if result.returncode:
+            raise AgentError("Room scan failed: " + result.stderr[-4000:])
+        try:
+            report = json.loads(result.stdout)
+        except ValueError as exc:
+            raise AgentError("Room scanner returned invalid JSON") from exc
+        with open(os.path.join(out, "room.txt")) as f:
+            text = f.read()
+        record = room_records(text)
+        if str(record["universe"]) != universe:
+            raise AgentError("Room scanner returned the wrong universe")
+        mesh = None
+        if record.get("mesh"):
+            with open(os.path.join(out, record["mesh"]["filename"]), "rb") as f:
+                mesh = f.read()
+        scan_log = result.stderr
+        try:
+            with open(dump + ".log") as log:
+                scan_log += "\n" + log.read()
+        except OSError:
+            pass
+        room_store(text, mesh, scan_log, room_extras(out))
+    return {**cmd_room_status({}), "report": report}  # (the scanner's summary, not scan.json's)
+
+
+def cmd_room_refine(args):
+    """Clean up the saved room's scan again (fp_roomscan --refine-only on a copy of the room folder, from its raw
+    files), then publish it like room_store (games pick it up through room_sync).
+    settings: the clean-up settings to save (null = keep the saved ones); erase: [[x, y, z, r], ...] spheres of scan
+    to remove; keep_edits (default true): the player's own furniture / doors stay (false = back to the scan's)."""
+    settings = args.get("settings")
+    if settings is not None:
+        settings = room_refine_settings(settings)
+    else:
+        settings = room_refine_load()
+    options = room_refine_args(settings, args.get("erase"))
+    if args.get("settings") is not None:
+        os.makedirs(ROOMS_DIR, exist_ok=True)
+        _write_json(ROOM_REFINE_FILE, settings)
+    if not os.access(ROOM_SCANNER, os.X_OK):
+        raise AgentError("Room scanner is not installed")
+    selected = room_selected()
+    if not selected:
+        raise AgentError("No room saved yet")
+    with open(os.path.join(ROOMS_DIR, ".scan.lock"), "a") as lock:  # not while a scan builds a room
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise AgentError("A room scan is running. Try again when it has finished.") from None
+        with tempfile.TemporaryDirectory(prefix=".refine-", dir=ROOMS_DIR) as stage:
+            for name in os.listdir(selected):
+                path = os.path.join(selected, name)
+                if os.path.isfile(path) and not os.path.islink(path):
+                    shutil.copy2(path, os.path.join(stage, name))
+            result = subprocess.run([ROOM_SCANNER, "--refine-only", stage, *options, "--json"],
+                                    capture_output=True, text=True, timeout=300)
+            if result.returncode:
+                raise AgentError("Room clean-up failed: " + (result.stderr or result.stdout or "")[-4000:])
+            try:
+                summary = json.loads(result.stdout or "{}")
+            except ValueError:
+                summary = {}
+            with open(os.path.join(stage, "room.txt")) as f:
+                text = f.read()
+            record = room_records(text)
+            if str(record["universe"]) != os.path.basename(selected):
+                raise AgentError("Room clean-up returned the wrong universe")
+            extras = room_extras(stage)
+            edits = extras.get("edits.txt")
+            if edits is not None and not args.get("keep_edits", True):
+                del extras["edits.txt"]
+            elif edits is not None:
+                text = room_merge_edits(text, edits.decode("utf-8", "replace"))
+            mesh = None
+            if record.get("mesh"):
+                with open(os.path.join(stage, record["mesh"]["filename"]), "rb") as f:
+                    mesh = f.read()
+            scan_log = None
+            if os.path.isfile(os.path.join(stage, "scan.log")):
+                with open(os.path.join(stage, "scan.log"), errors="replace") as f:
+                    scan_log = f.read()
+            room_store(text, mesh, scan_log, extras)
+    return {"summary": summary if isinstance(summary, dict) else {}, **cmd_room_status({})}
+
+
+# --- RoomView 3D capture (docs/mr/PHASE0.md) -------------------------------------------------------------------
+# Valve's passthrough computes a head-centred depth mesh (~30/s) and publishes it in two OpenVR block queues;
+# FramePort records it into a .fprs scan dump (docs/mr/ROOM_FORMAT.md) for fp_roomscan. Background app only: reading
+# never starts SteamVR or changes it. Poses are kept in SteamVR's raw space while recording and converted to STAGE
+# with the raw->standing transform at the END: Valve's floor estimate moves that transform during a session.
+ROOMVIEW_DATA = b"/xrservice/roomview3d/meshData"
+ROOMVIEW_LAYOUT = b"/xrservice/roomview3d/meshLayout"
+FPRS_FRAME = "<d7fII"           # time, pose (px py pz qx qy qz qw), vertex count, index count
+FPRS_POSE_OFFSET = 8            # the pose's byte offset inside a frame header (rewritten at the end)
+ROOMVIEW_MAX_DEPTH = 4.0        # metres; beyond this Valve's depth is inpainted (only reported here)
+VR_APP_OVERLAY = 2              # EVRApplicationType VRApplication_Overlay
+
+
+def _m34_mul(a, b):
+    """Row-major 3x4 affine a * b."""
+    out = []
+    for r in range(3):
+        for c in range(4):
+            v = sum(a[r * 4 + k] * b[k * 4 + c] for k in range(3))
+            out.append(v + (a[r * 4 + 3] if c == 3 else 0.0))
+    return out
+
+
+def _m34_quat(m):
+    """Rotation of a row-major 3x4 as (x, y, z, w)."""
+    r00, r01, r02, r10, r11, r12, r20, r21, r22 = m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]
+    tr = r00 + r11 + r22
+    if tr > 0:
+        s = math.sqrt(tr + 1.0) * 2
+        return ((r21 - r12) / s, (r02 - r20) / s, (r10 - r01) / s, 0.25 * s)
+    if r00 > r11 and r00 > r22:
+        s = math.sqrt(1.0 + r00 - r11 - r22) * 2
+        return (0.25 * s, (r01 + r10) / s, (r02 + r20) / s, (r21 - r12) / s)
+    if r11 > r22:
+        s = math.sqrt(1.0 + r11 - r00 - r22) * 2
+        return ((r01 + r10) / s, 0.25 * s, (r12 + r21) / s, (r02 - r20) / s)
+    s = math.sqrt(1.0 + r22 - r00 - r11) * 2
+    return ((r02 + r20) / s, (r12 + r21) / s, 0.25 * s, (r10 - r01) / s)
+
+
+def _view_coverage(m, yaw_bins, pitch):
+    """Note where the camera looked (+Z of the mesh = forward): yaw in 30 deg bins, how many frames looked up."""
+    fx, fy, fz = m[2], m[6], m[10]
+    yaw_bins.add(int((math.degrees(math.atan2(fx, fz)) % 360) // 30))
+    if fy > 0.6:
+        pitch["up"] += 1
+    elif fy < -0.6:
+        pitch["down"] += 1
+
+
+class _RoomViewReader:
+    """The two RoomView queues + their path properties through libopenvr_api.so (ctypes)."""
+
+    def __init__(self, app_type=None):
+        import ctypes
+
+        self.ct = ctypes
+        lib = next((p for p in OPENVR_LIBS if os.path.isfile(p)), None)
+        if lib is None:
+            raise RuntimeError("SteamVR isn't installed")
+        vr = self.vr = ctypes.CDLL(lib)
+        vr.VR_InitInternal2.restype = ctypes.c_uint32
+        vr.VR_InitInternal2.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_char_p]
+        vr.VR_GetGenericInterface.restype = ctypes.c_void_p
+        vr.VR_GetGenericInterface.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
+        vr.VR_ShutdownInternal.restype = None
+        err = ctypes.c_int(0)
+        # an Overlay app may create the prompt overlay; Background (no prompts) can't start SteamVR by accident
+        vr.VR_InitInternal2(ctypes.byref(err), VR_APP_BACKGROUND if app_type is None else app_type, None)
+        if err.value:
+            raise RuntimeError("SteamVR isn't running")
+        H, E, VP = ctypes.c_uint64, ctypes.c_int, ctypes.c_void_p
+        self.H, self.VP = H, VP
+
+        class BQ(ctypes.Structure):  # openvr_capi.h VR_IVRBlockQueue_FnTable (IVRBlockQueue_005)
+            _fields_ = [("Create", VP), ("Connect", ctypes.CFUNCTYPE(E, ctypes.POINTER(H), ctypes.c_char_p)),
+                        ("Destroy", VP), ("AcquireWriteOnlyBlock", VP), ("ReleaseWriteOnlyBlock", VP),
+                        ("WaitAndAcquireReadOnlyBlock", ctypes.CFUNCTYPE(E, H, ctypes.POINTER(H), ctypes.POINTER(VP),
+                                                                         ctypes.c_int, ctypes.c_uint32)),
+                        ("AcquireReadOnlyBlock", VP), ("ReleaseReadOnlyBlock", ctypes.CFUNCTYPE(E, H, H)),
+                        ("QueueHasReader", VP)]
+
+        class PathRead(ctypes.Structure):  # openvr_driver.h PathRead_t
+            _fields_ = [("ulPath", ctypes.c_uint64), ("pvBuffer", VP), ("unBufferSize", ctypes.c_uint32),
+                        ("unTag", ctypes.c_uint32), ("unRequiredBufferSize", ctypes.c_uint32), ("eError", ctypes.c_int),
+                        ("pszPath", ctypes.c_char_p)]
+
+        class M34(ctypes.Structure):
+            _fields_ = [("m", ctypes.c_float * 12)]
+
+        self.PathRead, self.M34 = PathRead, M34
+        e = ctypes.c_int(0)
+        ptr = vr.VR_GetGenericInterface(b"FnTable:IVRBlockQueue_005", ctypes.byref(e))
+        paths = vr.VR_GetGenericInterface(b"IVRPaths_002", ctypes.byref(e))
+        system = next((s for s in (vr.VR_GetGenericInterface(n, ctypes.byref(e))
+                                   for n in (b"IVRSystem_023", b"IVRSystem_022")) if s), None)
+        if not ptr or not paths or not system:
+            self.close()
+            raise RuntimeError("this SteamVR has no RoomView mesh interfaces")
+        self.bq = ctypes.cast(ptr, ctypes.POINTER(BQ)).contents
+        self.paths = paths
+        pvt = ctypes.cast(ctypes.cast(paths, ctypes.POINTER(VP))[0], ctypes.POINTER(VP))
+        self._read = ctypes.CFUNCTYPE(E, VP, ctypes.c_uint64, ctypes.POINTER(PathRead), ctypes.c_uint32)(pvt[0])
+        self._handle = ctypes.CFUNCTYPE(E, VP, ctypes.POINTER(ctypes.c_uint64), ctypes.c_char_p)(pvt[2])
+        self.system = system
+        svt = ctypes.cast(ctypes.cast(system, ctypes.POINTER(VP))[0], ctypes.POINTER(VP))
+        self._raw_to_standing = ctypes.CFUNCTYPE(M34, VP)(svt[13])  # GetRawZeroPoseToStandingAbsoluteTrackingPose
+        self.handles = {}
+        self.data, self.layout = self._connect(ROOMVIEW_DATA), self._connect(ROOMVIEW_LAYOUT)
+        if self.data is None or self.layout is None:
+            self.close()
+            raise RuntimeError("SteamVR has no RoomView mesh (passthrough never started since SteamVR started?)")
+
+    def _connect(self, path):
+        h = self.H(0)
+        return h if self.bq.Connect(self.ct.byref(h), path) == 0 else None
+
+    def prop(self, root, path, fmt):
+        ct = self.ct
+        if path not in self.handles:
+            h = ct.c_uint64(0)
+            self._handle(self.paths, ct.byref(h), path.encode())
+            self.handles[path] = h.value
+        buf = (ct.c_ubyte * 64)()
+        pr = self.PathRead(self.handles[path], ct.cast(buf, self.VP), 64, 0, 0, 0, None)
+        self._read(self.paths, root, ct.byref(pr), 1)
+        if pr.eError or pr.unRequiredBufferSize < struct.calcsize(fmt):
+            return None
+        vals = struct.unpack_from(fmt, bytes(buf))
+        return vals if len(vals) > 1 else vals[0]
+
+    def up_to_date(self):
+        return bool(self.prop(self.data.value, "/meshData/meshIsUpToDate", "<?"))
+
+    def acquire(self, queue, read_type, timeout_ms):
+        blk, buf = self.H(0), self.VP(0)
+        if self.bq.WaitAndAcquireReadOnlyBlock(queue, self.ct.byref(blk), self.ct.byref(buf), read_type, timeout_ms):
+            return None, None
+        return blk, buf.value
+
+    def release(self, queue, blk):
+        self.bq.ReleaseReadOnlyBlock(queue, blk)
+
+    def raw_to_standing(self):
+        return list(self._raw_to_standing(self.system).m)
+
+    def close(self):
+        try:
+            self.vr.VR_ShutdownInternal()
+        except Exception:  # noqa: BLE001 - shutting down a half-initialised client
+            pass
+
+
+class _ScanPrompt:
+    """A head-locked SteamVR overlay showing FramePort's pre-rendered scan prompts (artifacts/roomscan/*.png,
+    uploaded next to fp_roomscan): IVROverlay_028 through its C function table. Failing to show it never stops a
+    scan (the PC app shows the same state)."""
+    SLOTS = {"Create": 1, "Destroy": 3, "SortOrder": 20, "Width": 22, "DeviceRelative": 35, "Show": 43, "Hide": 44,
+             "FromFile": 63}
+
+    def __init__(self, rv, image_dir):
+        ct = self.ct = rv.ct
+        self.dir, self.shown, self.handle = image_dir, None, None
+        e = ct.c_int(0)
+        table = rv.vr.VR_GetGenericInterface(b"FnTable:IVROverlay_028", ct.byref(e))
+        if not table or not os.path.isdir(image_dir):
+            return
+        fn = ct.cast(table, ct.POINTER(ct.c_void_p))
+        U64, E = ct.c_uint64, ct.c_int
+        self.create = ct.CFUNCTYPE(E, ct.c_char_p, ct.c_char_p, ct.POINTER(U64))(fn[self.SLOTS["Create"]])
+        self.destroy = ct.CFUNCTYPE(E, U64)(fn[self.SLOTS["Destroy"]])
+        self.sort = ct.CFUNCTYPE(E, U64, ct.c_uint32)(fn[self.SLOTS["SortOrder"]])
+        self.width = ct.CFUNCTYPE(E, U64, ct.c_float)(fn[self.SLOTS["Width"]])
+        self.relative = ct.CFUNCTYPE(E, U64, ct.c_uint32, ct.POINTER(rv.M34))(fn[self.SLOTS["DeviceRelative"]])
+        self.show_fn = ct.CFUNCTYPE(E, U64)(fn[self.SLOTS["Show"]])
+        self.from_file = ct.CFUNCTYPE(E, U64, ct.c_char_p)(fn[self.SLOTS["FromFile"]])
+        h = U64(0)
+        if self.create(b"frameport.roomscan", b"FramePort room scan", ct.byref(h)):
+            return
+        self.handle = h
+        m = rv.M34()
+        for i, v in enumerate((1, 0, 0, 0, 0, 1, 0, -0.25, 0, 0, 1, -1.2)):  # 1.2 m ahead, a bit below eye level
+            m.m[i] = v
+        self.width(h, 0.8)
+        self.sort(h, 10)
+        self.relative(h, 0, ct.byref(m))  # k_unTrackedDeviceIndex_Hmd
+
+    def show(self, name):
+        if self.handle is None or name == self.shown:
+            return
+        path = os.path.join(self.dir, name + ".png")
+        if os.path.isfile(path) and self.from_file(self.handle, path.encode()) == 0:
+            self.show_fn(self.handle)
+            self.shown = name
+
+    def close(self, final=None, linger=4.0):
+        if self.handle is None:
+            return
+        if final:
+            self.show(final)
+            time.sleep(linger)
+        self.destroy(self.handle)
+        self.handle = None
+
+
+def _scan_point(m, p):
+    return tuple(sum(m[r * 4 + c] * p[c] for c in range(3)) + m[r * 4 + 3] for r in range(3))
+
+
+def _render_scan_preview(cells, raw_to_standing, center, size=256, width=6.0):
+    """Raw 10 cm voxel keys -> top-down RGBA. Image top is standing -Z; tallest class wins overlaps.
+    One colour (FramePort's secondary blue), only the opacity says floor / furniture / wall, and every cell is one
+    filled square: overlays draw over hands and the passthrough (no depth), so the map stays faint and calm (owner,
+    2026-10-18: three colours in 3x3 blotches clashed)."""
+    pixels = bytearray(size * size * 4)
+    classes = bytearray(size * size)
+    colors = (bytes((58, 168, 255, 40)), bytes((58, 168, 255, 80)), bytes((58, 168, 255, 150)))
+    scale = size / width
+    for key in cells:
+        x, y, z = _scan_point(raw_to_standing, tuple((v + 0.5) * 0.1 for v in key))
+        if y < -0.3:
+            continue
+        kind = 0 if y < 0.3 else 1 if y <= 1.5 else 2
+        # the cell's 10 cm footprint around its centre, in pixels
+        c0 = int(math.floor((x - 0.05 - center[0]) * scale + size / 2))
+        c1 = int(math.ceil((x + 0.05 - center[0]) * scale + size / 2))
+        r0 = int(math.floor((z - 0.05 - center[2]) * scale + size / 2))
+        r1 = int(math.ceil((z + 0.05 - center[2]) * scale + size / 2))
+        for row in range(max(r0, 0), min(r1, size)):
+            for col in range(max(c0, 0), min(c1, size)):
+                i = row * size + col
+                if classes[i] <= kind:
+                    pixels[i * 4:i * 4 + 4] = colors[kind]
+                    classes[i] = kind + 1
+    return bytes(pixels)
+
+
+class _ScanPreview:
+    """Best-effort floor overlay; same IVROverlay_028 C table setup as _ScanPrompt.
+
+    Slots verified against openvr-2.15.6.h. Keep voxels in raw space because Valve moves STAGE during capture.
+    """
+    SLOTS = {"Create": 1, "Destroy": 3, "SortOrder": 20, "Width": 22, "Absolute": 33, "Raw": 62, "Show": 43}
+
+    def __init__(self, rv, log=None):
+        self.rv, self.log = rv, log or (lambda message: print(message, file=sys.stderr, flush=True))
+        self.handle, self.disabled = None, False
+        self.cells, self.origin = {}, None
+        self.dirty, self.last_render, self.uploads = False, -float("inf"), 0
+        try:
+            ct = rv.ct
+            error = ct.c_int(0)
+            table = rv.vr.VR_GetGenericInterface(b"FnTable:IVROverlay_028", ct.byref(error))
+            if not table or error.value:
+                raise RuntimeError("IVROverlay_028 unavailable")
+            fn = ct.cast(table, ct.POINTER(ct.c_void_p))
+            U, E = ct.c_uint64, ct.c_int
+            signatures = {"Create": (ct.c_char_p, ct.c_char_p, ct.POINTER(U)), "Destroy": (U,),
+                          "SortOrder": (U, ct.c_uint32), "Width": (U, ct.c_float),
+                          "Absolute": (U, E, ct.POINTER(rv.M34)),
+                          "Raw": (U, ct.c_void_p, ct.c_uint32, ct.c_uint32, ct.c_uint32), "Show": (U,)}
+            self.functions = {name: ct.CFUNCTYPE(E, *args)(fn[self.SLOTS[name]])
+                              for name, args in signatures.items()}
+            h = U(0)
+            self._call("Create", b"frameport.roomscan.preview", b"FramePort floor coverage", ct.byref(h))
+            self.handle = h
+            self._call("SortOrder", h, 1)  # always below the scan prompts (_ScanPrompt: 10)
+            self._call("Width", h, 6.0)
+        except Exception as exc:
+            self._disable(exc)
+
+    def _call(self, name, *args):
+        error = self.functions[name](*args)
+        if error:
+            raise RuntimeError(f"{name}: overlay error {error}")
+
+    def _disable(self, exc):
+        if not self.disabled:
+            self.disabled = True
+            self._log(f"scan preview disabled: {exc}")
+            self.close()
+
+    def _log(self, message):
+        try:
+            self.log(message)
+        except Exception:
+            pass  # diagnostic I/O must never abort capture
+
+    def feed(self, vertices, pose, now=None):
+        if self.disabled:
+            return
+        try:
+            if self.origin is None:
+                self.origin = (pose[3], pose[7], pose[11])
+            for offset in range(0, len(vertices) - 11, 16 * 12):
+                point = struct.unpack_from("<3f", vertices, offset)
+                if not all(map(math.isfinite, point)) or not 0.09 <= sum(v * v for v in point) <= 16:
+                    continue
+                raw = _scan_point(pose, point)
+                key = tuple(math.floor(v / 0.1) for v in raw)
+                if key not in self.cells:
+                    self.dirty = True
+                self.cells[key] = self.cells.get(key, 0) + 1
+            now = time.monotonic() if now is None else now
+            if not self.dirty or now - self.last_render < 1.0:
+                return
+            transform = self.rv.raw_to_standing()
+            center = _scan_point(transform, self.origin)
+            matrix = self.rv.M34()
+            # Rx(-90 degrees): local +Z (front) -> standing +Y; local +Y -> -Z.
+            for i, value in enumerate((1, 0, 0, center[0], 0, 0, 1, 0.015, 0, -1, 0, center[2])):
+                matrix.m[i] = value
+            self._call("Absolute", self.handle, 1, self.rv.ct.byref(matrix))  # TrackingUniverseStanding
+            rgba = _render_scan_preview(self.cells, transform, center)
+            self.buffer = self.rv.ct.create_string_buffer(rgba)
+            started = time.monotonic()
+            try:
+                self._call("Raw", self.handle, self.buffer, 256, 256, 4)
+            finally:
+                elapsed = time.monotonic() - started
+                self.uploads += 1
+                if self.uploads <= 20 or self.uploads % 10 == 0:
+                    self._log(f"scan preview SetOverlayRaw #{self.uploads}: {elapsed * 1000:.2f} ms")
+            self._call("Show", self.handle)
+            self.last_render, self.dirty = now, False
+            if elapsed > 0.05:
+                self._disable(f"SetOverlayRaw too slow ({elapsed * 1000:.2f} ms)")
+        except Exception as exc:
+            self._disable(exc)
+
+    def close(self):
+        if self.handle is not None:
+            handle, self.handle = self.handle, None
+            try:
+                self._call("Destroy", handle)
+            except Exception as exc:
+                self._disable(exc)
+
+
+ROOM_SCAN_LOOK_FRAMES = 5   # recorded frames looking up / down (~1.7 s at 3/s) that count as "ceiling/floor seen"
+ROOM_SCAN_MIN_SECONDS = 60  # a complete scan still records this long: a 32 s one found 2 of 7 furniture boxes
+
+
+ROOMVIEW_STREAM_MESHES = 3     # new meshes within ROOMVIEW_STREAM_WINDOW s = passthrough is on (Valve: ~30/s)
+ROOMVIEW_STREAM_WINDOW = 2.0
+ROOM_SCAN_MIN_FRAMES = 30      # fewer recorded frames is no room: refused instead of replacing the saved one
+
+
+def _prompt_for(started, yaw_bins, pitch, streaming=True, now=None):
+    """Which prompt image the headset shows: "start" (turn on passthrough) whenever no meshes stream, also mid-scan."""
+    if started is None or not streaming:
+        return "start"
+    if (now is not None and len(yaw_bins) >= 12 and pitch["up"] >= ROOM_SCAN_LOOK_FRAMES
+            and pitch["down"] >= ROOM_SCAN_LOOK_FRAMES):
+        # everything seen before ROOM_SCAN_MIN_SECONDS: say so and show the time left (owner: "stuck on 12/12")
+        return f"finish_{min(12, int((now - started) / ROOM_SCAN_MIN_SECONDS * 12)):02d}"
+    if len(yaw_bins) >= 10 and pitch["up"] < ROOM_SCAN_LOOK_FRAMES:
+        return "ceiling"
+    if len(yaw_bins) >= 10 and pitch["down"] < ROOM_SCAN_LOOK_FRAMES:
+        return "floor"
+    return f"look_{min(12, len(yaw_bins)):02d}"
+
+
+def _scan_complete(started, now, yaw_bins, pitch):
+    return (started is not None and now - started >= ROOM_SCAN_MIN_SECONDS and len(yaw_bins) >= 12
+            and pitch["up"] >= ROOM_SCAN_LOOK_FRAMES and pitch["down"] >= ROOM_SCAN_LOOK_FRAMES)
+
+
+def capture_roomview(seconds, out_path, wait=0.0, max_hz=3.0, progress=None, prompts=None, preview=True,
+                     preview_log=None):
+    """Record RoomView 3D meshes into a .fprs dump: `seconds` of fresh meshes (after waiting up to `wait` s for the
+    first one), at most `max_hz` frames per second. progress(dict) is called about once a second. Returns a summary:
+    frames, duration, yaw coverage (30 deg bins seen), frames looking up/down, warnings."""
+    rv = _RoomViewReader(VR_APP_OVERLAY if prompts or preview else None)
+    ct = rv.ct
+    prompt = _ScanPrompt(rv, prompts) if prompts else None
+    floor_preview = _ScanPreview(rv, preview_log) if preview else None
+    tmp = out_path + ".part"
+    offsets, raw_poses = [], []
+    yaw_bins, pitch = set(), {"up": 0, "down": 0}
+    indices, layout_id, last_mesh, last_write = None, None, None, 0.0
+    # Valve only computes new meshes while passthrough is shown; a queue's last block (and meshIsUpToDate) stays
+    # after it stops. So "streaming" = ROOMVIEW_STREAM_MESHES new mesh ids within ROOMVIEW_STREAM_WINDOW seconds, and
+    # frames are recorded only then (2026-10-16: a scan started on one leftover block and recorded nothing else).
+    arrivals = []
+    seen_mesh = None
+    started, paused_since, paused_total = None, None, 0.0
+    t_end = time.time() + (wait or seconds)
+    next_progress = time.time()
+    try:
+        with open(tmp, "wb") as f:
+            f.write(b"FPRS" + struct.pack("<I", 1))
+            while time.time() < t_end:
+                now = time.time()
+                arrivals = [t for t in arrivals if now - t < ROOMVIEW_STREAM_WINDOW]
+                streaming = len(arrivals) >= ROOMVIEW_STREAM_MESHES
+                if started is not None:  # passthrough off mid-scan: the countdown waits (at most `wait` in all)
+                    if not streaming and paused_since is None:
+                        paused_since = now
+                    elif streaming and paused_since is not None:
+                        pause = min(now - paused_since, max(0.0, (wait or seconds) - paused_total))
+                        t_end += pause
+                        paused_total += pause
+                        paused_since = None
+                if _scan_complete(started, now, yaw_bins, pitch):
+                    break  # every direction, the ceiling and the floor seen: "Room scanned" at once
+                if now >= next_progress:
+                    if prompt:
+                        prompt.show(_prompt_for(started, yaw_bins, pitch, streaming, now))
+                    if progress:
+                        progress({"recording": started is not None, "frames": len(offsets),
+                                  "seconds": round(now - started - paused_total, 1) if started else 0,
+                                  "directions": len(yaw_bins), "looked_up": pitch["up"],
+                                  "looked_down": pitch["down"], "live": streaming})
+                    next_progress = now + 1
+                blk, buf = rv.acquire(rv.data, 1, 200)  # EBlockQueueReadType_New
+                if blk is None:
+                    continue
+                try:
+                    mesh_id = rv.prop(blk.value, "/meshData/meshId", "<Q")
+                    if mesh_id != seen_mesh:
+                        seen_mesh = mesh_id
+                        arrivals.append(now)
+                    if not streaming or not rv.up_to_date() or now - last_write < 1.0 / max_hz:
+                        continue
+                    lid = rv.prop(blk.value, "/meshData/layoutId", "<Q")
+                    count = rv.prop(blk.value, "/meshData/elementCount", "<i") or 0
+                    pose = rv.prop(blk.value, "/meshData/rawFromMeshPose", "<12f")
+                    if mesh_id == last_mesh or pose is None or count < 9 or not all(map(math.isfinite, pose)):
+                        continue
+                    if lid != layout_id:  # the index layout only changes with the mesh resolution
+                        lb, lbuf = rv.acquire(rv.layout, 0, 500)
+                        if lb is not None:
+                            n = rv.prop(lb.value, "/meshLayout/indexCount", "<i") or 0
+                            indices = ct.string_at(lbuf, n * 4)
+                            layout_id = rv.prop(lb.value, "/meshLayout/layoutId", "<Q")
+                            rv.release(rv.layout, lb)
+                    if indices is None or layout_id != lid:
+                        continue
+                    verts = ct.string_at(buf, count * 4)
+                finally:
+                    rv.release(rv.data, blk)
+                if started is None:
+                    started = now
+                    t_end = now + seconds
+                offsets.append(f.tell())
+                raw_poses.append(list(pose))
+                _view_coverage(pose, yaw_bins, pitch)
+                f.write(struct.pack(FPRS_FRAME, now, 0, 0, 0, 0, 0, 0, 1, count // 3, len(indices) // 4))
+                f.write(verts)
+                f.write(indices)
+                last_mesh, last_write = mesh_id, now
+                if floor_preview:
+                    floor_preview.feed(verts, pose)
+        r2s = rv.raw_to_standing()
+    finally:
+        if floor_preview:
+            floor_preview.close()
+        if prompt:
+            prompt.close("done" if offsets else "failed")
+        rv.close()
+    with open(tmp, "r+b") as f:  # raw -> STAGE with the final floor/universe transform
+        for off, raw in zip(offsets, raw_poses, strict=True):
+            m = _m34_mul(r2s, raw)
+            f.seek(off + FPRS_POSE_OFFSET)
+            f.write(struct.pack("<7f", m[3], m[7], m[11], *_m34_quat(m)))
+    warnings = []
+    if not offsets:
+        warnings.append("no passthrough mesh: turn on passthrough in the headset")
+    if len(yaw_bins) < 9:
+        warnings.append("not all directions seen: look around the whole room")
+    if pitch["up"] < 5:
+        warnings.append("ceiling not seen: look up")
+    os.replace(tmp, out_path)
+    return {"frames": len(offsets), "seconds": round(last_write - started, 1) if started else 0,
+            "directions": len(yaw_bins), "looked_up": pitch["up"], "looked_down": pitch["down"],
+            "bytes": os.path.getsize(out_path), "warnings": warnings}
+
+
+ROOM_SCAN_STATUS = os.path.join(ROOMS_DIR, "scan-status.json")
+ROOM_SCAN_DUMPS = os.path.join(ROOMS_DIR, "scans")
+ROOM_SCAN_PROMPTS = os.path.join(HOME, ".local/share/frameport/bin/roomscan-prompts")
+ROOM_SCAN_UNIT = "frameport-room-scan"
+ROOM_SCAN_KEEP = 2  # newest dumps kept for diagnostics (each ~100-600 MB)
+
+
+def cmd_room_capture(args):
+    """Start a room scan in the headset: a detached job records the passthrough mesh (with prompts in the headset),
+    then builds and stores the room. Progress: room_capture_status."""
+    seconds = float(args.get("seconds", 90))
+    wait = float(args.get("wait", 180))
+    if not (10 <= seconds <= 900 and 0 <= wait <= 1800):
+        raise AgentError("scan length out of range")
+    if not os.access(ROOM_SCANNER, os.X_OK):
+        raise AgentError("Room scanner is not installed")
+    state = cmd_room_capture_status({})
+    if state.get("state") in ("waiting", "recording", "building") and _unit_active(ROOM_SCAN_UNIT):
+        raise AgentError("A room scan is already running")
+    os.makedirs(ROOMS_DIR, exist_ok=True)
+    _write_json(ROOM_SCAN_STATUS, {"state": "waiting", "started": time.time(), "seconds": seconds})
+    p = run(["systemd-run", "--user", "--collect", "--quiet", f"--unit={ROOM_SCAN_UNIT}-{int(time.time())}",
+             "--setenv=HOME=" + HOME, sys.executable, os.path.abspath(__file__), "_room_capture",
+             json.dumps({"seconds": seconds, "wait": wait, "preview": args.get("preview", True)})])
+    if p.returncode != 0:
+        _write_json(ROOM_SCAN_STATUS, {"state": "failed", "error": p.stderr.strip()[-300:]})
+        raise AgentError(f"couldn't start the room scan: {p.stderr.strip()[-300:]}")
+    return {"started": True, "status": ROOM_SCAN_STATUS}
+
+
+def _unit_active(prefix):
+    p = run(["systemctl", "--user", "list-units", "--no-legend", "--plain", f"{prefix}-*"])
+    return any(line.split()[2:3] == ["active"] for line in (p.stdout or "").splitlines() if line.strip())
+
+
+def cmd_room_capture_status(args):
+    try:
+        with open(ROOM_SCAN_STATUS) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"state": "none"}
+
+
+def cmd_room_capture_stop(args):
+    """Cancel a running room scan (the Room tab's Cancel): stop its job (systemd ends the recorder and the room
+    builder with it); the saved room stays as it was."""
+    state = cmd_room_capture_status({})
+    p = run(["systemctl", "--user", "list-units", "--no-legend", "--plain", f"{ROOM_SCAN_UNIT}-*"])
+    units = [line.split()[0] for line in (p.stdout or "").splitlines() if line.strip()]
+    stopped = [u for u in units if run(["systemctl", "--user", "stop", u]).returncode == 0]
+    if state.get("state") in ("waiting", "recording", "building"):  # the job can't write its own end any more
+        state.update(state="failed", error="cancelled", cancelled=True, finished=time.time())
+        _write_json(ROOM_SCAN_STATUS, state)
+    return {"stopped": stopped, "state": state.get("state")}
+
+
+def room_capture_worker(payload):
+    # Separate from .lock: cmd_room_build -> room_store takes that lock while publishing.
+    os.makedirs(ROOMS_DIR, exist_ok=True)
+    with open(os.path.join(ROOMS_DIR, ".scan.lock"), "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise AgentError("A room scan is already running") from None
+        return _room_capture_worker(payload)
+
+
+def _room_capture_worker(payload):
+    job = json.loads(payload)
+    status = {"state": "waiting", "started": time.time(), "seconds": job["seconds"]}
+    os.makedirs(ROOM_SCAN_DUMPS, exist_ok=True)
+    dump = os.path.join(ROOM_SCAN_DUMPS, time.strftime("scan-%Y%m%d-%H%M%S.fprs"))
+
+    def progress(p):
+        status.update(p, state="recording" if p.get("recording") else "waiting")
+        _write_json(ROOM_SCAN_STATUS, status)
+
+    def preview_log(message):
+        with open(dump + ".log", "a") as log:
+            log.write(message + "\n")
+
+    try:
+        summary = capture_roomview(job["seconds"], dump, wait=job["wait"], progress=progress,
+                                   prompts=ROOM_SCAN_PROMPTS if os.path.isdir(ROOM_SCAN_PROMPTS) else None,
+                                   preview=job.get("preview", True), preview_log=preview_log)
+        status.update(capture=summary, state="building")
+        _write_json(ROOM_SCAN_STATUS, status)
+        if summary["frames"] < ROOM_SCAN_MIN_FRAMES:  # never replace a saved room with a scrap of one
+            raise AgentError("The scan saw too little of the room: keep passthrough on, look around until the "
+                             "headset says \"Room scanned\", and scan again")
+        built = cmd_room_build({"dump": dump})
+        status.update(state="done", report=built.get("report"), room=built.get("room"), finished=time.time())
+    except Exception as exc:  # noqa: BLE001 - every failure ends in the status file the PC polls
+        status.update(state="failed", error=str(exc)[-500:], finished=time.time())
+    finally:
+        _write_json(ROOM_SCAN_STATUS, status)
+        for old in sorted(glob.glob(os.path.join(ROOM_SCAN_DUMPS, "scan-*.fprs")))[:-ROOM_SCAN_KEEP]:
+            try:
+                os.remove(old)
+                if os.path.isfile(old + ".log"):
+                    os.remove(old + ".log")
+            except OSError:
+                pass
+
+
+def wants_scene_room(anchor):
+    try:
+        with open(os.path.join(anchor, "deployment.json")) as f:
+            dep = json.load(f)
+        # Live Game settings changes are in settings.conf; older recipes list patch ids only.
+        conf = os.path.join(dep.get("base", anchor), "settings.conf")
+        if os.path.isfile(conf):
+            for line in open(conf):
+                key, _, value = line.strip().partition("=")
+                if key == "scene_emul":
+                    return float(value) != 0
+        recipe = dep.get("recipe") or {}
+        return dep.get("scene_room", "adapter.scene_emul" in (recipe.get("patches") or []))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def set_room_sync_line(text, pkg, want):
+    text = set_scan_watch_line(text, pkg, want)
+    text = "".join(line for line in text.splitlines(True) if "# frameport-room-sync" not in line)
+    if not want or "\nsetsid " not in text:
+        return text
+    line = ROOM_SYNC_LINE.format(agent_q=shlex.quote(os.path.abspath(__file__)), pkg_q=shlex.quote(pkg))
+    return text.replace("\nsetsid ", "\n" + line + "\nsetsid ", 1)
+
+
+SCAN_WATCH_LINE = ('python3 {agent_q} _scan_watch {pkg_q} '
+                   '>"$app_dir/scan-watch.log" 2>&1 9>&- & scanwatch=$! # frameport-scan-watch')
+
+
+def set_scan_watch_line(text, pkg, want):
+    text = "".join(line for line in text.splitlines(True) if "# frameport-scan-watch" not in line)
+    if not want or "\nchild=$!\n" not in text:
+        return text
+    line = SCAN_WATCH_LINE.format(agent_q=shlex.quote(os.path.abspath(__file__)), pkg_q=shlex.quote(pkg))
+    text = text.replace("\nchild=$!\n", "\nchild=$!\n" + line + "\n", 1)
+    if '${scanwatch:-}' in text:
+        return text
+    stop = '    [[ -z "${scanwatch:-}" ]] || kill "$scanwatch" 2>/dev/null || true\n'
+    return text.replace('    trap - EXIT INT TERM\n', '    trap - EXIT INT TERM\n' + stop, 1)
+
+
+def scan_watch_write(folder, name, text):
+    path = os.path.join(folder, "framebridge-scan-" + name)
+    with open(path + ".tmp", "w") as f:
+        f.write(text + "\n")
+    os.replace(path + ".tmp", path)
+
+
+def scan_watch_request(pkg, folder, request_id, alive):
+    scan_watch_write(folder, "ack", "ack " + request_id)
+    child = None
+    try:
+        # A process group lets cancellation stop fp_roomscan as well as the Python capture worker.
+        child = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_room_capture",
+                                  json.dumps({"seconds": 90, "wait": 180})], start_new_session=True)
+        deadline = time.monotonic() + 350
+        while child.poll() is None:
+            if not alive():
+                raise AgentError("cancelled")
+            if time.monotonic() >= deadline:
+                raise AgentError("timeout")
+            time.sleep(1)
+        if child.returncode:
+            raise AgentError("scanner error (possibly another scan is running)")
+        status = cmd_room_capture_status({})
+        if status.get("state") != "done":
+            raise AgentError(status.get("error", "scanner error"))
+        copied = room_sync_worker(pkg)
+        if not copied or not copied.get("room"):
+            raise AgentError("no room copied")
+        scan_watch_write(folder, "result", "ok " + request_id)
+    except Exception as exc:  # every acknowledged request gets a terminal result
+        reason = " ".join(str(exc).split())[:300] or "scanner error"
+        print("scan " + request_id + ": " + reason, flush=True)
+        scan_watch_write(folder, "result", "failed " + request_id + " " + reason)
+    finally:
+        if child is not None and child.poll() is None:
+            os.killpg(child.pid, signal.SIGTERM)
+            try:
+                child.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait()
+
+
+def scan_watch_worker(pkg):
+    dep = deployment(check_pkg(pkg))
+    if not dep or dep.get("kind", "quest") != "quest":
+        return
+    folder = os.path.join(dep["base"], "lepton-data/external/Android/data", pkg, "files")
+    os.makedirs(folder, exist_ok=True)
+    for name in ("request", "ack", "result"):
+        try:
+            os.unlink(os.path.join(folder, "framebridge-scan-" + name))
+        except FileNotFoundError:
+            pass
+    parent = os.getppid()
+    stopped = [False]
+    def stop(signum, frame):
+        stopped[0] = True
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    def alive():
+        return not stopped[0] and parent > 1 and os.getppid() == parent
+    seen = None
+    while alive():
+        try:
+            with open(os.path.join(folder, "framebridge-scan-request")) as f:
+                fields = f.read(512).split()
+            if len(fields) == 3 and fields[0] == "request" and fields[1] != seen:
+                float(fields[2])
+                seen = fields[1]
+                print("scan requested: " + seen, flush=True)
+                scan_watch_request(pkg, folder, seen, alive)
+        except (OSError, ValueError) as exc:
+            if not isinstance(exc, FileNotFoundError):
+                print(str(exc), flush=True)
+        time.sleep(1)
+
+
+def room_sync_worker(pkg):
+    dep = deployment(check_pkg(pkg))
+    if not dep or dep.get("kind", "quest") != "quest":
+        return
+    base = dep["base"]
+    # Explicit scene_room follows the recipe at finalize; older deployments derive it on launcher upgrade.
+    selected = room_selected() if wants_scene_room(os.path.join(ANCHORS, pkg)) else None
+    record = None
+    if selected:
+        with open(os.path.join(selected, "room.txt")) as f:
+            text = f.read()
+        record = room_records(text)
+        if record.get("mesh"):
+            with open(os.path.join(selected, record["mesh"]["filename"]), "rb") as f:
+                mesh = f.read()
+            room_validate_mesh(mesh, record["mesh"])
+            # The public format allows any sidecar basename; per-game copies use the contract's fixed name.
+            text = re.sub(r"(?m)^(mesh\s+[a-f0-9]{32}\s+)\S+", r"\g<1>room-mesh.bin", text)
+            with open(os.path.join(base, "room-mesh.bin.tmp"), "wb") as f:
+                f.write(mesh)
+            os.replace(os.path.join(base, "room-mesh.bin.tmp"), os.path.join(base, "room-mesh.bin"))
+        with open(os.path.join(base, "room.txt.tmp"), "w") as f:
+            f.write(text)
+        os.replace(os.path.join(base, "room.txt.tmp"), os.path.join(base, "room.txt"))
+    for name in ("room.txt", "room-mesh.bin"):
+        if not selected or (name == "room-mesh.bin" and not record.get("mesh")):
+            try:
+                os.unlink(os.path.join(base, name))
+            except FileNotFoundError:
+                pass
+    return {"room": record, "aligned": bool(record and record["universe"] == room_current_universe())}
+
+
+def room_setting_changed(pkg, dep, settings):
+    """Live settings must update the launcher too, including switching emulation on after install."""
+    if "scene_emul" not in settings:
+        return
+    dep["scene_room"] = float(settings["scene_emul"]) != 0
+    write_deployment(pkg, dep)
+    path = os.path.join(ANCHORS, pkg, "launch.sh")
+    if os.path.isfile(path):
+        with open(path) as f:
+            old = f.read()
+        text = set_room_sync_line(old, pkg, dep["scene_room"])
+        if text != old:
+            with open(path + ".tmp", "w") as f:
+                f.write(text)
+            os.chmod(path + ".tmp", 0o755)
+            os.replace(path + ".tmp", path)
+    if not dep["scene_room"]:
+        room_sync_worker(pkg)
+
+
+# ---------------------------------------------------------- end mixed-reality room storage
+
+def cmd_finalize(args):
+    """Move uploaded files into place, write launcher/settings/config files/deployment.json. Keeps saves."""
+    pkg = check_pkg(args["package"])
+    title = args["title"]
+    prep = cmd_prepare({"package": pkg, "title": title, "dest": args.get("dest")})
+    base, anchor, incoming = prep["base"], prep["anchor"], prep["incoming"]
+    lepton = prep["lepton"]
+    if not lepton:
+        raise AgentError("Lepton is not installed (Developer Mode → install/launch 'Lepton Development' once)")
+    app = os.path.join(base, "lepton-app")
+    os.makedirs(os.path.join(app, "obb"), exist_ok=True)
+    os.makedirs(anchor, exist_ok=True)
+    new_apk = os.path.join(incoming, "game.apk")
+    inc_obb = os.path.join(incoming, "obb")
+    expected = args.get("obb_manifest")  # rel path -> size
+    if expected:  # check the data as it will be after the move, before replacing anything (a failure keeps the old)
+        have = {**obb_manifest(os.path.join(app, "obb")), **obb_manifest(inc_obb)}
+        bad = [k for k, v in expected.items() if have.get(k) != v]
+        if bad:
+            raise AgentError(f"{len(bad)} data file(s) missing or incomplete, e.g. {bad[0]}")
+    if args.get("existing_only") and os.path.exists(new_apk):
+        raise AgentError("an interrupted APK upload is pending; finish that install before updating data")
+    if args.get("existing_only"):
+        verify_installed_apk(deployment(pkg), args.get("apk_sha256"))
+    if os.path.exists(new_apk):
+        if args.get("apk_sha256") and sha256_file(new_apk) != args["apk_sha256"]:
+            raise AgentError("uploaded APK checksum mismatch (transfer corrupted?)")
+        cur = os.path.join(app, "game.apk")
+        if os.path.exists(cur):
+            os.replace(cur, os.path.join(base, "previous-game.apk"))  # one generation for rollback
+        os.replace(new_apk, cur)
+    elif not os.path.exists(os.path.join(app, "game.apk")):
+        raise AgentError("no APK uploaded and none installed")
+    moved = 0
+    if not args.get("preserve_data"):
+        for root, _, files in os.walk(inc_obb):
+            for name in files:
+                if name.endswith(".part"):
+                    continue
+                src = os.path.join(root, name)
+                rel = os.path.relpath(src, inc_obb)
+                if expected is not None and rel not in expected:
+                    continue  # an older interrupted upload is not part of this install
+                dst = os.path.join(app, "obb", rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if os.path.isdir(dst) and obb_unpacked_size(dst) is not None:
+                    shutil.rmtree(dst)  # a new version of an unpacked OBB image (unpacked again: unpack_obb)
+                os.replace(src, dst)
+                moved += 1
+        shutil.rmtree(incoming, ignore_errors=True)
+    return configure_install({**args, "consume_artwork": args.get("consume_artwork", True)}, prep, moved)
+
+
+def verify_installed_apk(dep, expected):
+    apk = os.path.join(dep["base"], "lepton-app", "game.apk")
+    if not expected or dep.get("sha256") != expected or not os.path.isfile(apk):
+        raise AgentError("installed APK is missing or changed; refresh and reinstall it")
+    st = os.stat(apk)
+    identity = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    if identity != dep.get("apk_stat") and sha256_file(apk) != expected:
+        raise AgentError("installed APK content changed; reinstall it")
+
+
+def cmd_configure(args):
+    """Apply runtime configuration to an existing, matching APK without staging/replacing game files."""
+    pkg = check_pkg(args["package"])
+    dep = deployment(pkg)
+    if not dep or dep.get("kind", "quest") != "quest":
+        raise AgentError(f"{pkg} is not an installed Quest/Android app")
+    base, _ = new_base(args, pkg, dep)  # validates a removable drive; never silently falls back
+    verify_installed_apk(dep, args.get("apk_sha256"))
+    if container_running(dep["appid"]):
+        raise AgentError("Close the game before updating its configuration")
+    lepton, _ = lepton_path()
+    if not lepton:
+        raise AgentError("Lepton is not installed")
+    return configure_install({**args, "title": dep["title"]},
+                             {"base": base, "anchor": os.path.join(ANCHORS, pkg),
+                              "appid": dep["appid"], "lepton": lepton}, 0)
+
+
+def configure_install(args, prep, moved):
+    pkg, title = check_pkg(args["package"]), args["title"]
+    base, anchor, appid, lepton = prep["base"], prep["anchor"], prep["appid"], prep["lepton"]
+    app = os.path.join(base, "lepton-app")
+    previous = deployment(pkg) or {}
+    files_dir = data_files_dir(base, pkg)
+    for rel in set(args.get("files") or {}) | set(previous.get("managed_config_files") or {}):
+        target = os.path.realpath(os.path.join(files_dir, rel))
+        if not _inside(target, os.path.realpath(files_dir)) or target == os.path.realpath(files_dir):
+            raise AgentError(f"refusing to write outside the game's files dir: {rel}")
+        backup = os.path.join(files_dir, rel) + ".frameport-config-backup"
+        if os.path.islink(backup):
+            raise AgentError(f"refusing a linked configuration backup: {rel}")
+    for key, value in (args.get("settings") or {}).items():
+        if not re.fullmatch(r"[a-z_]+", key) or any(c in str(value) for c in "\r\n\x00"):
+            raise AgentError(f"bad setting {key}")
+    if "flatscreen" in args:  # older clients don't send it: leave the marker as it is
+        set_flatscreen(app, args["flatscreen"])
+    # settings: settings.conf (read by the adapter via LEPTON_ENV_FRAMEBRIDGE_CONFIG) + framebridge.conf copy
+    files_dir = data_files_dir(base, pkg)
+    os.makedirs(files_dir, exist_ok=True)
+    os.makedirs(os.path.join(base, "lepton-shaders"), exist_ok=True)
+    settings = args.get("settings") or {}
+    conf = os.path.join(base, "settings.conf")
+    if settings:
+        if os.path.exists(conf):
+            shutil.copy2(conf, conf + ".previous")
+        text = "".join(f"{k}={v}\n" for k, v in settings.items())
+        with open(conf, "w") as f:
+            f.write(text)
+        with open(os.path.join(files_dir, "framebridge.conf"), "w") as f:
+            f.write(text)
+    managed = previous.get("managed_config_files") or {}
+    wanted = args.get("files") or {}
+    for rel, record in managed.items():
+        if rel in wanted:
+            continue
+        target = os.path.realpath(os.path.join(files_dir, rel))
+        if not _inside(target, os.path.realpath(files_dir)):
+            raise AgentError(f"invalid previously managed path: {rel}")
+        if os.path.isfile(target) and sha256_file(target) == record["sha256"]:
+            backup = target + ".frameport-config-backup"
+            if record.get("backup") and os.path.isfile(backup):
+                os.replace(backup, target)
+            else:
+                os.unlink(target)
+    new_managed = {}
+    for rel, content in (args.get("files") or {}).items():
+        target = os.path.normpath(os.path.join(files_dir, rel))
+        if not target.startswith(files_dir + os.sep):
+            raise AgentError(f"refusing to write outside the game's files dir: {rel}")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        record = managed.get(rel)
+        backup = target + ".frameport-config-backup"
+        # no record: an existing file is the user's, unless it already has exactly this content (written by
+        # FramePort before agent v86 kept records; backing it up would bring it back when the recipe drops it)
+        had_original = bool(record.get("backup")) if record else os.path.isfile(target) and \
+            open(target, "rb").read() != content.encode()
+        if not record and had_original:
+            shutil.copy2(target, backup)
+        with open(target, "w") as f:
+            f.write(content)
+        new_managed[rel] = {"sha256": sha256_file(target), "backup": had_original}
+    models = install_controller_models(files_dir, str(settings.get("controller_models", 0)) not in ("0", "0.0"))
+    recipe = args.get("recipe") if isinstance(args.get("recipe"), dict) else {}
+    static_openxr = "frame.static_openxr_loader" in (recipe.get("patches") or [])
+    write_openxr_runtime_manifest(base, static_openxr)
+    hw_video = HW_VIDEO_PATCH in (recipe.get("patches") or [])  # the shared codec (install_video_codec)
+    gamepad = GAMEPAD_PATCH in (recipe.get("patches") or [])  # Steam Input's virtual gamepad (PODMAN_WRAPPER)
+    features = bool(system_features((args.get("env") or {}).get("FRAMEPORT_FEATURES")))  # device.hybrid_app
+    if gamepad or features:
+        ensure_podman_wrapper()
+    extra_folder_cleanup(base, (args.get("env") or {}).get(FOLDER_ENV))  # device.extra_folder taken off or changed
+    config_sync = args.get("config_sync") if isinstance(args.get("config_sync"), dict) else {}
+    scene_value = settings.get("scene_emul", (recipe.get("adapter") or {}).get(
+        "scene_emul", int("adapter.scene_emul" in (recipe.get("patches") or []))))
+    scene_room = float(scene_value) != 0
+    write_launcher(anchor, base, pkg, title, appid, lepton, args.get("env"), hw_video, gamepad, bool(config_sync),
+                   static_openxr, scene_room, features)
+    art_in = os.path.join(base, "incoming-artwork")
+    art_moved = False
+    if args.get("consume_artwork") and os.path.isdir(art_in):
+        shutil.rmtree(os.path.join(anchor, "artwork"), ignore_errors=True)
+        shutil.move(art_in, os.path.join(anchor, "artwork"))
+        art_moved = True
+    dep = {**previous, "package": pkg, "appid": int(appid), "base": base, "title": title,
+           "tags": args.get("tags", previous.get("tags")) or [],
+           "apk": args.get("apk_name", previous.get("apk", "game.apk")),
+           "sha256": args.get("apk_sha256") or previous.get("sha256"),
+           "recipe": args.get("recipe"), "installed_by": "frameport",
+           "static_openxr_loader": static_openxr,
+           "hw_video_decode": hw_video, "steam_gamepad": gamepad, "config_sync": config_sync,
+           "scene_room": scene_room,
+           "agent_version": AGENT_VERSION, "time": time.time()}
+    if previous.get("eye_base"):  # the runtime's eye size learned from an earlier start (device.config_sync)
+        dep["eye_base"] = previous["eye_base"]
+    dep["foveation_env"] = {key: (args.get("env") or {}).get(key) for key in FOVEATION_ENV_KEYS}
+    dep["managed_config_files"] = new_managed
+    # An app before agent v86 records none of these: what it installed is unknown, so a newer PC mustn't skip work
+    # on the strength of an older record. Art the agent didn't replace keeps its record.
+    art_replaced = bool(args.get("consume_artwork")) and art_moved
+    for key in ("configuration", "configuration_fp", "apk_recipe_fp", "source_version", "artwork_manifest"):
+        if key in args:
+            dep[key] = args[key]
+        elif key != "artwork_manifest" or art_replaced:
+            dep.pop(key, None)
+    if args.get("obb_manifest") is not None:
+        dep["data_manifest"] = args["obb_manifest"]
+    if "data_manifest" in dep:
+        dep["data_fp"] = hashlib.sha256(json.dumps(dep["data_manifest"], sort_keys=True).encode()).hexdigest()[:32]
+    st = os.stat(os.path.join(app, "game.apk"))
+    dep["apk_size"] = st.st_size
+    dep["apk_stat"] = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    synced = sync_game_config(pkg, dep)
+    write_deployment(pkg, dep)
+    if not scene_room:
+        room_sync_worker(pkg)
+    return {"ok": True, "base": base, "appid": appid, "moved_data_files": moved, "controller_models": models,
+            "config_sync": synced, "deployment": deployment_summary(dep), "refresh_rate": sync_refresh_rate(pkg, dep)}
+
+
+# --------------------------------------------------------------- Steam Frame controller models (XR_FB_render_model)
+# The FrameBridge adapter (setting controller_models=1) serves these to games that ask the runtime for controller
+# models.
+# They are converted here, on the Frame, from the SteamVR render models the Frame already has (OBJ + PNG) into glTF
+# binaries, so Valve's models never leave the device.
+MODELS_CACHE = os.path.join(HOME, ".local/share/frameport/controller-models")
+FRAME_MODEL_RE = re.compile(r"frame", re.I)
+SKIP_COMPONENTS = ("status", "led", "scroll_wheel_touch")
+
+
+def steamvr_roots():
+    roots = []
+    rt = openxr_runtime()
+    if rt and rt.get("path"):
+        roots.append(os.path.dirname(rt["path"]))
+    roots += [os.path.join(lib, "steamapps/common/SteamVR") for lib in steam_libraries()]
+    roots += ["/opt/steamvr", os.path.join(STEAM, "steamapps/common/SteamVR")]
+    out = []
+    for r in roots:
+        r = os.path.realpath(r)
+        if os.path.isdir(r) and r not in out:
+            out.append(r)
+    return out
+
+
+def render_model_dirs(roots=None):
+    """name -> directory of every SteamVR render model (a folder with .obj files)."""
+    found = {}
+    for root in roots if roots is not None else steamvr_roots():
+        for pattern in ("resources/rendermodels/*", "drivers/*/resources/rendermodels/*"):
+            for d in sorted(glob.glob(os.path.join(root, pattern))):
+                if os.path.isdir(d) and glob.glob(os.path.join(d, "*.obj")):
+                    found.setdefault(os.path.basename(d), d)
+    return found
+
+
+def model_side(name):
+    n = name.lower()
+    for side in ("left", "right"):
+        if side in n:
+            return side
+    for side in ("left", "right"):  # e.g. controller_l / controller-r
+        if re.search(rf"(^|[_\-. ]){side[0]}([_\-. ]|$)", n):
+            return side
+    return None
+
+
+def pick_controller_models(dirs, pattern=FRAME_MODEL_RE):
+    """{'left': dir, 'right': dir} for the Steam Frame controllers (names matching `pattern`), or {}."""
+    best = {}
+    for name, d in dirs.items():
+        side = model_side(name)
+        if not side or not pattern.search(name):
+            continue
+        score = ("controller" in name.lower()) * 10 - len(name)
+        if side not in best or score > best[side][0]:
+            best[side] = (score, d)
+    return {s: d for s, (_, d) in best.items()} if len(best) == 2 else {}
+
+
+def _rotation_xyz(deg):
+    """3x3 rotation for SteamVR's rotate_xyz (degrees; applied about X, then Y, then Z)."""
+    import math
+    rx, ry, rz = (math.radians(float(v)) for v in (list(deg) + [0, 0, 0])[:3])
+    cx, sx, cy, sy, cz, sz = math.cos(rx), math.sin(rx), math.cos(ry), math.sin(ry), math.cos(rz), math.sin(rz)
+    X = [[1, 0, 0], [0, cx, -sx], [0, sx, cx]]
+    Y = [[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]]
+    Z = [[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]]
+    mul = lambda a, b: [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+    return mul(Z, mul(Y, X))
+
+
+def model_description(model_dir):
+    """(obj files, grip transform or None) from the model's JSON (components) or the folder's .obj files."""
+    name = os.path.basename(model_dir)
+    desc = {}
+    for cand in (os.path.join(model_dir, name + ".json"), *sorted(glob.glob(os.path.join(model_dir, "*.json")))):
+        try:
+            desc = json.load(open(cand))
+            if isinstance(desc, dict) and "components" in desc:
+                break
+        except (OSError, ValueError):
+            desc = {}
+    objs, grip = [], None
+    for cname, comp in (desc.get("components") or {}).items():
+        if not isinstance(comp, dict):
+            continue
+        if cname == "openxr_grip" and isinstance(comp.get("component_local"), dict):
+            local = comp["component_local"]
+            grip = (list(local.get("origin") or [0, 0, 0]), _rotation_xyz(local.get("rotate_xyz") or [0, 0, 0]))
+        fn = comp.get("filename")
+        hidden = (comp.get("visibility") or {}).get("default") is False  # e.g. status LEDs
+        if fn and not hidden and not any(s in cname.lower() for s in SKIP_COMPONENTS):
+            p = os.path.join(model_dir, fn)
+            if os.path.exists(p):
+                objs.append(p)
+    if not objs:
+        whole = os.path.join(model_dir, name + ".obj")
+        objs = [whole] if os.path.exists(whole) else sorted(glob.glob(os.path.join(model_dir, "*.obj")))
+    return objs, grip
+
+
+def parse_mtl(path):
+    """material name -> texture file (map_Kd)."""
+    out, cur = {}, None
+    try:
+        for line in open(path, errors="replace"):
+            parts = line.strip().split(None, 1)
+            if not parts:
+                continue
+            if parts[0] == "newmtl" and len(parts) > 1:
+                cur = parts[1].strip()
+            elif parts[0] == "map_Kd" and cur and len(parts) > 1:
+                out[cur] = os.path.join(os.path.dirname(path), parts[1].strip().split()[-1])
+    except OSError:
+        pass
+    return out
+
+
+def parse_obj(path):
+    """-> list of (texture path or None, positions, normals, uvs, triangles as (v, vt, vn) index triples)."""
+    pos, nrm, uv = [], [], []
+    groups = {}  # texture -> list of corner triples
+    mats, tex = {}, None
+    for line in open(path, errors="replace"):
+        parts = line.split()
+        if not parts:
+            continue
+        tag = parts[0]
+        if tag == "v":
+            pos.append(tuple(float(x) for x in parts[1:4]))
+        elif tag == "vn":
+            nrm.append(tuple(float(x) for x in parts[1:4]))
+        elif tag == "vt":
+            uv.append((float(parts[1]), float(parts[2]) if len(parts) > 2 else 0.0))
+        elif tag == "mtllib":
+            mats.update(parse_mtl(os.path.join(os.path.dirname(path), " ".join(parts[1:]))))
+        elif tag == "usemtl":
+            tex = mats.get(" ".join(parts[1:]))
+        elif tag == "f":
+            corners = []
+            for c in parts[1:]:
+                idx = (c.split("/") + ["", ""])[:3]
+                ref = []
+                for i, n in zip(idx, (len(pos), len(uv), len(nrm)), strict=True):
+                    ref.append(None if not i else (int(i) - 1 if int(i) > 0 else n + int(i)))
+                corners.append(tuple(ref))
+            for i in range(1, len(corners) - 1):  # fan triangulation
+                groups.setdefault(tex, []).extend((corners[0], corners[i], corners[i + 1]))
+    return pos, nrm, uv, groups
+
+
+def controller_glb(model_dir):
+    """glTF binary (one mesh, one primitive per texture, PNG/JPEG textures, in the controller's OpenXR grip space
+    when the model defines openxr_grip) for a SteamVR render model folder."""
+    objs, grip = model_description(model_dir)
+    if not objs:
+        raise AgentError(f"no .obj files in {model_dir}")
+    # texture -> (positions, normals, uvs, indices), vertices de-duplicated per corner triple
+    prims = {}
+    for obj in objs:
+        pos, nrm, uv, groups = parse_obj(obj)
+        for tex, corners in groups.items():
+            if tex and os.path.splitext(tex)[1].lower() not in (".png", ".jpg", ".jpeg"):
+                tex = None
+            p = prims.setdefault(tex, {"pos": [], "nrm": [], "uv": [], "idx": [], "map": {}})
+            for c in corners:
+                key = (obj, c)
+                if key not in p["map"]:
+                    p["map"][key] = len(p["pos"])
+                    v = pos[c[0]]
+                    n = nrm[c[2]] if c[2] is not None and c[2] < len(nrm) else (0.0, 0.0, 1.0)
+                    t = uv[c[1]] if c[1] is not None and c[1] < len(uv) else (0.0, 0.0)
+                    if grip:  # raw device space -> grip space: R^T (v - origin)
+                        o, r = grip
+                        d = [v[k] - float(o[k]) for k in range(3)]
+                        v = tuple(sum(r[k][j] * d[k] for k in range(3)) for j in range(3))
+                        n = tuple(sum(r[k][j] * n[k] for k in range(3)) for j in range(3))
+                    p["pos"].append(v)
+                    p["nrm"].append(n)
+                    p["uv"].append((t[0], 1.0 - t[1]))  # OBJ origin bottom-left, glTF top-left
+                p["idx"].append(p["map"][key])
+    blob = bytearray()
+    views, accessors, images, textures, materials, primitives = [], [], [], [], [], []
+
+    def add_view(data, target=None):
+        while len(blob) % 4:
+            blob.append(0)
+        view = {"buffer": 0, "byteOffset": len(blob), "byteLength": len(data)}
+        if target:
+            view["target"] = target
+        blob.extend(data)
+        views.append(view)
+        return len(views) - 1
+
+    def add_accessor(values, width, ctype, kind, target, minmax=False):
+        fmt = {5126: "f", 5125: "I"}[ctype]
+        flat = [x for v in values for x in (v if width > 1 else (v,))]
+        acc = {"bufferView": add_view(struct.pack(f"<{len(flat)}{fmt}", *flat), target), "componentType": ctype,
+               "count": len(values), "type": kind}
+        if minmax:
+            acc["min"] = [min(v[k] for v in values) for k in range(width)]
+            acc["max"] = [max(v[k] for v in values) for k in range(width)]
+        accessors.append(acc)
+        return len(accessors) - 1
+
+    for tex, p in prims.items():
+        if not p["idx"]:
+            continue
+        attrs = {"POSITION": add_accessor(p["pos"], 3, 5126, "VEC3", 34962, minmax=True),
+                 "NORMAL": add_accessor(p["nrm"], 3, 5126, "VEC3", 34962),
+                 "TEXCOORD_0": add_accessor(p["uv"], 2, 5126, "VEC2", 34962)}
+        indices = add_accessor(p["idx"], 1, 5125, "SCALAR", 34963)
+        mat = {"pbrMetallicRoughness": {"metallicFactor": 0.0, "roughnessFactor": 0.8}}
+        if tex and os.path.exists(tex):
+            mime = "image/png" if tex.lower().endswith(".png") else "image/jpeg"
+            images.append({"bufferView": add_view(open(tex, "rb").read()), "mimeType": mime})
+            textures.append({"source": len(images) - 1})
+            mat["pbrMetallicRoughness"]["baseColorTexture"] = {"index": len(textures) - 1}
+        else:
+            mat["pbrMetallicRoughness"]["baseColorFactor"] = [0.1, 0.1, 0.1, 1.0]
+        materials.append(mat)
+        primitives.append({"attributes": attrs, "indices": indices, "material": len(materials) - 1})
+    if not primitives:
+        raise AgentError(f"no triangles in {model_dir}")
+    while len(blob) % 4:
+        blob.append(0)
+    gltf = {"asset": {"version": "2.0", "generator": "FramePort agent"}, "scene": 0, "scenes": [{"nodes": [0]}],
+            "nodes": [{"name": os.path.basename(model_dir), "mesh": 0}],
+            "meshes": [{"primitives": primitives}], "materials": materials, "accessors": accessors,
+            "bufferViews": views, "buffers": [{"byteLength": len(blob)}]}
+    if images:
+        gltf.update(images=images, textures=textures, samplers=[{}])
+        for t in textures:
+            t["sampler"] = 0
+    js = json.dumps(gltf, separators=(",", ":")).encode()
+    js += b" " * (-len(js) % 4)
+    total = 12 + 8 + len(js) + 8 + len(blob)
+    return (struct.pack("<III", 0x46546C67, 2, total) + struct.pack("<I4s", len(js), b"JSON") + js
+            + struct.pack("<I4s", len(blob), b"BIN\x00") + bytes(blob))
+
+
+def _tree_stamp(d):
+    h = hashlib.sha256()
+    for p in sorted(glob.glob(os.path.join(d, "*"))):
+        st = os.stat(p)
+        h.update(f"{os.path.basename(p)}:{st.st_size}:{int(st.st_mtime)}\n".encode())
+    return h.hexdigest()[:16]
+
+
+def frame_controller_models():
+    """Converted (cached) glb paths for the Frame controllers: {'left': path, 'right': path, 'sources': {...}}."""
+    picked = pick_controller_models(render_model_dirs())
+    if not picked:
+        raise AgentError("no Steam Frame controller render models found in SteamVR (looked in: "
+                         + ", ".join(steamvr_roots() or ["no SteamVR install"]) + ")")
+    os.makedirs(MODELS_CACHE, exist_ok=True)
+    out = {"sources": picked}
+    for side, d in picked.items():
+        cached = os.path.join(MODELS_CACHE, f"{os.path.basename(d)}-{_tree_stamp(d)}.glb")
+        if not os.path.exists(cached):
+            data = controller_glb(d)
+            with open(cached + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(cached + ".tmp", cached)
+        out[side] = cached
+    return out
+
+
+def install_controller_models(files_dir, enabled):
+    """Put (or remove) framebridge/controller_{left,right}.glb in a game's files dir. Never fails the install."""
+    target = os.path.join(files_dir, "framebridge")
+    if not enabled:
+        for side in ("left", "right"):
+            p = os.path.join(target, f"controller_{side}.glb")
+            if os.path.exists(p):
+                os.remove(p)
+        return None
+    try:
+        models = frame_controller_models()
+    except (AgentError, OSError, ValueError, IndexError) as e:
+        return {"ok": False, "error": str(e)}
+    os.makedirs(target, exist_ok=True)
+    for side in ("left", "right"):
+        shutil.copyfile(models[side], os.path.join(target, f"controller_{side}.glb"))
+    return {"ok": True, "sources": models["sources"]}
+
+
+def cmd_controller_models(args):
+    """Diagnostics: SteamVR roots, every render model found, and which ones are used as the Frame controllers."""
+    dirs = render_model_dirs()
+    result = {"roots": steamvr_roots(), "render_models": dirs, "picked": pick_controller_models(dirs)}
+    if args.get("convert"):
+        try:
+            result["converted"] = frame_controller_models()
+        except (AgentError, OSError, ValueError, IndexError) as e:
+            result["error"] = str(e)
+    return result
+
+
+# ------------------------------------------------------------------------------------------ PC VR (Rift) under Proton
+PCVR_TREES = ("game", "revive", "xrlayer", "helpers")
+
+
+def tree_manifest(root):
+    out = {}
+    for r, _, files in os.walk(root):
+        for name in files:
+            if name.endswith(".part"):
+                continue
+            p = os.path.join(r, name)
+            rel = os.path.relpath(p, root)
+            if name.lower() == "crashreportclient.exe.disabled":  # renamed by set_crash_reporter: same file
+                rel = rel[:-len(".disabled")]
+            out[rel] = os.path.getsize(p)
+    return out
+
+
+# ------------------------------------------------------------------------------- OBB disk images (frame.obb_mount_emul)
+# Some games mount their OBBs as FAT disk images (StorageManager.mountObb; jobb-made, e.g. GRID Legends, GitHub #308).
+# Lepton has no loop devices, so with the patch the game reads a folder with the image's name instead: each image is
+# unpacked here into `obb/<name>/` (a marker file inside keeps the image's size, so the PC's "already on the Frame"
+# check and finalize's data check still see `<name>` = that size) and the image file is removed.
+OBB_IMAGE_PATCH = "frame.obb_mount_emul"
+OBB_MARKER = ".frameport-obb-image.json"
+OBB_UNPACKING = ".fp-unpack"
+OBB_FOOTER_SIG = 0x01059983  # Android ObbFile footer signature (last 4 bytes), jobb
+OBB_SALTED = 1  # footer flag: the image is encrypted (jobb -k: PBKDF2 + Twofish), not supported
+
+
+class FatImage:
+    """Read-only FAT12/16/32 reader for OBB images (stdlib only; the image is untrusted: names are checked, cluster
+    chains are bounded and loop-checked)."""
+
+    def __init__(self, path):
+        self.f = open(path, "rb")
+        try:
+            self._parse()
+        except Exception:
+            self.f.close()
+            raise
+
+    def _parse(self):
+        self.f.seek(0, 2)
+        size = self.f.tell()
+        self.f.seek(0)
+        bs = self.f.read(512)
+        if len(bs) < 512 or bs[510:512] != b"\x55\xaa":
+            raise ValueError("not a FAT image (no boot sector signature)")
+        bps, spc, res, nfat, root_n, tot16, _media, fat16 = struct.unpack_from("<HBHBHHBH", bs, 11)
+        tot32, fat32 = struct.unpack_from("<I", bs, 32)[0], struct.unpack_from("<I", bs, 36)[0]
+        if bps not in (512, 1024, 2048, 4096) or spc == 0 or spc & (spc - 1) or not res or not nfat:
+            raise ValueError("not a FAT image (bad BIOS parameter block)")
+        fat_sectors = fat16 or fat32
+        total = tot16 or tot32
+        root_sectors = (root_n * 32 + bps - 1) // bps
+        self.data_off = (res + nfat * fat_sectors + root_sectors) * bps
+        self.cluster = bps * spc
+        clusters = (total * bps - self.data_off) // self.cluster
+        if fat_sectors == 0 or total * bps > size + bps or clusters <= 0:
+            raise ValueError("not a FAT image (sizes don't fit the file)")
+        self.bits = 12 if clusters < 4085 else 16 if clusters < 65525 else 32
+        self.max_cluster = clusters + 1
+        self.f.seek(res * bps)
+        self.fat = self.f.read(fat_sectors * bps)
+        if self.bits == 32:
+            self.root = struct.unpack_from("<I", bs, 44)[0]
+            self.root_region = None
+        else:
+            self.root = 0
+            self.root_region = ((res + nfat * fat_sectors) * bps, root_sectors * bps)
+
+    def close(self):
+        self.f.close()
+
+    def next_cluster(self, c):
+        if self.bits == 32:
+            return struct.unpack_from("<I", self.fat, 4 * c)[0] & 0x0FFFFFFF if 4 * c + 4 <= len(self.fat) else None
+        if self.bits == 16:
+            return struct.unpack_from("<H", self.fat, 2 * c)[0] if 2 * c + 2 <= len(self.fat) else None
+        off = c + c // 2
+        if off + 2 > len(self.fat):
+            return None
+        v = struct.unpack_from("<H", self.fat, off)[0]
+        return v >> 4 if c & 1 else v & 0xFFF
+
+    def chain(self, first, limit):
+        """Clusters of a chain, at most `limit` (loops and out-of-range links are errors)."""
+        end = {12: 0xFF8, 16: 0xFFF8, 32: 0x0FFFFFF8}[self.bits]
+        out, seen, c = [], set(), first
+        while 2 <= c < end and len(out) < limit:
+            if c > self.max_cluster or c in seen:
+                raise ValueError(f"broken cluster chain at {c}")
+            seen.add(c)
+            out.append(c)
+            c = self.next_cluster(c)
+            if c is None:
+                raise ValueError("cluster chain runs past the FAT")
+        return out
+
+    def runs(self, first, size):
+        """(image offset, length) of the contiguous pieces holding `size` bytes from cluster `first`."""
+        need = (size + self.cluster - 1) // self.cluster
+        clusters = self.chain(first, need) if size else []
+        if len(clusters) < need:
+            raise ValueError("a file is longer than its cluster chain")
+        runs = []
+        for c in clusters:
+            off = self.data_off + (c - 2) * self.cluster
+            if runs and runs[-1][0] + runs[-1][1] == off:
+                runs[-1][1] += self.cluster
+            else:
+                runs.append([off, self.cluster])
+        left, out = size, []
+        for off, n in runs:
+            out.append((off, min(n, left)))
+            left -= min(n, left)
+        return out
+
+    def read_dir(self, first):
+        if first == 0 and self.root_region:
+            self.f.seek(self.root_region[0])
+            return self.f.read(self.root_region[1])
+        data = bytearray()
+        for off, n in self.runs(first, len(self.chain(first, 1 << 16)) * self.cluster):
+            self.f.seek(off)
+            data += self.f.read(n)
+        return bytes(data)
+
+    def entries(self, first):
+        """(name, is_dir, first cluster, size) of a directory's entries (long names preferred; volume labels,
+        deleted entries, '.' and '..' skipped)."""
+        data, lfn = self.read_dir(first), []
+        for i in range(0, len(data) - 31, 32):
+            e = data[i:i + 32]
+            if e[0] == 0:
+                break
+            if e[0] == 0xE5:
+                lfn = []
+                continue
+            if e[11] == 0x0F:
+                lfn.insert(0, e[1:11] + e[14:26] + e[28:32])
+                continue
+            if lfn:
+                name = b"".join(lfn).decode("utf-16-le", "replace").split("\0")[0]
+            else:
+                base = e[0:8].replace(b"\x05", b"\xe5", 1).decode("latin-1").rstrip()
+                ext = e[8:11].decode("latin-1").rstrip()
+                if e[12] & 0x08:
+                    base = base.lower()
+                if e[12] & 0x10:
+                    ext = ext.lower()
+                name = base + ("." + ext if ext else "")
+            lfn = []
+            if e[11] & 0x08 or name in (".", ".."):
+                continue
+            cl = struct.unpack_from("<H", e, 20)[0] << 16 | struct.unpack_from("<H", e, 26)[0]
+            if self.bits != 32:
+                cl &= 0xFFFF
+            yield name, bool(e[11] & 0x10), cl, struct.unpack_from("<I", e, 28)[0]
+
+    def walk(self, first=None, prefix="", depth=0):
+        """(relative path, is_dir, first cluster, size) of every entry, parents before children."""
+        if depth > 64:
+            raise ValueError("directories nested too deep")
+        for name, is_dir, cl, size in self.entries(self.root if first is None else first):
+            if not name or any(c in name for c in "/\\\0") or name.strip(". ") == "":
+                raise ValueError(f"unsafe file name in the image: {name!r}")
+            rel = prefix + name
+            yield rel, is_dir, cl, size
+            if is_dir:
+                if cl < 2 or cl == self.root:
+                    raise ValueError(f"directory {rel} points back at the root")
+                yield from self.walk(cl, rel + "/", depth + 1)
+
+
+def obb_footer(path):
+    """Android's OBB footer (jobb): {package, version, flags}, or None (an image without one is unpacked too)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            if size < 41:
+                return None
+            f.seek(size - 8)
+            n, sig = struct.unpack("<II", f.read(8))
+            if sig != OBB_FOOTER_SIG or not 33 <= n <= min(size - 8, 4096):
+                return None
+            f.seek(size - 8 - n)
+            ft = f.read(n)
+        _ver, pkg_ver, flags = struct.unpack_from("<III", ft, 0)
+        name_len = struct.unpack_from("<I", ft, 20)[0]
+        return {"version": pkg_ver, "flags": flags, "package": ft[24:24 + name_len].decode("utf-8", "replace")}
+    except (OSError, struct.error):
+        return None
+
+
+def is_obb_image(path):
+    """A FAT disk image (what StorageManager.mountObb mounts), not an archive or asset file the game reads itself."""
+    try:
+        with open(path, "rb") as f:
+            bs = f.read(512)
+    except OSError:
+        return False
+    return (len(bs) == 512 and bs[510:512] == b"\x55\xaa" and bs[0] in (0xEB, 0xE9)
+            and (bs[54:59] in (b"FAT12", b"FAT16") or bs[82:87] == b"FAT32"))
+
+
+def unpack_obb_image(path, dest):
+    """Unpack the FAT image `path` into the new folder `dest`; returns (files, bytes)."""
+    footer = obb_footer(path)
+    if footer and footer["flags"] & OBB_SALTED:
+        raise AgentError(f"{os.path.basename(path)} is an encrypted OBB image; FramePort can't unpack it")
+    files = total = 0
+    try:
+        fs = FatImage(path)
+    except ValueError as exc:
+        raise AgentError(f"{os.path.basename(path)}: {exc}") from None
+    try:
+        os.makedirs(dest)
+        real_dest = os.path.realpath(dest)
+        for rel, is_dir, cl, size in fs.walk():
+            target = os.path.join(dest, *rel.split("/"))
+            if not os.path.realpath(target).startswith(real_dest + os.sep):
+                raise AgentError(f"refusing a path outside the folder: {rel}")
+            if is_dir:
+                os.makedirs(target, exist_ok=True)
+                continue
+            with open(target, "xb") as out:
+                for off, n in fs.runs(cl, size):
+                    fs.f.seek(off)
+                    while n:
+                        chunk = fs.f.read(min(n, 8 << 20))
+                        if not chunk:
+                            raise AgentError(f"{os.path.basename(path)} ends inside {rel}")
+                        out.write(chunk)
+                        n -= len(chunk)
+            files += 1
+            total += size
+    except ValueError as exc:
+        raise AgentError(f"{os.path.basename(path)}: {exc}") from None
+    finally:
+        fs.close()
+    return files, total
+
+
+def obb_unpacked_size(folder):
+    """The image size recorded in an unpacked image's folder, else None."""
+    try:
+        with open(os.path.join(folder, OBB_MARKER)) as f:
+            size = json.load(f).get("size")
+        return size if isinstance(size, int) else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def obb_manifest(top):
+    """rel path -> size of the game data in an obb folder; an unpacked image's folder counts as the image file."""
+    out = {}
+    for root, dirs, files in os.walk(top):
+        keep = []
+        for d in dirs:
+            p = os.path.join(root, d)
+            size = obb_unpacked_size(p)
+            if size is not None and not d.endswith(OBB_UNPACKING):
+                out[os.path.relpath(p, top)] = size
+            elif size is None and not d.endswith(OBB_UNPACKING):
+                keep.append(d)
+        dirs[:] = keep
+        for name in files:
+            if not name.endswith(".part"):
+                p = os.path.join(root, name)
+                out[os.path.relpath(p, top)] = os.path.getsize(p)
+    return out
+
+
+def finish_obb_unpacks(obb):
+    """An unpack interrupted after its image was removed only needs its folder's final name; others are dropped."""
+    for root, dirs, _files in os.walk(obb):
+        for d in list(dirs):
+            tmp = os.path.join(root, d)
+            if not d.endswith(OBB_UNPACKING):
+                if obb_unpacked_size(tmp) is not None:
+                    dirs.remove(d)
+                continue
+            dirs.remove(d)
+            final = tmp[:-len(OBB_UNPACKING)]
+            if obb_unpacked_size(tmp) is not None and not os.path.exists(final):
+                os.rename(tmp, final)
+            else:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+
+def cmd_unpack_obb(args):
+    """frame.obb_mount_emul: without `image`, the game's OBB disk images still to unpack ({pending: [rel, ...]});
+    with `image` (one of them), unpack it into a folder of the same name and remove the image."""
+    pkg = check_pkg(args["package"])
+    dep = deployment(pkg)
+    if not dep:
+        raise AgentError(f"{pkg} is not installed")
+    obb = os.path.join(dep["base"], "lepton-app", "obb")
+    finish_obb_unpacks(obb)
+    pending = []
+    for root, dirs, files in os.walk(obb):
+        dirs[:] = [d for d in dirs if obb_unpacked_size(os.path.join(root, d)) is None]
+        for name in files:
+            p = os.path.join(root, name)
+            if name.lower().endswith(".obb") and is_obb_image(p):
+                pending.append(os.path.relpath(p, obb))
+    image = args.get("image")
+    if image is None:
+        return {"pending": sorted(pending)}
+    if image not in pending:
+        raise AgentError(f"{image} is not an OBB disk image waiting to be unpacked")
+    if container_running(dep["appid"]):
+        raise AgentError(f"{dep.get('title', pkg)} is running on the Frame. Close it first.")
+    src = os.path.join(obb, image)
+    tmp = src + OBB_UNPACKING
+    shutil.rmtree(tmp, ignore_errors=True)
+    size = os.path.getsize(src)
+    if shutil.disk_usage(obb).free < size + (512 << 20):
+        raise AgentError(f"not enough space on the Frame to unpack {image} ({size / 2**30:.1f} GiB needed)")
+    started = time.time()
+    try:
+        files, total = unpack_obb_image(src, tmp)
+        with open(os.path.join(tmp, OBB_MARKER), "w") as f:
+            json.dump({"size": size, "footer": obb_footer(src), "files": files, "bytes": total,
+                       "time": time.time()}, f)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    os.remove(src)
+    os.rename(tmp, src)
+    return {"image": image, "files": files, "bytes": total, "seconds": round(time.time() - started, 1)}
+
+
+
+
+def pcvr_pids(base):
+    """Processes of a PC VR game (the Proton/Wine command lines contain its install folder)."""
+    p = run(["pgrep", "-f", re.escape(base.rstrip("/") + "/")])
+    return [x for x in p.stdout.split() if x != str(os.getpid())]
+
+
+def cmd_prepare_pcvr(args):
+    """Where to upload a Windows game + Revive, and what the Frame already has (unchanged files aren't re-sent)."""
+    pkg = check_pkg(args["package"])
+    title = args["title"]
+    anchor = os.path.join(ANCHORS, pkg)
+    dep = deployment(pkg)
+    base, free = new_base(args, pkg, dep)
+    appid = dep["appid"] if dep else shortcut_appid(f'"{anchor}/launch.sh"', title)
+    if dep and pcvr_pids(base):
+        raise AgentError(f"{title} is running on the Frame. Close it first.")
+    incoming = os.path.join(base, "incoming")
+    for t in PCVR_TREES:
+        os.makedirs(os.path.join(incoming, t), exist_ok=True)
+    # files already in place plus files uploaded by an interrupted install (still in incoming/): not sent again
+    existing = {t: {**tree_manifest(os.path.join(base, t)), **tree_manifest(os.path.join(incoming, t))}
+                for t in PCVR_TREES}
+    status = cmd_proton_status({"tool": args.get("tool")})
+    return {"package": pkg, "base": base, "anchor": anchor, "appid": appid, "incoming": incoming,
+            "installed": bool(dep), "existing": existing, "free_bytes": free,
+            "proton": status.get("ready"), "proton_suggested": status.get("suggested"), "openxr": status.get("openxr")}
+
+
+LAUNCH_PROTON_SH = r"""#!/usr/bin/env bash
+# Steam Frame launcher for {title} ({pkg}): Windows PC VR game under Proton ({tool}). Generated by FramePort.
+set -euo pipefail
+base={base_q}
+[[ -d "$base/game" ]] || {{ echo "Game files missing at $base (storage not mounted?)" >&2; exit 1; }}
+export SteamAppId={appid}
+{steam_game_id}export STEAM_COMPAT_APP_ID={appid}
+export STEAM_COMPAT_DATA_PATH="$base/compatdata"
+export STEAM_COMPAT_CLIENT_INSTALL_PATH={steam_q}
+export STEAM_COMPAT_INSTALL_PATH="$base/game"
+export STEAM_COMPAT_LIBRARY_PATHS="$base"
+export STEAM_COMPAT_SHADER_PATH="$base/shadercache"
+export PROTON_LOG_DIR="$base"
+{xr_layer}export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+# Wine needs the display session (gamescope's X/Wayland). Steam passes it; headless launches take it from Steam.
+if [[ -z "${{DISPLAY:-}}" ]]; then
+    steam_pid=$(pgrep -x steam | head -n1 || true)
+    if [[ -n "$steam_pid" && -r "/proc/$steam_pid/environ" ]]; then
+        while IFS= read -r -d '' kv; do
+            case "$kv" in DISPLAY=*|WAYLAND_DISPLAY=*|GAMESCOPE_WAYLAND_DISPLAY=*|XAUTHORITY=*|XDG_SESSION_TYPE=*)
+                export "$kv";; esac
+        done < "/proc/$steam_pid/environ"
+    fi
+fi
+{extra_env}
+mkdir -p "$STEAM_COMPAT_DATA_PATH" "$STEAM_COMPAT_SHADER_PATH"
+cd "$base/game"{workdir}
+echo "FramePort: launching {pkg} with {tool}" >"$base/launch.log"
+{plays_start}
+exec {command} >>"$base/launch.log" 2>&1
+"""
+
+
+def windows_path(path):
+    """Unix path as Wine sees it through drive Z: (the root filesystem)."""
+    return "Z:" + os.path.abspath(path).replace("/", "\\")
+
+
+XR_LAYER = "XR_APILAYER_FRAMEPORT_timefix"
+XR_LAYER_ENV = (f'# FramePort OpenXR layer: OpenXR 1.1 -> 1.0 fallback for the Frame runtime'
+                f' (+ timespec time emulation)\n'
+                f'export XR_API_LAYER_PATH="$base/xrlayer${{XR_API_LAYER_PATH:+:$XR_API_LAYER_PATH}}"\n'
+                f'export XR_ENABLE_API_LAYERS="{XR_LAYER}${{XR_ENABLE_API_LAYERS:+:$XR_ENABLE_API_LAYERS}}"\n')
+
+
+XR_LAYER_MANIFEST = os.path.join(HOME, ".local/share/openxr/1/api_layers/explicit.d", XR_LAYER + ".json")
+
+
+def install_xr_layer(base):
+    """Proton's Steam Linux Runtime container drops XR_API_LAYER_PATH, so the layer is registered where the OpenXR
+    loader also looks for explicit layers ($XDG_DATA_HOME/openxr/1/api_layers/explicit.d, shared into the container
+    with the home dir). Explicit layers only load when XR_ENABLE_API_LAYERS names them (launch.sh does), so other apps
+    are unaffected. The library is a shared copy under the agent's folder."""
+    src = os.path.join(base, "xrlayer")
+    with open(os.path.join(src, XR_LAYER + ".json")) as f:
+        manifest = json.load(f)
+    lib_name = os.path.basename(manifest["api_layer"]["library_path"])
+    dest = os.path.join(AGENT_HOME, "xrlayer")
+    os.makedirs(dest, exist_ok=True)
+    tmp = os.path.join(dest, lib_name + ".tmp")
+    shutil.copyfile(os.path.join(src, lib_name), tmp)
+    os.replace(tmp, os.path.join(dest, lib_name))
+    manifest["api_layer"]["library_path"] = os.path.join(dest, lib_name)
+    os.makedirs(os.path.dirname(XR_LAYER_MANIFEST), exist_ok=True)
+    with open(XR_LAYER_MANIFEST + ".tmp", "w") as f:
+        json.dump(manifest, f, indent=4)
+    os.replace(XR_LAYER_MANIFEST + ".tmp", XR_LAYER_MANIFEST)
+
+
+OCULUS_HMD_HELPER = "fp_oculushmd.exe"
+
+
+def write_proton_launcher(anchor, base, pkg, title, appid, tool, exe_rel, revive, env, xr_layer=False, game_args=(),
+                          oculus_hmd=False, vr=True):
+    exe = os.path.join(base, "game", exe_rel)
+    prefix = compat_command(tool["dir"])
+    injector = os.path.join(base, "revive", "ReviveInjector.exe")
+    if oculus_hmd:
+        # FramePort's helper provides the OculusHMDConnected event (Unreal's Oculus plugin checks for it) and runs the
+        # rest of its command line, staying alive until the game has exited
+        argv = prefix + [os.path.join(base, "helpers", OCULUS_HMD_HELPER)]
+        argv += [windows_path(injector), "/openxr", windows_path(exe)] if revive else [windows_path(exe)]
+    elif revive:
+        # ReviveInjector joins its arguments into one command line; /openxr = LibReviveXR (OpenXR -> wineopenxr)
+        argv = prefix + [injector, "/openxr", windows_path(exe)]
+    else:
+        argv = prefix + [exe]
+    argv += [a for a in game_args or () if re.fullmatch(r"[A-Za-z0-9_=.:/+-]+", a)]  # e.g. -hmd=OpenXR, -vrmode OpenVR
+    extra = "".join(f"export {k}={shlex.quote(str(v))}\n" for k, v in (env or {}).items()
+                    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k))
+    workdir = os.path.dirname(exe_rel)
+    text = LAUNCH_PROTON_SH.format(
+        title=title.replace("\n", " "), pkg=pkg, base_q=shlex.quote(base), appid=appid, steam_q=shlex.quote(STEAM),
+        tool=tool["name"], extra_env=extra, workdir=("/" + shlex.quote(workdir)) if workdir else "",
+        # Proton sets up VR (vrclient, wineopenxr) only when SteamGameId is set: a flat Windows game goes without
+        steam_game_id=f"export SteamGameId={appid}\n" if vr else "",
+        xr_layer=XR_LAYER_ENV if xr_layer else "", plays_start=plays_lines(anchor)[0],
+        command=" ".join(shlex.quote(a) for a in argv))
+    path = os.path.join(anchor, "launch.sh")
+    with open(path + ".tmp", "w") as f:
+        f.write(text)
+    os.chmod(path + ".tmp", 0o755)
+    os.replace(path + ".tmp", path)
+
+
+def set_crash_reporter(base, enabled):
+    """Unreal's CrashReportClient.exe in the Frame copy of the game: renamed to .disabled so a crash just closes the
+    game (and back when enabled)."""
+    game = os.path.join(base, "game")
+    for root, _, files in os.walk(game):
+        for name in files:
+            low = name.lower()
+            p = os.path.join(root, name)
+            if not enabled and low == "crashreportclient.exe":
+                os.replace(p, p + ".disabled")
+            elif enabled and low == "crashreportclient.exe.disabled":
+                os.replace(p, p[:-len(".disabled")])
+
+
+def set_libovr_redirect(base, exe_rel, enabled, bundled=False):
+    """LoadLibrary redirect (pure runtime substitution): put LibOVRRT{64,32}_1.dll in the game's own DLL search dir as
+    a symlink to Revive's LibReviveXR runtime, so the game's Oculus SDK finds a runtime to load. The symlink keeps the
+    DLL in the revive/ folder, so its sibling dependencies still resolve. This does NOT touch the game's runtime
+    signature check — a build that verifies the Oculus signature of LibOVRRT will still reject Revive's (unsigned)
+    runtime; this only helps builds that don't verify it. We only ever create/remove our own symlink, never a real
+    DLL the game shipped. Removed when disabled."""
+    game = os.path.join(base, "game")
+    exe_dir = os.path.dirname(os.path.join(game, exe_rel))
+    # the runtime: FramePort's Revive (revive/LibReviveXR*), or with bundled=True the repack's own LibRevive*.dll
+    # next to the exe (a repack set up for SteamVR, whose Windows loader hook doesn't take effect under Proton)
+    runtimes = {bits: (os.path.join(exe_dir, f"LibRevive{bits}.dll") if bundled else
+                       os.path.join(base, "revive", f"LibReviveXR{bits}.dll")) for bits in ("64", "32")}
+    # where the Oculus SDK looks for LibOVRRT: the game exe's dir (monolithic engines carry the shim in the exe) AND
+    # next to every OVRPlugin.dll (Unreal's shim searches its own module dir).
+    dirs = {os.path.dirname(os.path.join(game, exe_rel))}
+    for root, _, files in os.walk(game):
+        for n in files:
+            if n.lower() == "ovrplugin.dll":
+                dirs.add(root)
+    for d in dirs:
+        for bits, target in runtimes.items():
+            link = os.path.join(d, f"LibOVRRT{bits}_1.dll")
+            ours = os.path.islink(link) and os.path.basename(os.path.realpath(link)).lower().startswith("librevive")
+            if ours and os.path.realpath(link) != os.path.realpath(target):
+                os.remove(link)  # switched between FramePort's and the bundled Revive
+            if enabled and os.path.isfile(target):
+                if os.path.islink(link) or not os.path.exists(link):  # never clobber a real game-shipped DLL
+                    if os.path.lexists(link):
+                        os.remove(link)
+                    os.symlink(target, link)
+            elif ours:
+                os.remove(link)
+
+
+def cmd_finalize_pcvr(args):
+    """Move uploaded game/Revive files into place, delete files the new version no longer has, write the Proton
+    launcher and deployment.json. The Proton prefix (saves) is kept."""
+    pkg = check_pkg(args["package"])
+    title = args["title"]
+    prep = cmd_prepare_pcvr({"package": pkg, "title": title, "dest": args.get("dest"), "tool": args.get("tool")})
+    base, anchor, appid, incoming = prep["base"], prep["anchor"], prep["appid"], prep["incoming"]
+    tool = prep["proton"]
+    if not tool:
+        raise AgentError("Proton isn't installed on the Frame yet (FramePort: Frame → Install Proton)")
+    exe_rel = os.path.normpath(args["exe"])
+    if exe_rel.startswith("..") or os.path.isabs(exe_rel):
+        raise AgentError(f"bad exe path {args['exe']!r}")
+    old = (deployment(pkg) or {}).get("files") or {}
+    manifests = args.get("manifests") or {}
+    moved = 0
+    for t in PCVR_TREES:
+        src_root, dst_root = os.path.join(incoming, t), os.path.join(base, t)
+        for rel in tree_manifest(src_root):
+            dst = os.path.join(dst_root, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.replace(os.path.join(src_root, rel), dst)
+            moved += 1
+        want = manifests.get(t)
+        if want is None:
+            continue
+        for rel in set(old.get(t) or {}) - set(want):  # files of the previous version that are gone now
+            p = os.path.normpath(os.path.join(dst_root, rel))
+            if p.startswith(dst_root + os.sep) and os.path.isfile(p):
+                os.remove(p)
+        have = tree_manifest(dst_root)
+        bad = [k for k, v in want.items() if have.get(k) != v]
+        if bad:
+            raise AgentError(f"{len(bad)} {t} file(s) missing or incomplete, e.g. {bad[0]}")
+    if not os.path.isfile(os.path.join(base, "game", exe_rel)):
+        raise AgentError(f"game executable {exe_rel} missing after upload")
+    shutil.rmtree(incoming, ignore_errors=True)
+    os.makedirs(anchor, exist_ok=True)
+    revive = bool(args.get("revive", True))
+    if revive and not os.path.isfile(os.path.join(base, "revive", "ReviveInjector.exe")):
+        raise AgentError("Revive files missing")
+    xr_layer = bool(args.get("xr_layer")) and os.path.isfile(os.path.join(base, "xrlayer", XR_LAYER + ".json"))
+    if args.get("xr_layer") and not xr_layer:
+        raise AgentError("timefix layer files missing")
+    if xr_layer:
+        install_xr_layer(base)
+    oculus_hmd = bool(args.get("oculus_hmd"))
+    if oculus_hmd and not os.path.isfile(os.path.join(base, "helpers", OCULUS_HMD_HELPER)):
+        raise AgentError(f"{OCULUS_HMD_HELPER} missing")
+    set_crash_reporter(base, enabled=not args.get("no_crash_reporter"))
+    set_libovr_redirect(base, exe_rel, enabled=bool(args.get("libovr_redirect")), bundled=not revive)
+    vr = args.get("vr", True) is not False  # False: a flat Windows game (no VR at all)
+    write_proton_launcher(anchor, base, pkg, title, appid, tool, exe_rel, revive, args.get("env"), xr_layer,
+                          args.get("game_args") or [], oculus_hmd, vr=vr)
+    art_in = os.path.join(base, "incoming-artwork")
+    if os.path.isdir(art_in):
+        shutil.rmtree(os.path.join(anchor, "artwork"), ignore_errors=True)
+        shutil.move(art_in, os.path.join(anchor, "artwork"))
+    dep = {"package": pkg, "kind": "pcvr", "appid": int(appid), "base": base, "title": title, "exe": exe_rel,
+           "tags": args.get("tags") or [],
+           "sha256": args.get("exe_sha256"), "revive": revive, "revive_version": args.get("revive_version"),
+           "proton": tool["name"], "xr_layer": xr_layer, "oculus_hmd": oculus_hmd, "vr": vr,
+           "libovr_redirect": bool(args.get("libovr_redirect")),
+           "launcher": {"env": args.get("env") or {}, "game_args": args.get("game_args") or []},
+           "recipe": args.get("recipe"),
+           "installed_by": "frameport",
+           "files": {t: manifests.get(t) or {} for t in PCVR_TREES},
+           "agent_version": AGENT_VERSION, "time": time.time()}
+    with open(os.path.join(anchor, "deployment.json"), "w") as f:
+        json.dump(dep, f, indent=2)
+    overlay = finalize_overlay(pkg, args.get("overlay"))
+    return {"ok": True, "base": base, "appid": appid, "moved_files": moved, "proton": tool["name"], "overlay": overlay}
+
+
+def finalize_overlay(pkg, overlay):
+    """An install's overlay choice ({autostart, app, manifest_dir} = a SteamVR overlay app, None = not one):
+    register or unregister it with SteamVR. Returns register_vr_overlay's result, or None."""
+    if overlay:
+        return cmd_register_vr_overlay({"package": pkg, "autostart": bool(overlay.get("autostart")),
+                                        "app": overlay.get("app"), "manifest_dir": overlay.get("manifest_dir")})
+    if os.path.exists(os.path.join(ANCHORS, pkg, OVERLAY_MANIFEST)):  # no longer one (the user turned it off)
+        cmd_unregister_vr_overlay({"package": pkg})
+    return None
+
+
+# ------------------------------------------------------------------------------------------ Linux apps (arm64)
+# Native arm64 Linux programs (AppImages, zip/tar builds) installed from FramePort (GitHub #31): files in
+# <base>/app, AppImages extracted once (no FUSE in Steam's launch environment needed, faster start), a launcher with
+# the same exit watchdog as the Quest launcher, and a Steam shortcut (VR flag for OpenXR apps).
+LINUX_LAUNCH_SH = r"""#!/usr/bin/env bash
+# Steam Frame launcher for {title} ({pkg}), a Linux app. Generated by FramePort.
+set -uo pipefail
+cd {run_dir_q} || {{ echo "App files missing at {run_dir_q}" >&2; exit 1; }}
+export XDG_RUNTIME_DIR="${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}"
+# Steam passes the display session (gamescope's X/Wayland); headless launches (launch tests) take it from Steam.
+# Started from Desktop Mode's menu (FRAMEPORT_DESKTOP=1, GitHub #84) the desktop's own session is used.
+if [[ -z "${{FRAMEPORT_DESKTOP:-}}" && -z "${{DISPLAY:-}}" ]]; then
+    steam_pid=$(pgrep -x steam | head -n1 || true)
+    if [[ -n "$steam_pid" && -r "/proc/$steam_pid/environ" ]]; then
+        while IFS= read -r -d '' kv; do
+            case "$kv" in DISPLAY=*|WAYLAND_DISPLAY=*|GAMESCOPE_WAYLAND_DISPLAY=*|XAUTHORITY=*|XDG_SESSION_TYPE=*)
+                export "$kv";; esac
+        done < "/proc/$steam_pid/environ"
+    fi
+fi
+{extra_env}parent=$PPID
+# Desktop Mode's launcher exits right after starting this: no Steam parent to watch; SteamVR overlay apps
+# (FRAMEPORT_OVERLAY) are started by SteamVR and run next to games
+[[ -n "${{FRAMEPORT_DESKTOP:-}}${{FRAMEPORT_OVERLAY:-}}" ]] && parent=1
+{exe_q} "$@" >{log_q} 2>&1 &
+child=$!
+trap 'kill -TERM $child 2>/dev/null' INT TERM
+( while sleep 2 && kill -0 $child 2>/dev/null; do
+    if [[ $parent -gt 1 ]] && ! kill -0 $parent 2>/dev/null; then kill -TERM $child; fi; done ) &
+wait $child
+"""
+
+
+def linux_run_target(base, exe_rel, appimage):
+    """(working directory, program) for a Linux app: an extracted AppImage runs its AppRun."""
+    if appimage:  # absolute paths: the agent finds the app's processes by its folder in their command lines
+        root = os.path.join(base, "app", "squashfs-root")
+        return root, os.path.join(root, "AppRun")
+    path = os.path.join(base, "app", exe_rel)
+    return os.path.dirname(path), path
+
+
+SHARED_LIBRARY = re.compile(r"lib.+\.so(?:\.\d+)*")
+
+
+def app_lib_dirs(root):
+    """The folders of an app that hold shared libraries (lib*.so[.N]); Python extension modules don't count."""
+    out = set()
+    for dirpath, _dirs, files in os.walk(root):
+        if any(SHARED_LIBRARY.fullmatch(n) for n in files):
+            out.add(dirpath)
+    return sorted(out)
+
+
+def missing_libraries(root, programs):
+    """Shared libraries the app's main programs need (ldd follows their dependencies) that neither the Frame nor the
+    app itself has, with the app's own library folders on LD_LIBRARY_PATH as AppImages' AppRun sets it: e.g.
+    libwebkit2gtk-4.1 for Venera. Only the programs that start, not every bundled module (FramePort's own build
+    ships optional Python modules needing libjvm/libtcl that never load)."""
+    env = dict(os.environ, LD_LIBRARY_PATH=":".join(app_lib_dirs(root)))
+    missing = set()
+    for path in programs:
+        p = subprocess.run(["ldd", path], capture_output=True, text=True, env=env, timeout=30)
+        for line in p.stdout.splitlines():
+            if "=> not found" in line:
+                missing.add(line.split("=>")[0].strip())
+    return sorted(missing)
+
+
+def appimage_programs(root):
+    """The ELF programs an extracted AppImage starts: top-level and usr/bin executables (not libraries)."""
+    out = []
+    for d in (root, os.path.join(root, "usr", "bin")):
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(d, name)
+            if ".so" in name or not os.path.isfile(path) or not os.access(path, os.X_OK):
+                continue
+            try:
+                with open(path, "rb") as f:
+                    if f.read(4) == b"\x7fELF":
+                        out.append(path)
+            except OSError:
+                pass
+    return out
+
+
+def cmd_prepare_linux(args):
+    """Where to upload a Linux app, and what the Frame already has (unchanged files aren't re-sent)."""
+    pkg = check_pkg(args["package"])
+    anchor = os.path.join(ANCHORS, pkg)
+    dep = deployment(pkg)
+    base, free = new_base(args, pkg, dep)
+    appid = dep["appid"] if dep else shortcut_appid(f'"{anchor}/launch.sh"', args["title"])
+    if dep and pcvr_pids(base):
+        raise AgentError(f"{args['title']} is running on the Frame. Close it first.")
+    incoming = os.path.join(base, "incoming")
+    os.makedirs(os.path.join(incoming, "app"), exist_ok=True)
+    existing = {"app": {**tree_manifest(os.path.join(base, "app")), **tree_manifest(os.path.join(incoming, "app"))}}
+    existing["app"] = {k: v for k, v in existing["app"].items() if not k.startswith("squashfs-root/")}
+    return {"package": pkg, "base": base, "anchor": anchor, "appid": appid, "incoming": incoming,
+            "installed": bool(dep), "existing": existing, "free_bytes": free}
+
+
+def cmd_finalize_linux(args):
+    """Move the uploaded app into place (files the new version lacks are deleted), extract an AppImage, check its
+    libraries, write the launcher and deployment.json."""
+    pkg = check_pkg(args["package"])
+    title = args["title"]
+    prep = cmd_prepare_linux({"package": pkg, "title": title, "dest": args.get("dest")})
+    base, anchor, appid, incoming = prep["base"], prep["anchor"], prep["appid"], prep["incoming"]
+    exe_rel = os.path.normpath(args["exe"])
+    if exe_rel.startswith("..") or os.path.isabs(exe_rel):
+        raise AgentError(f"bad program path {args['exe']!r}")
+    app = os.path.join(base, "app")
+    want = (args.get("manifests") or {}).get("app")
+    old = ((deployment(pkg) or {}).get("files") or {}).get("app") or {}
+    moved = 0
+    for rel in tree_manifest(os.path.join(incoming, "app")):
+        dst = os.path.join(app, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        os.replace(os.path.join(incoming, "app", rel), dst)
+        moved += 1
+    if want is not None:
+        for rel in set(old) - set(want):
+            p = os.path.normpath(os.path.join(app, rel))
+            if p.startswith(app + os.sep) and os.path.isfile(p):
+                os.remove(p)
+        have = tree_manifest(app)
+        bad = [k for k, v in want.items() if have.get(k) != v]
+        if bad:
+            raise AgentError(f"{len(bad)} app file(s) missing or incomplete, e.g. {bad[0]}")
+    exe = os.path.join(app, exe_rel)
+    if not os.path.isfile(exe):
+        raise AgentError(f"program {exe_rel} missing after upload")
+    shutil.rmtree(incoming, ignore_errors=True)
+    os.chmod(exe, os.stat(exe).st_mode | 0o111)
+    appimage = bool(args.get("appimage"))
+    x86 = bool(args.get("x86_64"))
+    prefix = []
+    if x86:  # an x86_64 build: FEX runs it on SteamOS's x86 guest system (the chain Steam itself would use)
+        tool = pick_tool("linux_x86", linux_x86_tools())
+        if not tool or not tool["installed"] or not tool["require_installed"]:
+            raise AgentError("FEX (x86 translation for Linux apps) isn't installed on the Frame yet")
+        prefix = compat_command(tool["dir"])
+    if appimage:
+        shutil.rmtree(os.path.join(app, "squashfs-root"), ignore_errors=True)
+        # an x86_64 AppImage's own extractor is x86 code too: it runs through FEX like the app
+        p = subprocess.run(prefix + [exe, "--appimage-extract"], cwd=app, capture_output=True, text=True,
+                           timeout=600)
+        if not os.path.isfile(os.path.join(app, "squashfs-root", "AppRun")):
+            raise AgentError(f"couldn't unpack the AppImage: {(p.stderr or p.stdout).strip()[-300:]}")
+    run_dir, program = linux_run_target(base, exe_rel, appimage)
+    for name in args.get("executables") or []:  # other programs the app starts (archives may lose the x bit)
+        q = os.path.normpath(os.path.join(app, name))
+        if q.startswith(app + os.sep) and os.path.isfile(q):
+            os.chmod(q, os.stat(q).st_mode | 0o111)
+    # ldd can't read x86_64 programs here: their libraries come from FEX's x86 root (/usr/share/guestos/fex-mesa)
+    missing = [] if x86 else missing_libraries(app, appimage_programs(run_dir) if appimage else [exe])
+    os.makedirs(anchor, exist_ok=True)
+    env = dict(args.get("env") or {})
+    if args.get("overlay"):
+        env["FRAMEPORT_OVERLAY"] = "1"
+    write_linux_launcher(anchor, base, pkg, title, exe_rel, appimage, prefix, env)
+    art_in = os.path.join(base, "incoming-artwork")
+    if os.path.isdir(art_in):
+        shutil.rmtree(os.path.join(anchor, "artwork"), ignore_errors=True)
+        shutil.move(art_in, os.path.join(anchor, "artwork"))
+    vr = bool(args.get("openxr"))
+    dep = {"package": pkg, "kind": "linux", "appid": int(appid), "base": base, "title": title, "exe": exe_rel,
+           "appimage": appimage, "vr": vr, "x86_64": x86, "tags": args.get("tags") or [],
+           "sha256": args.get("exe_sha256"),
+           "missing_libraries": missing, "recipe": args.get("recipe"), "installed_by": "frameport",
+           "launcher": {"env": args.get("env") or {}}, "desktop_entry": args.get("desktop_entry", True) is not False,
+           "desktop_icon": args.get("desktop_icon", True) is not False, "files": {"app": want or {}},
+           "agent_version": AGENT_VERSION, "time": time.time()}
+    with open(os.path.join(anchor, "deployment.json"), "w") as f:
+        json.dump(dep, f, indent=2)
+    try:  # the app's own icon (GitHub #99), found again for every install: a new version may bring another
+        own_icon = ensure_app_icon(dep, anchor, refresh=True)["icon"]
+    except OSError:
+        own_icon = None
+    desktop = None
+    try:
+        if dep["desktop_entry"]:
+            desktop = write_desktop_entry(pkg)
+        else:
+            remove_desktop_entries(pkg)
+    except OSError:
+        pass
+    overlay = finalize_overlay(pkg, args.get("overlay"))
+    return {"ok": True, "base": base, "appid": appid, "moved_files": moved, "missing_libraries": missing,
+            "desktop_entry": desktop, "app_icon": app_icon_result(own_icon), "overlay": overlay}
+
+
+def write_linux_launcher(anchor, base, pkg, title, exe_rel, appimage, prefix, env):
+    """launch.sh of a Linux app; prefix = FEX's command for x86_64 builds ([] for arm64)."""
+    run_dir, program = linux_run_target(base, exe_rel, appimage)
+    command = list(prefix) + [program]
+    extra = "".join(f"export {k}={shlex.quote(str(v))}\n" for k, v in (env or {}).items()
+                    if re.fullmatch(r"[A-Z_][A-Z0-9_]*", k))
+    if not appimage and not prefix:
+        # an unpacked archive's own libraries (GitHub #473: Plezy's lib/libselinux.so.1, needed by its bundled GTK);
+        # AppImages' AppRun sets this itself, and missing_libraries checks with the same folders
+        dirs = app_lib_dirs(os.path.join(base, "app"))
+        if dirs:
+            extra = (f"export LD_LIBRARY_PATH={shlex.quote(':'.join(dirs))}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\n"
+                     + extra)
+    if prefix:  # fex-compat-tool exits ("No compat data path?") without it; FEX keeps its config in <it>/fex-emu
+        data = shlex.quote(os.path.join(base, "compatdata"))
+        extra = f"mkdir -p {data}\nexport STEAM_COMPAT_DATA_PATH={data}\n" + extra
+    text = LINUX_LAUNCH_SH.format(title=title.replace("\n", " "), pkg=pkg, run_dir_q=shlex.quote(run_dir),
+                                  exe_q=" ".join(shlex.quote(a) for a in command),
+                                  log_q=shlex.quote(os.path.join(base, "launch.log")),
+                                  extra_env=extra)
+    path = os.path.join(anchor, "launch.sh")
+    with open(path + ".tmp", "w") as f:
+        f.write(text)
+    os.chmod(path + ".tmp", 0o755)
+    os.replace(path + ".tmp", path)
+
+
+# ------------------------------------------------------------------------------------------ Linux apps' own icons
+# The icon an AppImage or app folder brings (GitHub #99): its .DirIcon, else the Icon= of its .desktop file, looked up
+# next to it, in usr/share/icons/hicolor/<size>/apps and usr/share/pixmaps. Copied to <anchor>/artwork/app-icon.<ext>
+# and used for the Desktop Mode entry and the Steam shortcut unless the user chose an icon on the PC: the PC writes
+# what the art set's icon is into artwork/.icon-source ("custom" = the user's pick or store art, "app" = the app's own,
+# "generated" = FramePort's placeholder). Never reads outside the app's folder (symlinks are resolved and checked).
+APP_ICON = "app-icon"
+ICON_SOURCE = ".icon-source"
+APP_ICON_MAX = 4 << 20
+APP_ICON_SEND = 1 << 20  # the PNG goes back to the PC (library artwork) up to this size
+ICON_EXTS = (".png", ".svg")
+
+
+def _real_file_in(root, path):
+    """The real path of `path` when it is a file inside `root` (symlinks resolved), else None."""
+    real_root = os.path.realpath(root)
+    real = os.path.realpath(path)
+    if real.startswith(real_root + os.sep) and os.path.isfile(real):
+        return real
+    return None
+
+
+def icon_format(path):
+    """("png", width) or ("svg", 0) by content, None for anything else (xpm, ico, unreadable)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(1024)
+    except OSError:
+        return None
+    if head[:8] == b"\x89PNG\r\n\x1a\n" and len(head) >= 24:
+        return "png", struct.unpack(">I", head[16:20])[0]
+    if b"<svg" in head:
+        return "svg", 0
+    return None
+
+
+def desktop_fields(path):
+    """The [Desktop Entry] group of a .desktop file as {key: value} (localised keys left out)."""
+    out, group = {}, None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("["):
+                    group = line
+                elif group == "[Desktop Entry]" and "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    if "[" not in k:
+                        out.setdefault(k.strip(), v.strip())
+    except OSError:
+        pass
+    return out
+
+
+def app_desktop_file(root, appimage):
+    """The app's own .desktop file: an AppImage's top-level one, else the first within three folder levels."""
+    if appimage:
+        found = sorted(glob.glob(os.path.join(glob.escape(root), "*.desktop")))
+    else:
+        found = []
+        for dirpath, dirs, files in os.walk(root):
+            depth = 0 if dirpath == root else os.path.relpath(dirpath, root).count(os.sep) + 1
+            dirs[:] = sorted(dirs) if depth < 3 else []
+            found += [os.path.join(dirpath, n) for n in sorted(files) if n.endswith(".desktop")]
+    for path in found:
+        if _real_file_in(root, path):
+            return path
+    return None
+
+
+def _icon_candidates(base, name):
+    """Files that may be the icon called `name` (an Icon= value) under the folder `base`."""
+    if not name or os.path.isabs(name) or ".." in name.split("/"):
+        return []
+    stem = name[:-4] if name.lower().endswith(ICON_EXTS + (".xpm",)) else name
+    out = [os.path.join(base, name)] if "/" in name or name != stem else []
+    if "/" in name:
+        return out
+    esc = glob.escape
+    for share in (os.path.join(base, "usr", "share"), os.path.join(base, "share")):
+        for ext in ICON_EXTS:
+            out += glob.glob(os.path.join(esc(share), "icons", "hicolor", "*", "apps", esc(stem) + ext))
+            out.append(os.path.join(share, "pixmaps", stem + ext))
+    out += [os.path.join(base, stem + ext) for ext in ICON_EXTS]
+    return out
+
+
+def find_app_icon(root, appimage):
+    """{"icon": real path or None, "wmclass": the .desktop file's StartupWMClass or None} of an app's folder (an
+    AppImage's squashfs-root). The icon: the biggest PNG when it is at least 128 px, else an SVG, else the biggest
+    PNG; .DirIcon (an AppImage's own icon, often a symlink) counts like the .desktop file's Icon=."""
+    if not os.path.isdir(root):
+        return {"icon": None, "wmclass": None}
+    desktop = app_desktop_file(root, appimage)
+    fields = desktop_fields(desktop) if desktop else {}
+    paths = [os.path.join(root, ".DirIcon")] if appimage else []
+    bases = [root]
+    if desktop:  # a folder app's .desktop file may sit in a subfolder with the icon next to it
+        d = os.path.dirname(desktop)
+        while d.startswith(root + os.sep):
+            bases.append(d)
+            d = os.path.dirname(d)
+    for base in bases:
+        paths += _icon_candidates(base, fields.get("Icon", ""))
+    pngs, svgs, seen = [], [], set()
+    for p in paths:
+        real = _real_file_in(root, p)
+        if not real or real in seen:
+            continue
+        seen.add(real)
+        try:
+            if os.path.getsize(real) > APP_ICON_MAX:
+                continue
+        except OSError:
+            continue
+        fmt = icon_format(real)
+        if fmt and fmt[0] == "png":
+            pngs.append((fmt[1], real))
+        elif fmt:
+            svgs.append(real)
+    best = max(pngs, default=None, key=lambda t: t[0])
+    icon = best[1] if best and best[0] >= 128 else svgs[0] if svgs else best[1] if best else None
+    return {"icon": icon, "wmclass": fields.get("StartupWMClass") or None}
+
+
+def linux_app_root(dep):
+    app = os.path.join(dep["base"], "app")
+    return os.path.join(app, "squashfs-root") if dep.get("appimage") else app
+
+
+def ensure_app_icon(dep, anchor, refresh=False):
+    """The Linux app's own icon in <anchor>/artwork/app-icon.<ext> (copied from its files when missing, or always with
+    `refresh`, e.g. after an install), plus its StartupWMClass: {"icon": path or None, "wmclass": ...}."""
+    found = find_app_icon(linux_app_root(dep), dep.get("appimage"))
+    art = os.path.join(anchor, "artwork")
+    have = sorted(glob.glob(os.path.join(glob.escape(art), APP_ICON + ".*")))
+    icon = have[0] if have else None
+    if found["icon"] and (refresh or not icon):
+        dst = os.path.join(art, f"{APP_ICON}.{icon_format(found['icon'])[0]}")
+        os.makedirs(art, exist_ok=True)
+        for p in have:
+            if p != dst:
+                os.remove(p)
+        shutil.copyfile(found["icon"], dst + ".tmp")
+        os.replace(dst + ".tmp", dst)
+        icon = dst
+    elif refresh and not found["icon"]:
+        for p in have:
+            os.remove(p)
+        icon = None
+    return {"icon": icon, "wmclass": found["wmclass"]}
+
+
+def icon_source(anchor):
+    """What the art set's icon is, as the PC wrote it ("custom", "app", "generated"), or None (older PC app)."""
+    try:
+        with open(os.path.join(anchor, "artwork", ICON_SOURCE), encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def app_icon_for(dep, anchor, steam=False):
+    """(icon file, StartupWMClass) for a game's Desktop Mode entry / Steam shortcut: the user's chosen icon (PC:
+    "custom") > a Linux app's own icon > the art set's icon (FramePort's placeholder). Steam gets PNGs only."""
+    art_icon = next(iter(sorted(glob.glob(os.path.join(glob.escape(anchor), "artwork", "icon.*")))), "")
+    if dep.get("kind") != "linux" or not dep.get("base"):
+        return art_icon, None
+    try:
+        own = ensure_app_icon(dep, anchor)
+    except OSError:
+        return art_icon, None
+    if icon_source(anchor) == "custom" and art_icon:
+        return art_icon, own["wmclass"]
+    if own["icon"] and (not steam or own["icon"].endswith(".png")):
+        return own["icon"], own["wmclass"]
+    return art_icon, own["wmclass"]
+
+
+def app_icon_result(icon):
+    """finalize_linux's report of the app's own icon; a PNG comes back (base64) for the PC's library artwork."""
+    if not icon:
+        return None
+    out = {"file": os.path.basename(icon), "size": os.path.getsize(icon)}
+    if icon.endswith(".png") and out["size"] <= APP_ICON_SEND:
+        with open(icon, "rb") as f:
+            out["png"] = base64.b64encode(f.read()).decode("ascii")
+    return out
+
+
+# ------------------------------------------------------------------------------------------ Desktop Mode entries
+# Linux apps also get an entry in Desktop Mode's application menu and an icon on its desktop (GitHub #84: some apps
+# work better with the desktop's mouse and keyboard than in Gaming Mode, where Steam Input owns the controllers).
+DESKTOP_APPS = os.path.join(HOME, ".local/share/applications")
+DESKTOP_DIR = os.path.join(HOME, "Desktop")
+DESKTOP_KEY = "X-FramePort-Package"
+GAME_TAGS = {"game", "games", "action", "adventure", "arcade", "casual", "fighting", "platformer", "puzzle", "racing",
+             "rhythm", "rpg", "role playing", "shooter", "simulation", "sports", "strategy", "survival", "horror"}
+
+
+def desktop_value(text):
+    """A Desktop Entry string value: one line, backslashes escaped."""
+    return re.sub(r"[\r\n\t]", " ", str(text).replace("\\", "\\\\"))
+
+
+def desktop_exec_arg(arg):
+    """One Exec argument (Desktop Entry spec): in double quotes with \\ " ` $ backslash-escaped and % doubled, then
+    escaped once more as a string value."""
+    quoted = '"' + re.sub(r'([\\"`$])', r"\\\1", str(arg)).replace("%", "%%") + '"'
+    return desktop_value(quoted)
+
+
+def desktop_file_name(pkg):
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", pkg[len("linux."):] if pkg.startswith("linux.") else pkg)
+    return f"frameport-{slug.strip('-.') or 'app'}.desktop"
+
+
+def desktop_entry_text(dep, anchor):
+    icon, wmclass = app_icon_for(dep, anchor)
+    tags = {str(t).lower() for t in dep.get("tags") or []}
+    category = "Game;" if tags & GAME_TAGS else "Utility;"
+    lines = ["[Desktop Entry]", "Type=Application", f"Name={desktop_value(dep.get('title') or dep['package'])}",
+             "Comment=Installed by FramePort",
+             f"Exec=env FRAMEPORT_DESKTOP=1 {desktop_exec_arg(os.path.join(anchor, 'launch.sh'))}",
+             f"Path={desktop_value(anchor)}", "Terminal=false", f"Categories={category}"]
+    if icon:
+        lines.append(f"Icon={desktop_value(icon)}")
+    if wmclass:  # KDE's task bar groups the app's window under this entry (and shows its icon)
+        lines.append(f"StartupWMClass={desktop_value(wmclass)}")
+    lines.append(f"{DESKTOP_KEY}={dep['package']}")
+    return "\n".join(lines) + "\n"
+
+
+def _write_if_changed(path, text, mode):
+    try:
+        with open(path, encoding="utf-8") as f:
+            if f.read() == text and os.stat(path).st_mode & 0o777 == mode:
+                return False
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(path + ".tmp", mode)
+    os.replace(path + ".tmp", path)
+    return True
+
+
+def desktop_entries(pkg=None, folder=None):
+    """FramePort's .desktop files (of one app, or all) in the menu and desktop folders: {path: package}."""
+    out = {}
+    for d in [folder] if folder else (DESKTOP_APPS, DESKTOP_DIR):
+        for path in sorted(glob.glob(os.path.join(d, "frameport-*.desktop"))):
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    m = re.search(rf"^{DESKTOP_KEY}=(.+)$", f.read(), re.M)
+            except OSError:
+                continue
+            if m and (pkg is None or m[1].strip() == pkg):
+                out[path] = m[1].strip()
+    return out
+
+
+def write_desktop_entry(pkg, refresh=False):
+    """The app's menu entry, plus a copy on ~/Desktop when that folder exists and deployment.json's "desktop_icon"
+    isn't off (Plasma starts executable .desktop files there without asking). `refresh` (every connection) only
+    updates a desktop copy that is there: one the user deleted stays deleted (GitHub #212). Returns {"menu": path,
+    "desktop": path or None, "changed": bool}."""
+    anchor = os.path.join(ANCHORS, pkg)
+    dep = deployment(pkg)
+    if not dep:
+        raise AgentError(f"{pkg} is not installed")
+    text = desktop_entry_text(dep, anchor)
+    name = desktop_file_name(pkg)
+    for path in desktop_entries(pkg):  # the same app's entry under an older file name
+        if os.path.basename(path) != name:
+            os.remove(path)
+    menu = os.path.join(DESKTOP_APPS, name)
+    changed = _write_if_changed(menu, text, 0o755)
+    desk = os.path.join(DESKTOP_DIR, name)
+    if dep.get("desktop_icon", True) is False:
+        if os.path.exists(desk):
+            os.remove(desk)
+            changed = True
+        desk = None
+    elif os.path.isdir(DESKTOP_DIR) and not (refresh and not os.path.exists(desk)):
+        changed = _write_if_changed(desk, text, 0o755) or changed
+    else:
+        desk = None
+    return {"menu": menu, "desktop": desk, "changed": changed}
+
+
+def remove_desktop_entries(pkg=None):
+    removed = []
+    for path in desktop_entries(pkg):
+        try:
+            os.remove(path)
+            removed.append(path)
+        except OSError:
+            pass
+    return removed
+
+
+def refresh_desktop_entries():
+    """Entries for every installed Linux app that wants one (older installs, changed art or titles); entries of apps
+    that are gone or switched off are removed. Returns the packages whose entries changed."""
+    changed, wanted = [], set()
+    for dep_path in sorted(glob.glob(os.path.join(ANCHORS, "*/deployment.json"))):
+        try:
+            with open(dep_path) as f:
+                dep = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(dep, dict) or dep.get("kind") != "linux" or not dep.get("package") \
+                or dep.get("desktop_entry", True) is False:
+            continue
+        wanted.add(dep["package"])
+        try:
+            if write_desktop_entry(dep["package"], refresh=True)["changed"]:
+                changed.append(dep["package"])
+        except (OSError, AgentError):
+            pass
+    for path, pkg in desktop_entries().items():
+        if pkg not in wanted:
+            os.remove(path)
+            changed.append(pkg)
+    return sorted(set(changed))
+
+
+def cmd_desktop_entry(args):
+    """Turn a Linux app's Desktop Mode entry on or off, and with `icon` its copy on the desktop (agent v83; deployment
+    .json keeps both choices)."""
+    pkg = check_pkg(args["package"])
+    dep = deployment(pkg)
+    if not dep or dep.get("kind") != "linux":
+        raise AgentError(f"{pkg} is not an installed Linux app")
+    on = bool(args.get("enabled", True))
+    path = os.path.join(ANCHORS, pkg, "deployment.json")
+    with open(path) as f:
+        raw = json.load(f)
+    raw["desktop_entry"] = on
+    if args.get("icon") is not None:
+        raw["desktop_icon"] = bool(args["icon"])
+    with open(path + ".tmp", "w") as f:
+        json.dump(raw, f, indent=2)
+    os.replace(path + ".tmp", path)
+    if on:
+        return {"enabled": True, **write_desktop_entry(pkg)}
+    return {"enabled": False, "removed": remove_desktop_entries(pkg)}
+
+
+def cmd_usb_link(args):
+    """What the Frame's USB network link (usb0) looks like, for "connect with a USB cable" (read only): its address
+    and state, the USB gadget functions behind it (ncm/ecm/rndis: decides which PCs need a driver), the USB speed,
+    whether the Frame gives the PC an address (NetworkManager "shared" = DHCP server, dnsmasq) and whether sshd
+    answers on it."""
+    def sh(cmd):  # a missing tool (nmcli, ss) leaves its field empty instead of failing the whole probe
+        try:
+            return run(cmd)
+        except (OSError, subprocess.SubprocessError):
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+    def read(path):
+        try:
+            return open(path).read().strip()
+        except OSError:
+            return None
+    out = {"present": os.path.isdir("/sys/class/net/usb0")}
+    out["operstate"] = read("/sys/class/net/usb0/operstate")
+    out["carrier"] = read("/sys/class/net/usb0/carrier")
+    out["mac"] = read("/sys/class/net/usb0/address")
+    p = sh(["ip", "-j", "addr", "show", "usb0"])
+    try:
+        out["addresses"] = [f"{a['local']}/{a['prefixlen']}" for i in json.loads(p.stdout or "[]")
+                            for a in i.get("addr_info", [])]
+    except ValueError:
+        out["addresses"] = []
+    functions = []
+    for g in glob.glob("/sys/kernel/config/usb_gadget/*"):
+        functions += [f"{os.path.basename(g)}:{os.path.basename(f)}" for f in glob.glob(os.path.join(g, "functions/*"))]
+        out.setdefault("udc", read(os.path.join(g, "UDC")))
+        out.setdefault("gadget_ids", f"{read(os.path.join(g, 'idVendor'))}:{read(os.path.join(g, 'idProduct'))}")
+    out["functions"] = functions
+    out["speed"] = {os.path.basename(u): read(os.path.join(u, "current_speed")) for u in glob.glob("/sys/class/udc/*")}
+    nm = sh(["nmcli", "-t", "-f", "DEVICE,STATE,CONNECTION", "device"])
+    line = next((ln for ln in nm.stdout.splitlines() if ln.startswith("usb0:")), "")
+    out["nm"] = line
+    conn = line.split(":", 2)[2] if line.count(":") >= 2 else ""
+    if conn:
+        out["nm_ipv4_method"] = sh(["nmcli", "-g", "ipv4.method", "connection", "show", conn]).stdout.strip()
+    out["dhcp_servers"] = [ln for ln in sh(["pgrep", "-a", "dnsmasq|udhcpd|kea|dhcpd"]).stdout.splitlines()][:5]
+    out["leases"] = sorted(glob.glob("/var/lib/NetworkManager/dnsmasq-usb0*.leases") +
+                           glob.glob("/var/lib/misc/dnsmasq*.leases"))
+    neigh = sh(["ip", "-j", "neigh", "show", "dev", "usb0"])
+    try:
+        out["neighbours"] = [n.get("dst") for n in json.loads(neigh.stdout or "[]")]
+    except ValueError:
+        out["neighbours"] = []
+    out["sshd_listening"] = ":22 " in sh(["ss", "-ltn"]).stdout
+    out["devkit_mode"] = os.path.exists("/etc/steamos-devkit-enabled")
+    return out
+
+
+POWER_ACTIONS = {"sleep": "suspend", "restart": "reboot", "shutdown": "poweroff"}
+
+
+def cmd_power(args):
+    """Put the Frame to sleep, restart or shut it down (the app's power button). logind only allows these from the
+    user's own units ("yes"), not an SSH session ("challenge" = a password prompt), so a transient user timer runs
+    systemctl a few seconds later: this command answers first. A running game is refused unless force."""
+    action = args.get("action")
+    if action not in POWER_ACTIONS:
+        raise AgentError(f"unknown power action {action!r}")
+    if game_running() and not args.get("force"):
+        raise AgentError("a game is running on the Frame")
+    delay = max(2, min(int(args.get("delay", 3)), 60))
+    p = run(["systemd-run", "--user", "--collect", "--quiet", f"--unit=frameport-power-{int(time.time())}",
+             f"--on-active={delay}", "systemctl", POWER_ACTIONS[action]])
+    if p.returncode:
+        raise AgentError(f"couldn't {action}: {(p.stderr or p.stdout).strip()[-300:]}")
+    return {"action": action, "in_seconds": delay}
+
+
+AWAKE_UNIT = "frameport-awake"
+
+
+def cmd_keep_awake(args):
+    """Keep the Frame from going idle/asleep while FramePort installs games (on=False ends it). An inhibitor lock held
+    by a `sleep` in its own user unit, so it outlives this SSH command and ends by itself after `minutes` if FramePort
+    disappears. Blocking sleep needs a local session (polkit inhibit-block-sleep: auth_admin_keep for others), so
+    when logind refuses it, idle alone is blocked (allowed for any user)."""
+    run(["systemctl", "--user", "stop", f"{AWAKE_UNIT}.service"])
+    run(["systemctl", "--user", "reset-failed", f"{AWAKE_UNIT}.service"])
+    if not args.get("on", True):
+        return {"awake": False}
+    seconds = int(min(max(float(args.get("minutes", 60)), 1), 240) * 60)
+    for what in ("idle:sleep", "idle"):
+        run(["systemd-run", "--user", "--collect", "--quiet", f"--unit={AWAKE_UNIT}", "systemd-inhibit",
+             f"--what={what}", "--who=FramePort", "--why=Installing games", "--mode=block", "sleep", str(seconds)])
+        time.sleep(0.7)  # a refused lock ends the unit right away
+        if run(["systemctl", "--user", "is-active", f"{AWAKE_UNIT}.service"]).stdout.strip() == "active":
+            return {"awake": True, "what": what, "seconds": seconds}
+        run(["systemctl", "--user", "reset-failed", f"{AWAKE_UNIT}.service"])
+    return {"awake": False}
+
+
+FOVEATION_ENV_KEYS = {"FDM_DEBUG", "ENABLE_VULKAN_FDM_INJECTION_LAYER",
+    "LEPTON_ENV_DISABLE_VULKAN_FDM_INJECTION_LAYER", "VK_INSTANCE_LAYERS", "FOVE_INNER", "FOVE_OUTER", "FOVE_LEVEL",
+    "LEPTON_ENV_FRAMEPORT_FOVEATION_TEST", "LEPTON_ENV_FRAMEPORT_CLIMB_STEREO_OFFSETS",
+    "LEPTON_ENV_FRAMEPORT_VRAPI_FDM_ISOLATE_MONO", "LEPTON_ENV_FRAMEPORT_VRAPI_KEEP_FOCUSED_IMAGE"}
+
+
+def update_foveation_launcher(pkg, dep, env):
+    if not isinstance(env, dict) or set(env) - FOVEATION_ENV_KEYS or any(
+            v is not None and (not isinstance(v, str) or "\n" in v or "\r" in v) for v in env.values()):
+        raise AgentError("invalid foveation environment")
+    path = os.path.join(ANCHORS, pkg, "launch.sh")
+    text = open(path).read()
+    # Replace only managed exports; preserve all unrelated launcher customizations.
+    text = "".join(line for line in text.splitlines(keepends=True)
+                   if not any(line.startswith("export " + key + "=") for key in env))
+    lines = "".join(f"export {key}={shlex.quote(value)}\n" for key, value in env.items() if value is not None)
+    text = text.replace("\n", "\n" + lines, 1)
+    with open(path + ".tmp", "w") as f:
+        f.write(text)
+    os.chmod(path + ".tmp", 0o755)
+    os.replace(path + ".tmp", path)
+    dep["foveation_env"] = env
+    write_deployment(pkg, dep)
+
+
+def cmd_set_settings(args):
+    pkg = check_pkg(args["package"])
+    dep = deployment(pkg) or {}
+    if not dep:
+        raise AgentError(f"{pkg} is not installed")
+    base = dep["base"]
+    conf = os.path.join(base, "settings.conf")
+    current = {}
+    if os.path.exists(conf):
+        for line in open(conf):
+            k, _, v = line.strip().partition("=")
+            if k:
+                current[k] = v
+    for k, v in (args.get("settings") or {}).items():
+        if not re.fullmatch(r"[a-z_]+", k) or not re.fullmatch(r"-?(?:[0-9]+\.?[0-9]*|\.[0-9]+)", str(v)):
+            raise AgentError(f"bad setting {k}={v}")  # checked before anything is written
+        current[k] = str(v)
+    if "foveation_env" in args:
+        update_foveation_launcher(pkg, dep, args["foveation_env"])
+    text = "".join(f"{k}={v}\n" for k, v in current.items())
+    with open(conf, "w") as f:
+        f.write(text)
+    files_dir = data_files_dir(base, pkg)
+    os.makedirs(files_dir, exist_ok=True)
+    with open(os.path.join(files_dir, "framebridge.conf"), "w") as f:
+        f.write(text)
+    room_setting_changed(pkg, dep, args.get("settings") or {})
+    models = install_controller_models(files_dir, current.get("controller_models", "0") not in ("0", "0.0"))
+    synced = sync_game_config(pkg, dep)
+    if isinstance(dep.get("configuration"), dict):
+        applied = dep["configuration"]
+        settings = applied.get("settings") or {}
+        for key, value in (args.get("settings") or {}).items():
+            if key in settings:
+                number = float(value)
+                # keep the recorded type (the PC's fingerprint uses it); an int setting given 1.5 stays 1.5
+                settings[key] = number if isinstance(settings[key], float) or not number.is_integer() \
+                    else int(number)
+        dep["configuration_fp"] = hashlib.sha256(json.dumps(applied, sort_keys=True).encode()).hexdigest()[:32]
+        write_deployment(pkg, dep)
+    return {"settings": current, "foveation_env": dep.get("foveation_env", {}),
+            "controller_models": models, "config_sync": synced,
+            "refresh_rate": sync_refresh_rate(pkg, dep)}
+
+
+TITLE_MAX = 128
+
+
+def clean_title(title):
+    """A game's name for its Steam shortcut: one line, no control characters, at most TITLE_MAX characters."""
+    text = " ".join("".join(c if c.isprintable() else " " for c in str(title or "")).split())
+    if not text:
+        raise AgentError("the new name is empty")
+    return text[:TITLE_MAX]
+
+
+def cmd_record_artwork(args):
+    """Record artwork only after verifying the files actually uploaded to the game's anchor."""
+    pkg = check_pkg(args["package"])
+    dep = deployment(pkg)
+    if not dep:
+        raise AgentError(f"{pkg} is not installed")
+    manifest = args.get("manifest") or {}
+    root = os.path.join(ANCHORS, pkg, "artwork")
+    for name, digest in manifest.items():
+        if (not re.fullmatch(r"(?:portrait|landscape|hero|logo|icon)\.[a-zA-Z0-9]+|\.icon-source", name)
+                or not re.fullmatch(r"[a-f0-9]{64}", str(digest))):
+            raise AgentError("invalid artwork manifest")
+        path = os.path.join(root, name)
+        if not os.path.isfile(path) or sha256_file(path) != digest:
+            raise AgentError(f"artwork missing or checksum mismatch: {name}")
+    dep["artwork_manifest"] = manifest
+    write_deployment(pkg, dep)
+    return {"verified": True}
+
+
+def cmd_rename(args):
+    """Rename an installed game (agent v77): deployment.json's title is what its Steam shortcut shows. The shortcut
+    keeps its appid (upsert_shortcut matches by Exe, deployment.json keeps the appid), so Play, its grid art, launch
+    tests and the game's container stay the same. shortcuts (default on) rewrites the library entry like an install
+    does (Steam restarts once, after a running game or Desktop Mode). A devkit entry is named by its id: unchanged."""
+    pkg = check_pkg(args["package"])
+    title = clean_title(args.get("title"))
+    dep = deployment(pkg)
+    if not dep or not dep.get("appid"):
+        raise AgentError(f"{pkg} is not installed")
+    old = dep.get("title") or pkg
+    out = {"package": pkg, "title": title, "old": old, "appid": dep["appid"], "renamed": old != title}
+    if out["renamed"]:
+        dep["title"] = title
+        write_deployment(pkg, dep)
+        if (dep.get("overlay") or {}).get("registered"):  # its SteamVR manifest shows the name too
+            try:
+                register_overlay(pkg, bool(dep["overlay"].get("autostart")))
+            except Exception as exc:  # noqa: BLE001 - the shortcut matters more
+                out["overlay_error"] = str(exc)
+    out["shortcuts"] = cmd_shortcuts({"packages": [pkg], "restart": True}) \
+        if args.get("shortcuts", True) and out["renamed"] else {"started": False}
+    return out
+
+
+def cmd_uninstall(args):
+    pkg = check_pkg(args["package"])
+    dep = deployment(pkg)
+    if not dep:
+        return {"removed": False}
+    base = dep["base"]
+    pcvr = dep.get("kind") == "pcvr"
+    linux = dep.get("kind") == "linux"
+    if (pcvr_pids(base) if pcvr or linux else container_running(dep["appid"])):
+        raise AgentError("the game is running")
+    if is_overlay(dep) or os.path.exists(os.path.join(ANCHORS, pkg, OVERLAY_MANIFEST)):
+        unregister_overlay(pkg)  # SteamVR forgets the overlay app (before its manifest's folder goes)
+    keep_data = args.get("keep_data", True)
+    names = ("game", "revive", "xrlayer", "shadercache", "incoming", "incoming-artwork") if pcvr else \
+        ("app", "incoming", "incoming-artwork", "launch.log", "session.log") if linux else \
+        ("lepton-app", "lepton-shaders", "incoming", "previous-game.apk")
+    for name in names:
+        p = os.path.join(base, name)
+        if os.path.isdir(p):
+            remove_tree(p)
+        elif os.path.exists(p):
+            os.remove(p)
+    if not keep_data:
+        remove_tree(base)
+        remove_empty_drive_dir(base)
+    if linux:
+        remove_desktop_entries(pkg)
+    remove_lepton_path(pkg)
+    anchor = os.path.join(ANCHORS, pkg)
+    removed_sc = False
+    if args.get("remove_shortcut") and steam_users():
+        # Steam keeps its own copy of shortcuts.vdf and writes it back: change it only with Steam closed (worker)
+        # "later" queues the removal and "off" does nothing now: neither starts a worker (no "started")
+        removed_sc = bool(cmd_shortcuts({"remove": [{"exe": f'"{anchor}/launch.sh"',
+                                                     "appid": dep.get("appid")}]}).get("started"))
+    if args.get("remove_shortcut"):
+        try:
+            devkit_unregister(pkg, steam_running=run(["pgrep", "-x", "steam"]).returncode == 0)
+        except Exception:  # noqa: BLE001 (the files go anyway at the next purge)
+            pass
+    if not keep_data or base != anchor:
+        remove_tree(anchor)
+    else:  # saves live next to the launcher (Quest games): keep them, drop what marks the game as installed
+        for name in ("deployment.json", "launch.sh", "artwork", "launch.log", "launch-test.log", "session.log"):
+            p = os.path.join(anchor, name)
+            remove_tree(p)
+    if is_overlay(dep):
+        overlay_service_quiet()  # the last autostart overlay app gone: the service goes too
+    return {"removed": True, "kept_saves": keep_data, "shortcut_removed": removed_sc}
+
+
+# ------------------------------------------------------------------------------------------ move (GitHub #90)
+def remove_empty_drive_dir(base):
+    """<drive>/FramePort once its last game is gone."""
+    parent = os.path.dirname(os.path.normpath(base))
+    if os.path.basename(parent) != DRIVE_DIR or _inside(parent, HOME):
+        return False
+    try:
+        os.rmdir(parent)
+        return True
+    except OSError:
+        return False
+
+
+def base_items(base, anchor):
+    """The entries of a game's base that are the game's files (with base == anchor, the anchor's own files stay)."""
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return []
+    if os.path.normpath(base) == os.path.normpath(anchor):
+        names = [n for n in names if n not in ANCHOR_ITEMS]
+    return names
+
+
+def as_owner():
+    """Commands that must reach files owned by Lepton containers' user ids (overlayfs work dirs, the app's own
+    files) run in podman's user namespace, where the steamos user owns them all."""
+    return ["podman", "unshare"] if shutil.which("podman") else []
+
+
+def tree_stats(root, names):
+    """(files, bytes) of these entries of root: regular files and symlinks count (symlinks without size)."""
+    paths = [os.path.join(root, n) for n in names if os.path.lexists(os.path.join(root, n))]
+    if not paths:
+        return 0, 0
+    p = run(as_owner() + ["find"] + paths + ["(", "-type", "f", "-o", "-type", "l", ")", "-printf", r"%y %s\n"])
+    files = size = 0
+    for line in p.stdout.splitlines():
+        kind, _, n = line.partition(" ")
+        files += 1
+        if kind == "f" and n.isdigit():
+            size += int(n)
+    return files, size
+
+
+def replace_path(text, old, new):
+    """launch.sh text with the game's old folder replaced (the plain path and Wine's Z:\\ form). Paths that need
+    quoting differently can't be swapped as text: those launchers are written again instead."""
+    if "'" in new or (shlex.quote(old) == old and shlex.quote(new) != new):
+        raise AgentError(f"can't rewrite the launcher for {new!r}; reinstall the game once, then move it")
+    for o, n in ((old, new), (windows_path(old), windows_path(new))):
+        text = re.sub(re.escape(o) + r"(?=[/\\'\"\s;)|&]|$)", lambda m, n=n: n, text, flags=re.M)
+    return text
+
+
+def rebase_launcher(dep, anchor, new):
+    """launch.sh pointing at the game's new folder: the Quest launcher's app_dir line, Linux and PC VR launchers written
+    again from the install record (their settings are kept there since agent v63), else the path swapped as text."""
+    pkg, old = dep["package"], dep["base"]
+    path = os.path.join(anchor, "launch.sh")
+    with open(path) as f:
+        text = f.read()
+    kind = dep.get("kind", "quest")
+    launcher = dep.get("launcher")
+    if kind == "quest":
+        text, n = set_app_dir(text, new, pkg)
+        if not n:
+            raise AgentError("launch.sh has no app_dir line; reinstall the game once, then move it")
+    elif kind == "linux" and launcher is not None:
+        prefix = []
+        if dep.get("x86_64"):
+            tool = pick_tool("linux_x86", linux_x86_tools())
+            prefix = compat_command(tool["dir"]) if tool and tool.get("dir") else None
+        if prefix is not None:
+            write_linux_launcher(anchor, new, pkg, dep.get("title") or pkg, dep["exe"], dep.get("appimage"), prefix,
+                                 launcher.get("env"))
+            return
+        text = replace_path(text, old, new)
+    elif kind == "pcvr" and launcher is not None:
+        tool = next((t for t in proton_tools() if t["name"] == dep.get("proton")), None)
+        if tool and tool.get("dir"):
+            write_proton_launcher(anchor, new, pkg, dep.get("title") or pkg, dep["appid"], tool, dep["exe"],
+                                  dep.get("revive", True), launcher.get("env"), dep.get("xr_layer"),
+                                  launcher.get("game_args") or [], dep.get("oculus_hmd"), vr=dep.get("vr", True))
+            return
+        text = replace_path(text, old, new)
+    else:
+        text = replace_path(text, old, new)
+    with open(path + ".tmp", "w") as f:
+        f.write(text)
+    os.chmod(path + ".tmp", 0o755)
+    if shutil.which("bash") and run(["bash", "-n", path + ".tmp"]).returncode != 0:
+        os.remove(path + ".tmp")
+        raise AgentError("the rewritten launcher isn't valid; nothing was moved")
+    os.replace(path + ".tmp", path)
+
+
+def retarget_symlinks(root, names, old, new):
+    """Symlinks in the moved files that point into the old folder (PC VR: the LibOVRRT redirect to Revive's runtime,
+    links in the Proton prefix) point into the new one."""
+    fixed = 0
+    for name in names:
+        for r, dirs, files in os.walk(os.path.join(root, name)):
+            for n in files + dirs:
+                p = os.path.join(r, n)
+                if not os.path.islink(p):
+                    continue
+                target = os.readlink(p)
+                if os.path.isabs(target) and _inside(target, old):
+                    try:
+                        os.remove(p)
+                        os.symlink(new + target[len(os.path.normpath(old)):], p)
+                        fixed += 1
+                    except OSError:
+                        pass
+    return fixed
+
+
+def _write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(path + ".tmp", path)
+
+
+def same_device(a, b):
+    return os.stat(a).st_dev == os.stat(b).st_dev
+
+
+def game_is_running(dep):
+    if dep.get("kind") in ("pcvr", "linux"):
+        return bool(pcvr_pids(dep["base"]))
+    return container_running(dep["appid"])
+
+
+def cmd_move(args):
+    """Move an installed game's files to another drive (or back to internal storage): `dest` as for prepare (a drive's
+    FramePort folder or its mount point, "internal"). The launcher, Steam shortcut and saves stay valid. Copies run
+    detached (poll move_status); detach=False runs it here (tests)."""
+    pkg = check_pkg(args["package"])
+    dep = deployment(pkg)
+    if not dep:
+        raise AgentError(f"{pkg} is not installed")
+    title = dep.get("title") or pkg
+    old = os.path.normpath(dep["base"])
+    check_base_present(old, title)
+    dest = resolve_dest(args.get("dest"))
+    new = os.path.normpath(os.path.join(dest, pkg))
+    anchor = os.path.join(ANCHORS, pkg)
+    if new == old:
+        raise AgentError(f"{title} is already there")
+    if game_is_running(dep):
+        raise AgentError(f"{title} is running on the Frame. Close it first.")
+    try:
+        cur = json.load(open(MOVE_STATUS))
+        if cur.get("state") == "running" and cur.get("pid") and os.path.exists(f"/proc/{cur['pid']}"):
+            raise AgentError(f"another move is running ({cur.get('title') or cur.get('package')})")
+    except (OSError, ValueError):
+        pass
+    items = base_items(old, anchor)
+    clash = [n for n in items if os.path.lexists(os.path.join(new, n))]
+    if new != anchor and os.path.isdir(new) and os.listdir(new):
+        clash = clash or sorted(os.listdir(new))
+    if clash:
+        raise AgentError(f"{new} already has files ({clash[0]}); remove them first")
+    os.makedirs(dest, exist_ok=True)
+    same_fs = same_device(old, dest)
+    files, size = tree_stats(old, items)
+    if not same_fs:
+        free = _space(dest)[0] or 0
+        if size > free - MOVE_HEADROOM:
+            raise AgentError(f"not enough space: {title} needs {size / 2**30:.1f} GiB, the drive has "
+                             f"{free / 2**30:.1f} GiB free")
+    job = {"package": pkg, "title": title, "from": old, "to": new, "items": items, "same_fs": same_fs,
+           "files": files, "total_bytes": size, "status": args.get("status") or MOVE_STATUS}
+    _write_json(job["status"], {"state": "running", "phase": "starting", "package": pkg, "title": title, "from": old,
+                                "to": new, "done_bytes": 0, "total_bytes": size, "started": time.time()})
+    if args.get("detach", True) is False:
+        move_worker(json.dumps(job))
+        return json.load(open(job["status"]))
+    p = run(["systemd-run", "--user", "--collect", "--quiet", f"--unit=frameport-move-{int(time.time())}",
+             "--setenv=HOME=" + HOME, sys.executable, os.path.abspath(__file__), "_move_worker", json.dumps(job)])
+    if p.returncode != 0:
+        _write_json(job["status"], {"state": "failed", "package": pkg, "error": p.stderr.strip()[-300:]})
+        raise AgentError(f"couldn't start the move: {p.stderr.strip()[-300:]}")
+    return {"started": True, "package": pkg, "from": old, "to": new, "total_bytes": size, "files": files,
+            "same_drive": same_fs, "status": job["status"]}
+
+
+def cmd_move_status(args):
+    try:
+        return json.load(open(args.get("status") or MOVE_STATUS))
+    except (OSError, ValueError):
+        return {"state": "none"}
+
+
+def move_worker(payload):
+    job = json.loads(payload)
+    status = {"state": "running", "phase": "copying", "package": job["package"], "title": job["title"],
+              "from": job["from"], "to": job["to"], "done_bytes": 0, "total_bytes": job["total_bytes"],
+              "started": time.time(), "pid": os.getpid()}
+    _write_json(job["status"], status)
+    try:
+        status.update(_move(job, status))
+        status["state"] = "done"
+    except Exception as exc:  # noqa: BLE001
+        status.update(state="failed", error=str(exc) if isinstance(exc, AgentError) else f"{type(exc).__name__}: {exc}")
+    status.update(finished=time.time(), phase=status["state"])
+    _write_json(job["status"], status)
+
+
+def _move(job, status):
+    import threading
+
+    pkg, old, new, items = job["package"], job["from"], job["to"], job["items"]
+    anchor = os.path.join(ANCHORS, pkg)
+    dep = deployment(pkg)
+    if not dep or os.path.normpath(dep["base"]) != old:
+        raise AgentError("the game's install record changed; nothing was moved")
+    os.makedirs(new, exist_ok=True)
+    done = []
+    try:
+        if job["same_fs"]:  # same drive: rename, nothing to copy
+            for n in items:
+                os.rename(os.path.join(old, n), os.path.join(new, n))
+                done.append(n)
+        else:
+            stop = threading.Event()
+
+            def watch():  # progress for the PC: what has arrived so far
+                while not stop.wait(3):
+                    arrived = [n for n in items if os.path.lexists(os.path.join(new, n))]
+                    status["done_bytes"] = tree_stats(new, arrived)[1]
+                    _write_json(job["status"], status)
+
+            t = threading.Thread(target=watch, daemon=True)
+            t.start()
+            try:
+                for n in items:
+                    done.append(n)
+                    p = run(as_owner() + ["cp", "-a", "--", os.path.join(old, n), new + "/"])
+                    if p.returncode != 0:
+                        raise AgentError(f"copy failed: {(p.stderr or p.stdout).strip()[-300:]}")
+            finally:
+                stop.set()
+                t.join(5)
+            status["phase"] = "verifying"
+            _write_json(job["status"], status)
+            have = tree_stats(new, items)
+            if have != (job["files"], job["total_bytes"]):
+                raise AgentError(f"the copy doesn't match ({have[0]} files, {have[1]} bytes; expected "
+                                 f"{job['files']} files, {job['total_bytes']} bytes)")
+            status["done_bytes"] = job["total_bytes"]
+        status["relinked"] = retarget_symlinks(new, items, old, new)
+        old_launcher = open(os.path.join(anchor, "launch.sh")).read()
+        rebase_launcher(dep, anchor, new)
+    except BaseException:
+        if job["same_fs"]:
+            for n in reversed(done):
+                try:
+                    os.rename(os.path.join(new, n), os.path.join(old, n))
+                except OSError:
+                    pass
+        else:
+            for n in done:
+                _remove_owned(os.path.join(new, n))
+        if new != anchor:
+            try:
+                os.rmdir(new)
+            except OSError:
+                pass
+            remove_empty_drive_dir(new)
+        raise
+    dep_path = os.path.join(anchor, "deployment.json")
+    try:
+        with open(dep_path) as f:
+            raw = json.load(f)
+        raw.update(base=new, moved={"from": old, "time": time.time()})
+        _write_json(dep_path, raw)
+    except Exception:
+        with open(os.path.join(anchor, "launch.sh"), "w") as f:  # keep the game where it was
+            f.write(old_launcher)
+        raise
+    status["phase"] = "removing"
+    _write_json(job["status"], status)
+    if not job["same_fs"]:
+        for n in items:
+            _remove_owned(os.path.join(old, n))
+    if old != os.path.normpath(anchor):
+        try:
+            os.rmdir(old)
+        except OSError:
+            pass
+        remove_empty_drive_dir(old)
+    return {"base": new}
+
+
+def _remove_owned(path):
+    """Remove a copied or moved tree, including files owned by the container's user ids."""
+    remove_tree(path)
+    if os.path.lexists(path) and as_owner():
+        run(as_owner() + ["rm", "-rf", "--", path])
+
+
+# ------------------------------------------------------------------------------------------ launch tests
+def cmd_stop(args):
+    pkg = check_pkg(args["package"])
+    dep = deployment(pkg)
+    out = {"stopped": bool(dep)}
+    if dep:
+        if dep.get("kind") not in ("pcvr", "linux") and container_running(dep["appid"]):
+            # before the launch-test unit is stopped: systemd's TERM reaches Lepton too, whose teardown ends the
+            # container at once (GitHub #480)
+            out["paused"] = pause_app(dep["appid"], pkg)
+        run(["systemctl", "--user", "stop", f"frameport-test-{dep['appid']}"])
+        if dep.get("kind") == "pcvr":
+            stop_pcvr(dep)
+        elif dep.get("kind") == "linux":
+            for pid in pcvr_pids(dep["base"]):
+                run(["kill", "-TERM", pid])
+        else:
+            run(["podman", "kill", f"lepton-steamlaunch-{dep['appid']}"])
+    return out
+
+
+def stop_pcvr(dep):
+    """Stop a Proton game: wineserver -k in its prefix, then anything still using its folder."""
+    tool = next((t for t in proton_tools() if t["name"] == dep.get("proton")), None) if dep.get("proton") else None
+    if tool and tool.get("dir"):
+        stop_prefix(tool, os.path.join(dep["base"], "compatdata/pfx"))
+    for pid in pcvr_pids(dep["base"]):
+        run(["kill", "-TERM", pid])
+
+
+PCVR_LOGS = ("compatdata/pfx/drive_c/users/steamuser/AppData/Local/Revive/ReviveInjector.txt",)
+LOCAL_APPDATA = "compatdata/pfx/drive_c/users/steamuser/AppData/Local"
+
+
+LOCAL_LOW = "compatdata/pfx/drive_c/users/steamuser/AppData/LocalLow"
+
+
+def _head_tail(path, head=300, tail=1500):
+    lines = open(path, errors="replace").read().splitlines()
+    if len(lines) > head + tail:
+        lines = lines[:head] + [f"[... {len(lines) - head - tail} lines left out ...]"] + lines[-tail:]
+    return "\n".join(lines)
+
+
+def unity_logs(base, since=0.0):
+    """Unity's own logs of a PC VR game: LocalLow/<Company>/<Product>/Player.log + Player-prev.log (Unity 2018.3+;
+    company and product from <game>/<Name>_Data/app.info, else every Player log in LocalLow), the older
+    <Name>_Data/output_log.txt and the crash handler's Temp/<Company>/<Product>/Crashes/*/error.log. Unity logs VR
+    start-up (which SDK, init errors) at the top, so the head is kept as well as the tail."""
+    game = os.path.join(base, "game")
+    low = os.path.join(base, LOCAL_LOW)
+    temp = os.path.join(base, LOCAL_APPDATA, "Temp")
+    names = []
+    for info in glob.glob(os.path.join(glob.escape(game), "*_Data", "app.info")):
+        try:
+            lines = [ln.strip() for ln in open(info, errors="replace").read().splitlines()]
+        except OSError:
+            continue
+        if len(lines) >= 2 and lines[0] and lines[1] and "/" not in lines[0] + lines[1] and \
+                ".." not in (lines[0], lines[1]):
+            names.append((lines[0], lines[1]))
+    dirs = [os.path.join(low, c, p) for c, p in names if os.path.isdir(os.path.join(low, c, p))]
+    logs = []
+    for d in dirs or glob.glob(os.path.join(glob.escape(low), "*", "*")):
+        logs += [os.path.join(d, n) for n in ("Player.log", "Player-prev.log")]
+    logs += glob.glob(os.path.join(glob.escape(game), "*_Data", "output_log.txt"))
+    crash_dirs = [os.path.join(temp, c, p) for c, p in names] or glob.glob(os.path.join(glob.escape(temp), "*", "*"))
+    crashes = [x for d in crash_dirs for x in glob.glob(os.path.join(glob.escape(d), "Crashes", "*", "error.log"))]
+    out = []
+    for log in [x for x in logs if os.path.isfile(x)]:
+        if os.path.getmtime(log) < since:  # left over from an earlier run
+            continue
+        out.append(f"===== unity log {os.path.relpath(log, base)}\n" + _head_tail(log))
+    for err in sorted(crashes, key=os.path.getmtime, reverse=True)[:2]:
+        if os.path.getmtime(err) >= since:
+            out.append(f"===== unity crash {os.path.relpath(err, base)}\n" + _head_tail(err, 100, 400))
+    return out
+
+
+def game_logs(base, since=0.0):
+    """The game's own logs from the Proton prefix, newest first: Unreal Saved/Logs/*.log (tail) and crash summaries
+    (Saved/Crashes/*/CrashContext.runtime-xml → error message + call stack), Unity's Player.log / crash error.log
+    (agent v67), Revive's logs."""
+    out = unity_logs(base, since)
+    local = os.path.join(base, LOCAL_APPDATA)
+    for log in sorted(glob.glob(os.path.join(local, "*", "Saved", "Logs", "*.log")), key=os.path.getmtime,
+                      reverse=True)[:1]:
+        if os.path.getmtime(log) < since:  # left over from an earlier run
+            continue
+        text = open(log, errors="replace").read()
+        out.append(f"===== game log {os.path.relpath(log, base)}\n" + "\n".join(text.splitlines()[-1500:]))
+    for ctx in sorted(glob.glob(os.path.join(local, "*", "Saved", "Crashes", "*", "CrashContext.runtime-xml")),
+                      key=os.path.getmtime, reverse=True)[:2]:
+        if os.path.getmtime(ctx) < since:
+            continue
+        raw = open(ctx, "rb").read().decode("utf-8", "replace")
+        fields = []
+        for tag in ("ErrorMessage", "CrashType", "EngineVersion", "CallStack", "SourceContext"):
+            m = re.search(rf"<{tag}>(.*?)</{tag}>", raw, re.S)
+            if m and m.group(1).strip():
+                fields.append(f"{tag}: {m.group(1).strip()[:3000]}")
+        out.append(f"===== crash {os.path.relpath(os.path.dirname(ctx), base)} (UE4CC)\n" + "\n".join(fields))
+    for rv in glob.glob(os.path.join(local, "Revive", "*.txt")):
+        if not rv.endswith("ReviveInjector.txt") and os.path.getmtime(rv) >= since:
+            out.append(f"===== {os.path.relpath(rv, base)}\n" + open(rv, errors="replace").read()[-100000:])
+    return out
+
+
+LAUNCH_INSTALL_GRACE = 240  # s a launch test waits at most for Lepton's boot + app install before its own window
+
+
+def cmd_launch_test(args):
+    """Start the game headless (as Steam would), wait, classify, stop. Without the headset worn the OpenXR session
+    never reaches FOCUSED, so this proves startup, not visuals."""
+    pkg = check_pkg(args["package"])
+    seconds = int(args.get("seconds", 45))
+    dep = deployment(pkg)
+    if not dep:
+        raise AgentError(f"{pkg} is not installed")
+    anchor = os.path.join(ANCHORS, pkg)
+    log = os.path.join(dep["base"], "launch.log")
+    appid = dep["appid"]
+    if is_overlay(dep):  # nothing to see without a game; register_vr_overlay's SteamVR check is the test
+        return {"state": "SKIPPED", "skipped": "overlay app", "elapsed": 0, "log": None, "log_size": 0,
+                "crash_log": None, "kind": dep.get("kind")}
+    if dep.get("kind") == "pcvr":
+        return launch_test_pcvr(dep, anchor, log, seconds)
+    if dep.get("kind") == "linux":
+        return launch_test_linux(dep, anchor, log, seconds)
+    if container_running(appid):
+        raise AgentError("the game is already running")
+    ensure_host_fixes()
+    keys = key_usage()
+    unit = f"frameport-test-{appid}"
+    run(["systemctl", "--user", "reset-failed", unit])
+    mark_launch_test(anchor)
+    p = run(["systemd-run", "--user", "--collect", "--quiet", f"--unit={unit}", os.path.join(anchor, "launch.sh")])
+    if p.returncode:
+        raise AgentError("could not start the launcher: " + p.stderr[-300:])
+    start = time.time()
+    state = "RUNNING"
+    app_start = None  # when Lepton started the app ("Waiting for app"): the test window counts from there
+    while True:
+        time.sleep(3)
+        now = time.time()
+        text = open(log, errors="replace").read() if os.path.exists(log) else ""
+        if "Exited!" in text:
+            state = "EXITED"
+            break
+        if "Early-exit" in text or not_started(text, now - start):
+            state = "NEVER_STARTED"
+            break
+        if app_start is None and "Waiting for app" in text:
+            app_start = now
+        # the first start after an APK change boots Lepton and installs the app first (a minute or more): stopping the
+        # container then left a half-installed APK ("base.apk is not zip") that never started again (VR HOT)
+        if app_start is not None and now - app_start >= seconds:
+            break
+        if now - start >= seconds + LAUNCH_INSTALL_GRACE:
+            break
+    elapsed = round(time.time() - start)
+    if state == "EXITED":  # Lepton dumps the container's logcat buffers (crash backtraces) after "Exited!"
+        until = time.time() + 15
+        while time.time() < until and "Dumping logcat" not in (open(log, errors="replace").read()
+                                                                if os.path.exists(log) else ""):
+            time.sleep(1)
+        time.sleep(2)
+    run(["systemctl", "--user", "stop", unit])
+    run(["podman", "kill", f"lepton-steamlaunch-{appid}"])
+    time.sleep(3)
+    crash = os.path.join(STEAM, "logs", "lepton-logcats", f"steamlaunch-{appid}", "logcat-crash.log")
+    fresh = os.path.exists(crash) and os.path.getmtime(crash) >= start - 1 and os.path.getsize(crash) > 0
+    return {"state": state, "elapsed": elapsed, "log": log,
+            "log_size": os.path.getsize(log) if os.path.exists(log) else 0,
+            "crash_log": crash if fresh else None,
+            "kernel_keys_before": keys, "kernel_keys_after": key_usage()}
+
+
+def launch_test_linux(dep, anchor, log, seconds):
+    """Start a Linux app headless (the launcher borrows Steam's display) and see whether it stays up."""
+    base, appid = dep["base"], dep["appid"]
+    if pcvr_pids(os.path.join(base, "app")):
+        raise AgentError("the app is already running")
+    unit = f"frameport-test-{appid}"
+    run(["systemctl", "--user", "reset-failed", unit])
+    mark_launch_test(anchor)
+    start = time.time()
+    p = run(["systemd-run", "--user", "--quiet", f"--unit={unit}", "--property=RemainAfterExit=no",
+             os.path.join(anchor, "launch.sh")])
+    if p.returncode:
+        raise AgentError("could not start the launcher: " + p.stderr[-300:])
+    state, seen = "RUNNING", False
+    while time.time() - start < seconds:
+        time.sleep(2)
+        seen = seen or bool(pcvr_pids(os.path.join(base, "app")))
+        if run(["systemctl", "--user", "is-active", "--quiet", unit]).returncode:
+            state = "EXITED" if seen else "NEVER_STARTED"
+            break
+    elapsed = round(time.time() - start)
+    run(["systemctl", "--user", "stop", unit])
+    for pid in pcvr_pids(os.path.join(base, "app")):
+        run(["kill", "-TERM", pid])
+    combined = os.path.join(base, "launch-test.log")
+    text = open(log, errors="replace").read()[-400000:] if os.path.exists(log) else ""
+    missing = dep.get("missing_libraries") or []
+    with open(combined, "w") as f:
+        if missing:
+            f.write("FramePort: libraries missing on the Frame: " + ", ".join(missing) + "\n")
+        f.write(text)
+    return {"state": state, "elapsed": elapsed, "log": combined, "log_size": os.path.getsize(combined),
+            "kind": "linux", "game_process": seen, "missing_libraries": missing}
+
+
+def launch_test_pcvr(dep, anchor, log, seconds):
+    base, appid = dep["base"], dep["appid"]
+    if pcvr_pids(base):
+        raise AgentError("the game is already running")
+    unit = f"frameport-test-{appid}"
+    run(["systemctl", "--user", "reset-failed", unit])
+    mark_launch_test(anchor)
+    p = run(["systemd-run", "--user", "--quiet", f"--unit={unit}", "--property=RemainAfterExit=no",
+             os.path.join(anchor, "launch.sh")])
+    if p.returncode:
+        raise AgentError("could not start the launcher: " + p.stderr[-300:])
+    start = time.time()
+    state = "RUNNING"
+    game_seen = False
+    exe_name = os.path.basename(dep.get("exe", ""))
+    while time.time() - start < seconds:
+        time.sleep(3)
+        # Wine names game processes by their Windows path (X:\...\Game.exe); the Proton command line doesn't start so
+        game_seen = game_seen or bool(exe_name and run(
+            ["pgrep", "-if", r"^[a-z]:\\.*" + re.escape(exe_name)]).returncode == 0)
+        active = run(["systemctl", "--user", "is-active", "--quiet", unit]).returncode == 0
+        if not active:
+            state = "EXITED" if game_seen else "NEVER_STARTED"
+            break
+    elapsed = round(time.time() - start)
+    if state == "RUNNING" and not game_seen:
+        state = "NEVER_STARTED"  # the launcher is up but the game process never appeared
+    run(["systemctl", "--user", "stop", unit])
+    stop_pcvr(dep)
+    time.sleep(3)
+    # one log for triage: launcher/Proton output + Revive's logs + the game's own (Unreal) log and crash summaries +
+    # Proton's own log when enabled
+    parts = []
+    for rel in ("launch.log",) + PCVR_LOGS + (f"steam-{appid}.log",):
+        path = os.path.join(base, rel)
+        if os.path.exists(path) and os.path.getmtime(path) >= start - 5:  # not left over from an earlier run
+            parts.append(f"===== {rel}\n" + open(path, errors="replace").read()[-400000:])
+    parts += game_logs(base, since=start - 5)
+    combined = os.path.join(base, "launch-test.log")
+    with open(combined, "w") as f:
+        f.write("\n".join(parts))
+    return {"state": state, "elapsed": elapsed, "log": combined, "log_size": os.path.getsize(combined),
+            "kind": "pcvr", "game_process": bool(game_seen)}
+
+
+SESSION_LOG_MAX = 4 << 20  # bytes of a play session's log the PC triages
+SESSION_READ_MAX = 64 << 20  # a longer launch.log is read from its end
+SESSION_KEEP = re.compile(r"FrameBridge|focus|pacing|Fatal signal|FATAL|CRASH|#\d\d pc |Abort message|DEVICE.LOST|"
+                          r"AndroidRuntime|vrclient|Start proc|lepton", re.I)
+KERNEL_GPU = re.compile(r"hangcheck|gpu fault|adreno|kgsl|msm_drm.*(hang|recover)", re.I)
+
+
+def slice_session_log(text, max_bytes=SESSION_LOG_MAX):
+    """A long play session's log cut to max_bytes: its start (a quarter) and its end (half) whole, from the middle
+    only FrameBridge's, focus, pacing and crash lines (oldest first, while they fit). Returns (text, cut)."""
+    if len(text) <= max_bytes:
+        return text, False
+    head = text[:max_bytes // 4]
+    head = head[:head.rfind("\n") + 1]
+    tail = text[-(max_bytes // 2):]
+    tail = tail[tail.find("\n") + 1:]
+    middle = text[len(head):len(text) - len(tail)]
+    budget, kept = max_bytes - len(head) - len(tail) - 200, []
+    for line in middle.splitlines():
+        if SESSION_KEEP.search(line):
+            budget -= len(line) + 1
+            if budget < 0:
+                break
+            kept.append(line)
+    note = f"[FramePort: {len(middle)} bytes in the middle of this session cut, {len(kept)} lines kept]\n"
+    return head + note + "".join(ln + "\n" for ln in kept) + tail, True
+
+
+def session_kernel_lines(start, end):
+    """Kernel GPU lines (hangs, faults, recoveries) logged during a play session."""
+    until = (end or time.time()) + 120
+    try:
+        text = run(["journalctl", "-k", "--since", f"@{int(start)}", "--until", f"@{int(until)}", "-q", "--no-pager",
+                    "-o", "short-unix"]).stdout
+    except OSError:
+        return ""
+    lines = [ln for ln in text.splitlines() if KERNEL_GPU.search(ln)]
+    return "".join(f"kernel: {ln}\n" for ln in lines[-200:])
+
+
+def cmd_session_log(args):
+    """The log of the game's newest play session (agent v70), for triage on the PC: {session: {start, end, test},
+    log: path of the session's log (launch.log sliced to 4 MB; PC VR: + Revive's and the game's own logs), log_size,
+    cut, crash: that session's crash logcat (tombstones), kernel: GPU hang/fault lines from the kernel log}.
+    session is None when the game was never played."""
+    pkg = check_pkg(args["package"])
+    dep = deployment(pkg)
+    if not dep:
+        raise AgentError(f"{pkg} is not installed")
+    anchor, base = os.path.join(ANCHORS, pkg), dep["base"]
+    session = last_play(anchor)
+    out = {"session": session, "log": None, "log_size": 0, "cut": False, "crash": "", "kernel": "",
+           "kind": dep.get("kind", "quest")}
+    if not session:
+        return out
+    start, end = session["start"], session["end"]
+    parts = []
+    log = os.path.join(base, "launch.log")
+    if os.path.exists(log) and os.path.getmtime(log) >= start - 5:  # else no log of this session is left
+        size = os.path.getsize(log)
+        with open(log, "rb") as f:
+            if size > SESSION_READ_MAX:
+                f.seek(size - SESSION_READ_MAX)
+            parts.append(f.read().decode("utf-8", "replace"))
+    if dep.get("kind") == "pcvr":
+        for rel in PCVR_LOGS:
+            path = os.path.join(base, rel)
+            if os.path.exists(path) and os.path.getmtime(path) >= start - 5:
+                parts.append(f"===== {rel}\n" + (_tail(path, 400000) or ""))
+        parts += game_logs(base, since=start - 5)
+    text, cut = slice_session_log("\n".join(parts), int(args.get("max_bytes", SESSION_LOG_MAX)))
+    path = os.path.join(base, "session.log")
+    with open(path, "w") as f:
+        f.write(text)
+    out.update(log=path, log_size=os.path.getsize(path), cut=cut)
+    crash = os.path.join(STEAM, "logs", "lepton-logcats", f"steamlaunch-{dep['appid']}", "logcat-crash.log")
+    try:
+        mtime = os.path.getmtime(crash)
+        if start - 1 <= mtime <= (end or time.time()) + 120:
+            out["crash"] = _tail(crash, 256 * 1024) or ""
+    except OSError:
+        pass
+    out["kernel"] = session_kernel_lines(start, end)
+    return out
+
+
+def steam_library_report():
+    """Why a game installed by FramePort may be missing from Steam or fail with "Game configuration unavailable"
+    (GitHub #21/#30): where Steam really lives, Steam's client version/beta, each account's shortcuts.vdf (when it
+    was written vs when Steam started, FramePort's entries in it) and Steam's log lines about these shortcuts.
+    Accounts are numbered, not named (the PC redacts ids anyway)."""
+    rep = {"steam_dir": STEAM}
+    for link in ("~/.steam/steam", "~/.steam/root"):
+        path = os.path.expanduser(link)
+        rep[link] = os.path.realpath(path) if os.path.lexists(path) else None
+    pkg_dir = os.path.join(STEAM, "package")
+    rep["beta"] = (_tail(os.path.join(pkg_dir, "beta"), 200) or "").strip() or None
+    rep["client_manifests"] = sorted(n for n in os.listdir(pkg_dir) if n.endswith(".manifest"))[:10] \
+        if os.path.isdir(pkg_dir) else []
+    p = run(["pgrep", "-o", "-x", "steam"])
+    pid = p.stdout.split()[0] if p.returncode == 0 and p.stdout.split() else None
+    rep["steam_started"] = os.stat(f"/proc/{pid}").st_mtime if pid and os.path.exists(f"/proc/{pid}") else None
+    if pid:
+        try:
+            rep["steam_cmdline"] = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode()[:500]
+        except OSError:
+            pass
+    ours = {}
+    for dep_path in glob.glob(os.path.join(ANCHORS, "*/deployment.json")):
+        try:
+            dep = json.load(open(dep_path))
+        except (OSError, ValueError):
+            continue
+        ours[f'"{os.path.dirname(dep_path)}/launch.sh"'] = dep.get("package")
+    active = active_steam_user()
+    accounts, appids = [], set()
+    for i, user in enumerate(steam_users()):
+        acc = {"account": i + 1, "most_recent_login": user == active}
+        cfg = os.path.join(STEAM, "userdata", user, "config")
+        vdf = os.path.join(cfg, "shortcuts.vdf")
+        acc["shortcuts_vdf_written"] = os.path.getmtime(vdf) if os.path.exists(vdf) else None
+        acc["localconfig_written"] = os.path.getmtime(os.path.join(cfg, "localconfig.vdf")) \
+            if os.path.exists(os.path.join(cfg, "localconfig.vdf")) else None
+        acc["backups"] = len(glob.glob(vdf + ".backup-*"))
+        try:
+            root = vdf_decode(open(vdf, "rb").read()) if os.path.exists(vdf) else {}
+            entries = [v for v in (root.get("shortcuts") or {}).values() if isinstance(v, dict)]
+            acc["shortcuts"] = len(entries)
+            acc["frameport"] = []
+            for v in entries:
+                if v.get("Exe") in ours:
+                    appids.add(v.get("appid", 0) & 0xFFFFFFFF)
+                    acc["frameport"].append({"package": ours[v["Exe"]], "appid": v.get("appid", 0) & 0xFFFFFFFF,
+                                             "title": v.get("AppName", v.get("appname")),
+                                             "start_dir": v.get("StartDir"), "openvr": v.get("OpenVR"),
+                                             "options": v.get("LaunchOptions")})
+            acc["exe_dupes"] = len(entries) - len({v.get("Exe") for v in entries})
+        except Exception as exc:  # noqa: BLE001
+            acc["error"] = f"shortcuts.vdf unreadable: {exc}"
+        accounts.append(acc)
+    rep["accounts"] = accounts
+    rep["devkit_games"] = sorted(n for n in os.listdir(DEVKIT_GAMES) if os.path.isdir(os.path.join(DEVKIT_GAMES, n))) \
+        if os.path.isdir(DEVKIT_GAMES) else []
+    lines = []
+    shortcut_log = _tail(os.path.join(STEAM, "logs/shortcuts.previous.txt"), 200000)
+    if shortcut_log:
+        lines += ["==> shortcuts.previous.txt", shortcut_log]
+    for name in ("console_log.previous.txt", "console_log.txt"):
+        text = _tail(os.path.join(STEAM, "logs", name), 8 << 20) or ""
+        keep = [ln for ln in text.splitlines() if "launch error" in ln or "rungameid" in ln
+                or ("shortcut" in ln.lower() and "path_shortcut" not in ln) or any(f"[AppID {a}" in ln for a in appids)]
+        if keep:
+            lines += [f"==> {name}"] + keep[-400:]
+    return rep, "\n".join(lines)
+
+
+def _tail(path, max_bytes):
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+            data = f.read()
+        text = data.decode("utf-8", "replace")
+        return (f"[... first {size - max_bytes} bytes cut ...]\n" if size > max_bytes else "") + text
+    except OSError:
+        return None
+
+
+# shader dumps in a game's files dir: the Vulkan shim's vk_shader_dump and the shader-fix layer's zink_shader_dump
+SHADER_DUMP_DIRS = ("fp_vk_shaders", "fp_spirv")
+SHADER_DUMP_BYTES = 4 << 20  # without an index: newest modules per folder (by time written), base64 on the wire
+SHADER_DUMP_FILES = 200
+SHADER_SESSION_BYTES = 30 << 20  # with an index: the newest session's modules, up to this much in all
+SHADER_MODULE_BYTES = 4 << 20  # larger modules are left out
+SHADER_INDEX_READ = 64 << 20  # index.txt bytes looked at (from the end) for the newest session
+SHADER_INDEX_BYTES = 4 << 20  # index text sent (the newest session's lines)
+_SPV_NAME = re.compile(r"\d+_[0-9a-f]{64}\.spv")
+
+
+def shader_session(index_path):
+    """(index text from the newest "# start" line on, [module names of that session, last used first]) from a
+    vk_shader_dump index.txt (`<seq> <ms> <unix ms> <size>_<sha256>.spv new|known|again|failed` lines, one
+    "# start <unix s> pid <pid>" per process), or None without an index or a module line in its newest session."""
+    try:
+        size = os.path.getsize(index_path)
+        with open(index_path, "rb") as f:
+            if size > SHADER_INDEX_READ:
+                f.seek(size - SHADER_INDEX_READ)
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    lines = text.splitlines()
+    first = max((i for i, ln in enumerate(lines) if ln.startswith("# start")), default=0)
+    session = lines[first:]
+    names, seen = [], set()
+    for ln in reversed(session):
+        parts = ln.split()
+        if len(parts) >= 4 and _SPV_NAME.fullmatch(parts[3]) and parts[3] not in seen:
+            seen.add(parts[3])
+            names.append(parts[3])
+    if not names:
+        return None
+    body = "\n".join(session) + "\n"
+    if len(body) > SHADER_INDEX_BYTES:
+        body = f"[... first {len(body) - SHADER_INDEX_BYTES} characters cut ...]\n" + body[-SHADER_INDEX_BYTES:]
+    elif first > 0 or size > SHADER_INDEX_READ:
+        body = "[... earlier sessions left out ...]\n" + body
+    return body, names
+
+
+def shader_dumps(files_dir, max_bytes=SHADER_DUMP_BYTES, session_bytes=SHADER_SESSION_BYTES):
+    """{dir: {"index": index text, "modules": {name: base64}, "total": n, "skipped": n[, "session": n]}} for the
+    dump folders in a game's files dir. With an index.txt naming modules (vk_shader_dump): every module named in its
+    newest session (= process start), last used first, each <= SHADER_MODULE_BYTES, up to session_bytes in all
+    ("session" = how many it names). A GPU hang can come seconds after the culprit was created, so "newest written"
+    missed it (GitHub #140). Without one (fp_spirv): the newest modules (by time written) up to max_bytes. Unreadable
+    files are skipped (the app writes them inside its container). The reply is one JSON line on the SSH channel's
+    stdout (~40 MB base64 at most): the PC reads it whole, which is fine at that size."""
+    out = {}
+    for d in SHADER_DUMP_DIRS:
+        path = os.path.join(files_dir, d)
+        try:
+            names = [n for n in os.listdir(path) if n.endswith(".spv")]
+        except OSError:
+            continue
+        res = {"total": len(names), "modules": {}, "skipped": 0}
+        session = shader_session(os.path.join(path, "index.txt"))
+        if session is not None:
+            res["index"], order = session
+            res["session"] = len(order)
+            budget, per_module = session_bytes, SHADER_MODULE_BYTES
+        else:
+            index = _tail(os.path.join(path, "index.txt"), 1 << 20)
+            if index is not None:
+                res["index"] = index
+            mods = []
+            for n in names:
+                try:
+                    mods.append((os.path.getmtime(os.path.join(path, n)), n))
+                except OSError:
+                    pass
+            mods.sort(reverse=True)
+            order = [n for _, n in mods[:SHADER_DUMP_FILES]]
+            budget, per_module = max_bytes, max_bytes
+        used = 0
+        for n in order:
+            try:
+                with open(os.path.join(path, n), "rb") as f:
+                    data = f.read(min(per_module, budget - used) + 1)
+            except OSError:
+                res["skipped"] += 1
+                continue
+            if used + len(data) > budget or len(data) > per_module:
+                if session is None:
+                    break
+                res["skipped"] += 1  # too big: a smaller, older one may still fit
+                continue
+            used += len(data)
+            res["modules"][n] = base64.b64encode(data).decode("ascii")
+        out[d] = res
+    return out
+
+
+# arm64 syscall numbers seen in stuck threads (/proc/<tid>/syscall gives the number)
+ARM64_SYSCALLS = {22: "epoll_pwait", 29: "ioctl", 56: "openat", 63: "read", 64: "write", 73: "ppoll",
+                  98: "futex", 101: "nanosleep", 115: "clock_nanosleep", 203: "connect", 206: "sendto",
+                  207: "recvfrom", 212: "recvmsg", 260: "wait4"}
+TCP_STATES = {"01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV", "04": "FIN_WAIT1", "05": "FIN_WAIT2",
+              "06": "TIME_WAIT", "07": "CLOSE", "08": "CLOSE_WAIT", "09": "LAST_ACK", "0A": "LISTEN", "0B": "CLOSING"}
+
+
+def _remote_kind(hexaddr):
+    """/proc/net/tcp(6) remote address → loopback / local / internet (never the address itself: it would need
+    redacting, and what matters is whether the game waits on the internet)."""
+    import ipaddress
+    try:
+        raw = bytes.fromhex(hexaddr)
+        if len(raw) == 4:
+            ip = ipaddress.IPv4Address(raw[::-1])
+        else:  # four little-endian 32-bit words
+            ip = ipaddress.IPv6Address(b"".join(raw[i:i + 4][::-1] for i in range(0, 16, 4)))
+            ip = ip.ipv4_mapped or ip
+    except ValueError:
+        return "?"
+    if ip.is_unspecified:
+        return "none"
+    if ip.is_loopback:
+        return "loopback"
+    return "local" if ip.is_private or ip.is_link_local else "internet"
+
+
+def game_threads(pkg, proc=None, samples=3, gap=1.0, sleep=time.sleep):
+    """What a running (e.g. stuck) Android game's threads are doing (GitHub #157): for every process of `pkg` (its
+    main process and `pkg:<name>` ones), each thread's state, CPU time used over the sampled seconds, kernel wait
+    channel and current syscall, plus its TCP sockets. Readable as steamos: the container's user namespace belongs to
+    steamos. None when the game isn't running."""
+    proc = proc or PROC
+    pids = []
+    for d in os.listdir(proc):
+        if not d.isdigit():
+            continue
+        cmd = (_rd(os.path.join(proc, d, "cmdline")) or "").split("\0")[0]
+        if cmd == pkg or cmd.startswith(pkg + ":"):
+            pids.append((int(d), cmd))
+    if not pids:
+        return None
+
+    def cpu(pid):
+        out = {}
+        for t in os.listdir(os.path.join(proc, str(pid), "task")) if os.path.isdir(os.path.join(proc, str(pid),
+                                                                                                  "task")) else []:
+            st = _rd(os.path.join(proc, str(pid), "task", t, "stat")) or ""
+            f = st[st.rfind(")") + 2:].split()
+            if len(f) > 12:
+                out[t] = (f[0], int(f[11]) + int(f[12]))
+        return out
+
+    first = {pid: cpu(pid) for pid, _ in sorted(pids)}
+    for _ in range(max(0, samples - 1)):
+        sleep(gap)
+    span = max(0, samples - 1) * gap
+    lines = [f"# threads of the running game {pkg}; cpu_ms = CPU time used in {span:g} s, wchan = kernel wait, "
+             "syscall = what the thread is blocked in"]
+    for pid, cmd in sorted(pids):
+        last = cpu(pid)
+        lines.append(f"\n## process {cmd} (pid {pid}, {len(last)} threads)")
+        lines.append(f"{'tid':>7} st {'cpu_ms':>7}  {'comm':<16} {'wchan':<24} syscall")
+        rows = []
+        for tid, (state, ticks) in last.items():
+            used = (ticks - first.get(pid, {}).get(tid, (state, ticks))[1]) * 1000 // CLK_TCK
+            tdir = os.path.join(proc, str(pid), "task", tid)
+            comm = (_rd(os.path.join(tdir, "comm")) or "?").strip()
+            wchan = (_rd(os.path.join(tdir, "wchan")) or "?").strip() or "-"
+            sc = (_rd(os.path.join(tdir, "syscall")) or "?").split()
+            call = sc[0] if sc else "?"
+            if call.isdigit():
+                call = ARM64_SYSCALLS.get(int(call), "syscall " + call)
+            rows.append((-used, int(tid), f"{tid:>7} {state:>2} {used:>7}  {comm:<16} {wchan:<24} {call}"))
+        lines += [r[2] for r in sorted(rows)]
+        socks = []
+        for name in ("tcp", "tcp6"):
+            for ln in (_rd(os.path.join(proc, str(pid), "net", name)) or "").splitlines()[1:]:
+                f = ln.split()
+                if len(f) > 3 and ":" in f[2]:
+                    addr, port = f[2].rsplit(":", 1)
+                    socks.append(f"{name:<4} {TCP_STATES.get(f[3], f[3]):<12} remote={_remote_kind(addr)}"
+                                 f":{int(port, 16)}")
+        if socks:
+            lines.append("# TCP sockets (remote = loopback / local network / internet, and port)")
+            lines += sorted(set(socks))
+    return "\n".join(lines) + "\n"
+
+
+def usb_report():
+    """The USB cable link's Frame side for diagnostics (GitHub #398): usb0's address and state, the USB controller's
+    attach state, the gadget's functions and its services (Developer Mode turns them on)."""
+    def read(path):
+        try:
+            return open(path).read().strip()
+        except OSError:
+            return None
+    udcs = {os.path.basename(d): read(os.path.join(d, "state")) for d in glob.glob("/sys/class/udc/*")}
+    gadgets = {os.path.basename(g): {"udc": read(os.path.join(g, "UDC")),
+                                     "functions": sorted(os.listdir(os.path.join(g, "functions")))
+                                     if os.path.isdir(os.path.join(g, "functions")) else []}
+               for g in glob.glob("/sys/kernel/config/usb_gadget/*")}
+    units = run(["systemctl", "--no-pager", "--plain", "--no-legend", "list-units", "--all",
+                 "usb-gadget*", "usb-ncm*"]).stdout.strip().splitlines()
+    return {"usb0": run(["ip", "-br", "addr", "show", "usb0"]).stdout.strip(),
+            "operstate": read("/sys/class/net/usb0/operstate"), "udc": udcs, "gadgets": gadgets,
+            "units": [" ".join(u.split()) for u in units][:20]}
+
+
+def cmd_collect_diag(args):
+    """Everything useful for debugging without the game or the PC app: host runtime facts and, with a package, the
+    game's launcher, settings, deployment, logs (launch, Lepton logcat, Proton/Revive/Unreal) and its file listing.
+    Returns {"host": {...}, "files": {name: text}, "listing": ...}; the PC redacts and zips it."""
+    max_bytes = int(args.get("max_bytes", 2 << 20))
+    files, host = {}, {}
+    host["openxr_runtime"] = openxr_runtime()
+    layers = os.path.join(HOME, ".local/share/openxr/1/api_layers/explicit.d")
+    host["openxr_layers"] = sorted(os.listdir(layers)) if os.path.isdir(layers) else []
+    host["kernel_keys"] = key_usage()
+    host["containers_conf"] = _tail(CONTAINERS_CONF, 20000)
+    host["podman"] = run(["podman", "ps", "-a", "--filter", "name=lepton", "--format",
+                          "{{.Names}} {{.Status}}"]).stdout[-20000:]
+    host["steam_running"] = run(["pgrep", "-x", "steam"]).returncode == 0
+    host["uptime"] = _tail("/proc/uptime", 200)
+    host["boot"] = boot_state()
+    # how the previous boot ended: errors and kernel (GPU/msm/kgsl, OOM, panic) warnings before a crash or reset; and
+    # this boot's kernel warnings (a GPU hang the Frame recovered from only ends the game: no reboot, no tombstone)
+    for name, boot, extra in (("previous-boot-errors.txt", "-1", ["-p", "err"]),
+                              ("previous-boot-kernel.txt", "-1", ["-k", "-p", "warning"]),
+                              ("this-boot-kernel.txt", "0", ["-k", "-p", "warning"])):
+        try:
+            text = run(["journalctl", "-b", boot, *extra, "-n", "400", "-q", "--no-pager"]).stdout[-max_bytes:]
+        except OSError:
+            text = ""
+        if text.strip():
+            files[name] = text
+    host["installed"] = [{k: g.get(k) for k in ("package", "title", "kind", "appid", "version", "agent_version")}
+                         for g in cmd_list_installed({})["games"]]
+    try:
+        host["steam_library"], console = steam_library_report()
+        if console:
+            files["steam-console.txt"] = console[-max_bytes:]
+    except Exception as exc:  # noqa: BLE001 (diagnostics must not fail on it)
+        host["steam_library"] = {"error": str(exc)}
+    try:
+        host["usb"] = usb_report()
+    except Exception as exc:  # noqa: BLE001 (diagnostics must not fail on it)
+        host["usb"] = {"error": str(exc)}
+    out = {"agent_version": AGENT_VERSION, "host": host, "files": files}
+    pkg = args.get("package")
+    if not pkg:
+        # the OpenXR runtime's own logs (XRService-<date>_<time>.log, one per runtime start): the newest three, so a
+        # runtime or Steam restart during play still leaves the log from before it (GitHub #441)
+        xr = [p for p in glob.glob(os.path.join(STEAM, "logs/XRService-*.log")) +
+              glob.glob(os.path.join(STEAM, "logs/XRService-*/XRService-*.log")) if os.path.isfile(p)]
+        for i, p in enumerate(sorted(xr, key=os.path.getmtime, reverse=True)[:3]):
+            files[os.path.basename(p)] = _tail(p, max_bytes if i == 0 else max_bytes // 2)
+        # SteamVR's compositor/server logs and Steam's previous session: what ended a session that took Steam down
+        for name in ("vrcompositor.txt", "vrcompositor.previous.txt", "vrserver.txt", "vrserver.previous.txt",
+                     "console_log.previous.txt"):
+            text = _tail(os.path.join(STEAM, "logs", name), max_bytes // 4)
+            if text:
+                files["steam-" + name if name.startswith("console") else name] = text
+        # how steam.service ended (exit status, signal, restarts) in this boot and the one before
+        for name, boot in (("steam-service.txt", "0"), ("steam-service-previous-boot.txt", "-1")):
+            try:
+                text = run(["journalctl", "--user", "-u", "steam.service", "-b", boot, "-n", "300", "-q",
+                            "--no-pager"]).stdout[-max_bytes // 4:]
+            except OSError:
+                text = ""
+            if text.strip():
+                files[name] = text
+        return out
+    pkg = check_pkg(pkg)
+    dep = deployment(pkg)
+    anchor = os.path.join(ANCHORS, pkg)
+    if not dep:
+        out["installed"] = False
+        return out
+    out["installed"] = True
+    base, appid = dep["base"], dep.get("appid")
+    dep = dict(dep)
+    dep.pop("files", None)  # the install manifest is large; `listing` below has the real files
+    files["deployment.json"] = json.dumps(dep, indent=1)
+    for name, path in (("launch.sh", os.path.join(anchor, "launch.sh")),
+                       ("settings.conf", os.path.join(base, "settings.conf")),
+                       ("launch.log", os.path.join(base, "launch.log")),
+                       ("launch-test.log", os.path.join(base, "launch-test.log"))):
+        text = _tail(path, max_bytes)
+        if text is not None:
+            files[name] = text
+    # how the last session ended (GitHub #480): the pause before the stop, Steam's Exit game hook, SteamVR theater
+    # hold, dashboard closer; start/end times from the play log. Each worker's log holds only the last launch.
+    for name, path in (("stop-pause.log", os.path.join(base, "stop-pause.log")),
+                       ("exit-hook.log", os.path.join(base, "exit-hook.log")),
+                       ("theater.log", os.path.join(base, "theater.log")),
+                       ("dashboard.log", os.path.join(base, "dashboard.log")),
+                       ("plays.log", os.path.join(anchor, "plays.log"))):
+        text = _tail(path, max_bytes // 8)
+        if text is not None:
+            files[name] = text
+    for rel in PCVR_LOGS + (f"steam-{appid}.log",):
+        text = _tail(os.path.join(base, rel), max_bytes)
+        if text is not None:
+            files[os.path.basename(rel)] = text
+    if dep.get("kind") == "pcvr":
+        for i, part in enumerate(game_logs(base)):
+            files[f"game-log-{i}.txt"] = part[-max_bytes:]
+    logs = os.path.join(STEAM, "logs")
+    if dep.get("steam_gamepad"):  # which controller layout Steam activated, and the pads the container got (#162)
+        text = _tail(os.path.join(base, "gamepad.log"), max_bytes)
+        if text is not None:
+            files["gamepad.log"] = text
+        text = _tail(os.path.join(logs, "controller.txt"), 4 * max_bytes)
+        if text:
+            keep = [ln for ln in text.splitlines() if re.search(
+                r"Queueing activation|warmed config|Opted-in Controller|Loaded Config|virtual gamepad|xinput slot", ln)]
+            files["steam-controller.txt"] = "\n".join(keep[-400:]) + "\n"
+    text = _tail(os.path.join(logs, f"lepton-steamlaunch-{appid}.log"), max_bytes)  # Lepton's launcher log
+    if text is not None:
+        files[f"lepton-steamlaunch-{appid}.log"] = text
+    logcats = os.path.join(logs, "lepton-logcats")
+    # the container's logcat buffers: lepton-logcats/steamlaunch-<appid>/logcat-{main,crash,system,kernel,radio}.log
+    order = ("main", "crash", "system", "kernel", "radio")
+    cands = [p for p in glob.glob(os.path.join(logcats, f"steamlaunch-{appid}", "*")) if os.path.isfile(p)]
+    for p in sorted(cands, key=lambda p: next((i for i, k in enumerate(order) if k in os.path.basename(p)), 9)):
+        name = os.path.basename(p)
+        files[name if name.startswith("logcat") else "logcat-" + name] = _tail(p, max_bytes)
+    if dep.get("kind", "quest") == "quest":
+        try:
+            threads = game_threads(pkg, samples=int(args.get("thread_samples", 3)))
+        except OSError:
+            threads = None
+        if threads:
+            files["threads.txt"] = threads
+    shaders = shader_dumps(data_files_dir(base, pkg), int(args.get("shader_bytes", SHADER_DUMP_BYTES)),
+                           int(args.get("shader_session_bytes", SHADER_SESSION_BYTES)))
+    if shaders:
+        out["shaders"] = shaders
+    try:
+        listing = cmd_list_files({"package": pkg, "limit": 20000})
+        out["listing"] = {"missing": listing["missing"], "truncated": listing["truncated"],
+                          "roots": [{"name": r["name"], "files": r["files"]} for r in listing["roots"]]}
+    except AgentError:
+        pass
+    return out
+
+
+AGENT_HOME = os.path.join(HOME, ".local/share/frameport")
+
+
+def cmd_purge(args):
+    """Remove everything FramePort put on this Frame: its games (keep_saves: leave Quest save data and PC VR Proton
+    prefixes), their Steam shortcuts + grid art, ~/Applications/quest-frame, and ~/.local/share/frameport (this agent,
+    Proton self-test prefix, timefix layer). Runs detached (Steam is closed while shortcuts.vdf changes); poll
+    purge_status. Proton/Lepton stay installed (they're Steam apps) and the podman keyring fix stays (harmless)."""
+    games = cmd_list_installed({})["games"]
+    if any((pcvr_pids(d["base"]) if d.get("kind") in ("pcvr", "linux") else container_running(d["appid"]))
+           for d in games):
+        raise AgentError("a FramePort game is running on the Frame; close it first")
+    status = os.path.join(HOME, ".cache/frameport-purge.json")
+    os.makedirs(os.path.dirname(status), exist_ok=True)
+    with open(status, "w") as f:
+        json.dump({"state": "running", "started": time.time()}, f)
+    payload = json.dumps({"keep_saves": bool(args.get("keep_saves", True)), "status": status})
+    run(["systemd-run", "--user", "--collect", "--quiet", f"--unit=frameport-purge-{int(time.time())}",
+         "--setenv=HOME=" + HOME, sys.executable, os.path.abspath(__file__), "_purge_worker", payload])
+    return {"started": True, "games": len(games), "status": status}
+
+
+def purge_worker(payload):
+    args = json.loads(payload)
+    keep = args["keep_saves"]
+    result = {"state": "done", "removed": [], "kept": [], "errors": []}
+    service = True
+    try:
+        games = cmd_list_installed({})["games"]
+        users = steam_users()
+        for d in games:  # SteamVR overlay apps: SteamVR forgets their manifests (while it still runs)
+            if is_overlay(d) or os.path.exists(os.path.join(ANCHORS, d["package"], OVERLAY_MANIFEST)):
+                try:
+                    unregister_overlay(d["package"])
+                    result["removed"].append(f"SteamVR overlay: {d.get('title')}")
+                except Exception as exc:  # noqa: BLE001
+                    result["errors"].append(f"{d.get('title')}: {exc}")
+        try:  # the overlay autostart service runs this agent: it goes before AGENT_HOME does
+            if os.path.exists(VR_OVERLAY_UNIT_PATH):
+                user_systemctl("disable", "--now", VR_OVERLAY_UNIT + ".service")
+                os.remove(VR_OVERLAY_UNIT_PATH)
+                user_systemctl("daemon-reload")
+                result["removed"].append(VR_OVERLAY_UNIT_PATH)
+        except Exception as exc:  # noqa: BLE001
+            result["errors"].append(f"overlay autostart service: {exc}")
+        try:
+            if theater_settle(force=True):
+                result["removed"].append("SteamVR theater mode hold")
+        except Exception as exc:  # noqa: BLE001
+            result["errors"].append(f"SteamVR theater mode: {exc}")
+        try:
+            if remove_library_hooks():
+                result["removed"].append(LIBRARY_HOOK)
+        except Exception as exc:  # noqa: BLE001
+            result["errors"].append(f"Steam library hook: {exc}")
+        try:
+            service = stop_steam()
+        except AgentError as exc:
+            result["errors"].append(str(exc))
+            service = True
+        for d in games:  # devkit fallback entries (Steam is closed: removed from shortcuts.vdf)
+            try:
+                if devkit_unregister(d["package"], steam_running=False):
+                    result["removed"].append(f"Steam devkit entry: {d.get('title')}")
+            except Exception as exc:  # noqa: BLE001
+                result["errors"].append(f"{d.get('title')}: {exc}")
+        for u in users:
+            vdf = os.path.join(STEAM, "userdata", u, "config/shortcuts.vdf")
+            grid = os.path.join(STEAM, "userdata", u, "config/grid")
+            for d in games:
+                try:
+                    if remove_shortcut(vdf, f'"{os.path.join(ANCHORS, d["package"])}/launch.sh"'):
+                        result["removed"].append(f"Steam shortcut: {d.get('title')}")
+                    for art in grid_files(grid, d["appid"]):
+                        os.remove(art)
+                except Exception as exc:  # noqa: BLE001
+                    result["errors"].append(f"{d.get('title')}: {exc}")
+            try:  # shortcuts left from games without an install record (older versions, interrupted removals)
+                root = vdf_decode(open(vdf, "rb").read()) if os.path.exists(vdf) else {}
+                for sc in list(root.get("shortcuts", {}).values()):
+                    exe = sc.get("Exe", "") if isinstance(sc, dict) else ""
+                    if exe.startswith(f'"{ANCHORS}/') and remove_shortcut(vdf, exe):
+                        result["removed"].append(f"Steam shortcut: {sc.get('AppName') or sc.get('appname')}")
+                        for art in grid_files(grid, sc.get("appid", 0) & 0xFFFFFFFF):
+                            os.remove(art)
+            except Exception as exc:  # noqa: BLE001
+                result["errors"].append(f"shortcuts: {exc}")
+        for d in games:
+            base = d["base"]
+            saves = [os.path.join(base, n) for n in ("lepton-data", "compatdata")]
+            if keep and any(os.path.exists(p) for p in saves):
+                for name in os.listdir(base) if os.path.isdir(base) else []:
+                    p = os.path.join(base, name)
+                    if p not in saves:
+                        remove_tree(p)
+                result["kept"].append(base)
+            else:
+                remove_tree(base)
+            if not keep and os.path.lexists(base):
+                result["errors"].append(f"couldn't remove {base}")
+            result["removed"].append(d.get("title") or d["package"])
+        for path in remove_desktop_entries():  # Linux apps' Desktop Mode entries
+            result["removed"].append(path)
+        for d in games:  # <drive>/FramePort folders left empty
+            if remove_empty_drive_dir(d["base"]):
+                result["removed"].append(os.path.dirname(d["base"].rstrip("/")))
+        if not keep or not result["kept"]:
+            remove_tree(ANCHORS)
+        else:  # anchors hold only launchers/artwork; saves live in the bases
+            for d in games:
+                anchor = os.path.join(ANCHORS, d["package"])
+                if os.path.realpath(anchor) not in [os.path.realpath(k) for k in result["kept"]]:
+                    remove_tree(anchor)
+        remove_tree(AGENT_HOME)
+        result["removed"].append(AGENT_HOME)
+        if os.path.exists(XR_LAYER_MANIFEST):
+            os.remove(XR_LAYER_MANIFEST)
+            result["removed"].append(XR_LAYER_MANIFEST)
+        for name in ("frameport-setup.sh", "frameport-setup.log"):  # left by bootstrap.sh
+            p = os.path.join(HOME, ".cache", name)
+            if os.path.exists(p):
+                os.remove(p)
+                result["removed"].append(p)
+    except Exception as exc:  # noqa: BLE001
+        result["state"] = "failed"
+        result["errors"].append(str(exc))
+    finally:
+        start_steam(service)
+    result["finished"] = time.time()
+    with open(args["status"], "w") as f:
+        json.dump(result, f)
+
+
+def cmd_purge_status(args):
+    try:
+        return json.load(open(os.path.join(HOME, ".cache/frameport-purge.json")))
+    except (OSError, ValueError):
+        return {"state": "none"}
+
+
+def cmd_cleanup(args):
+    """Remove rollback copies (previous-game.apk, settings.conf.previous) and leftover uploads; optional extra paths
+    under HOME (e.g. an old manual-install folder). Saves and installed games are never touched."""
+    freed, removed = 0, []
+    for dep in cmd_list_installed({})["games"]:
+        base = dep["base"]
+        for name in (["previous-game.apk", "settings.conf.previous"] if args.get("rollback", True) else []) + \
+                ["incoming", "incoming-artwork"]:
+            p = os.path.join(base, name)
+            if os.path.isdir(p):
+                freed += sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(p) for f in fs)
+                remove_tree(p)
+                removed.append(p)
+            elif os.path.exists(p):
+                freed += os.path.getsize(p)
+                os.remove(p)
+                removed.append(p)
+    bases = [d["base"] for d in cmd_list_installed({})["games"]]
+    drive_dirs = [d["install_dir"] for d in list_drives() if not d["internal"]]
+    for extra in args.get("paths", []):
+        p = os.path.realpath(os.path.expanduser(extra))
+        first = os.path.relpath(p, HOME).split(os.sep)[0] if p.startswith(HOME + os.sep) else ""
+        # inside a drive's FramePort folder (leftovers of games on a microSD), never an installed game's files
+        on_drive = any(p != os.path.realpath(d) and _inside(p, os.path.realpath(d)) for d in drive_dirs) \
+            and not any(_inside(p, os.path.realpath(b)) or _inside(os.path.realpath(b), p) for b in bases)
+        if not on_drive and (not first or first.startswith(".") or p == ANCHORS or p.startswith(ANCHORS + os.sep)):
+            # only ordinary folders in the home folder: never dot folders (.ssh, .steam, .local, .config…)
+            raise AgentError(f"refusing to remove {extra}")
+        if os.path.exists(p):
+            freed += (sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(p) for f in fs)
+                      if os.path.isdir(p) else os.path.getsize(p))
+            remove_tree(p)
+            removed.append(p)
+    return {"removed": removed, "freed_bytes": freed}
+
+
+# ------------------------------------------------------------------------------------------ virtual keyboard
+# "Type on Frame": the PC's key presses become a real keyboard on the Frame (Linux uinput; the steamos user may open
+# /dev/uinput, an ACL entry made for Steam Input, no root). A real input device reaches everything that has focus:
+# Android windows (Lepton's wayland_keyboard), the Steam UI, the desktop, Proton games.
+UINPUT = "/dev/uinput"
+UI_SET_EVBIT, UI_SET_KEYBIT, UI_DEV_SETUP, UI_DEV_CREATE, UI_DEV_DESTROY = (0x40045564, 0x40045565, 0x405C5503,
+                                                                         0x5501, 0x5502)
+EV_SYN, EV_KEY, SYN_REPORT = 0, 1, 0
+KEY_LAST = 248  # KEY_ESC (1) .. KEY_MICMUTE (248): every key a PC keyboard sends
+KEY_LEFTSHIFT = 42
+
+
+def text_keys():
+    """US layout: character -> (Linux key code, shift)."""
+    keys = {"\n": (28, False), "\t": (15, False), " ": (57, False), "\b": (14, False)}
+    for plain, shifted, first in (("1234567890-=", "!@#$%^&*()_+", 2), ("qwertyuiop[]", "QWERTYUIOP{}", 16),
+                                  ("asdfghjkl;'`", 'ASDFGHJKL:"~', 30), ("\\zxcvbnm,./", "|ZXCVBNM<>?", 43)):
+        for i, (a, b) in enumerate(zip(plain, shifted, strict=True)):
+            keys[a] = (first + i, False)
+            keys[b] = (first + i, True)
+    return keys
+
+
+TEXT_KEYS = text_keys()
+# OS key repeat starts 0.25-1 s after a press (Windows/macOS/GNOME settings) and then comes 2.5-30 times a second
+KEY_HOLD_TIMEOUT, KEY_REPEAT_TIMEOUT = 1.5, 0.6
+MODIFIER_KEYS = {29, 97, 42, 54, 56, 100, 125, 126, 58, 69, 70}  # Ctrl, Shift, Alt, Meta, Caps/Num/Scroll Lock
+
+
+class VirtualKeyboard:
+    """A uinput keyboard. `fd`/`write` can be replaced in tests; the device goes away with close()."""
+
+    def __init__(self, fd=None, write=os.write, settle=0.8):
+        self.write, self.held = write, set()
+        self.seen = {}  # held key -> (time of its last down/repeat, value)
+        self.fd = fd
+        if fd is None:
+            self.fd = os.open(UINPUT, os.O_WRONLY | os.O_NONBLOCK)
+            fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
+            for code in range(1, KEY_LAST + 1):
+                fcntl.ioctl(self.fd, UI_SET_KEYBIT, code)
+            fcntl.ioctl(self.fd, UI_DEV_SETUP, struct.pack("HHHH80sI", 0x03, 0x1209, 0x4650, 1,
+                                                            b"FramePort keyboard", 0))
+            fcntl.ioctl(self.fd, UI_DEV_CREATE)
+            time.sleep(settle)  # let gamescope/libinput pick the new keyboard up before the first key
+
+    def _event(self, kind, code, value):
+        self.write(self.fd, struct.pack("llHHi", 0, 0, kind, code, value))
+
+    def key(self, code, value):
+        """value 1 = down, 0 = up, 2 = autorepeat."""
+        if not 0 < int(code) <= KEY_LAST or value not in (0, 1, 2):
+            return
+        self._event(EV_KEY, int(code), value)
+        self._event(EV_SYN, SYN_REPORT, 0)
+        (self.held.add if value else self.held.discard)(int(code))
+        if value:
+            self.seen[int(code)] = (time.monotonic(), value)
+        else:
+            self.seen.pop(int(code), None)
+
+    def release_stale(self, now=None, hold=KEY_HOLD_TIMEOUT, repeat=KEY_REPEAT_TIMEOUT):
+        """Release held keys the PC stopped refreshing: while a key is held the PC sends its OS key repeats, so a key
+        with no repeat or release for a while lost its release on the way, and the Frame would repeat it without end
+        (GitHub #411: one Up ran through a terminal's whole history). Modifiers repeat nothing and stay held."""
+        now = time.monotonic() if now is None else now
+        stale = [code for code, (t, value) in self.seen.items() if code not in MODIFIER_KEYS
+                 and now - t > (repeat if value == 2 else hold)]
+        for code in stale:
+            self.key(code, 0)
+        return stale
+
+    def type_text(self, text, delay=0.008):
+        """Type characters of the US layout; returns the characters it couldn't type."""
+        skipped = ""
+        for ch in text.replace("\r\n", "\n"):
+            if ch not in TEXT_KEYS:
+                skipped += ch
+                continue
+            code, shift = TEXT_KEYS[ch]
+            if shift:
+                self.key(KEY_LEFTSHIFT, 1)
+            self.key(code, 1)
+            self.key(code, 0)
+            if shift:
+                self.key(KEY_LEFTSHIFT, 0)
+            time.sleep(delay)
+        return skipped
+
+    def close(self):
+        for code in list(self.held):  # never leave a key stuck when the PC goes away mid-press
+            self.key(code, 0)
+        if self.fd is not None and isinstance(self.fd, int):
+            try:
+                fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+            except OSError:
+                pass
+            os.close(self.fd)
+        self.fd = None
+
+
+def x_clipboard_text(display, timeout=1.5):
+    """The X11 CLIPBOARD of `display` as text (UTF8_STRING), with libX11 through ctypes (the Frame has no xclip or
+    wl-paste). (text, None) or (None, reason); "" = nothing copied."""
+    import ctypes
+    import ctypes.util
+
+    try:
+        x = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+    except OSError as exc:
+        return None, f"no libX11: {exc}"
+    x.XOpenDisplay.restype = ctypes.c_void_p
+    x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    d = x.XOpenDisplay(display.encode())
+    if not d:
+        return None, "can't open the display"
+    x.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    try:
+        x.XInternAtom.restype = ctypes.c_ulong
+        x.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        clipboard, utf8, prop = (x.XInternAtom(d, n, 0) for n in (b"CLIPBOARD", b"UTF8_STRING", b"FRAMEPORT_CLIP"))
+        x.XGetSelectionOwner.restype = ctypes.c_ulong
+        x.XGetSelectionOwner.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        if not x.XGetSelectionOwner(d, clipboard):
+            return "", None
+        x.XDefaultRootWindow.restype = ctypes.c_ulong
+        x.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        x.XCreateSimpleWindow.restype = ctypes.c_ulong
+        x.XCreateSimpleWindow.argtypes = ([ctypes.c_void_p, ctypes.c_ulong] + [ctypes.c_int] * 2 + [ctypes.c_uint] * 3
+                                          + [ctypes.c_ulong] * 2)
+        w = x.XCreateSimpleWindow(d, x.XDefaultRootWindow(d), 0, 0, 1, 1, 0, 0, 0)
+        x.XConvertSelection.argtypes = [ctypes.c_void_p] + [ctypes.c_ulong] * 5
+        x.XConvertSelection(d, clipboard, utf8, prop, w, 0)
+        x.XFlush.argtypes = [ctypes.c_void_p]
+        x.XFlush(d)
+        event = (ctypes.c_long * 24)()
+        x.XCheckTypedWindowEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_void_p]
+        end = time.time() + timeout
+        while not x.XCheckTypedWindowEvent(d, w, 31, event):  # SelectionNotify
+            if time.time() > end:
+                return None, "the app that copied didn't answer"
+            time.sleep(0.02)
+        kind, fmt, n, after, data = ctypes.c_ulong(), ctypes.c_int(), ctypes.c_ulong(), ctypes.c_ulong(), \
+            ctypes.c_void_p()
+        x.XGetWindowProperty.argtypes = ([ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long,
+                                          ctypes.c_long, ctypes.c_int, ctypes.c_ulong] + [ctypes.c_void_p] * 5)
+        x.XGetWindowProperty(d, w, prop, 0, 1 << 20, 1, 0, ctypes.byref(kind), ctypes.byref(fmt), ctypes.byref(n),
+                             ctypes.byref(after), ctypes.byref(data))
+        text = ctypes.string_at(data, n.value).decode("utf-8", "replace") if data and n.value else ""
+        if data:
+            x.XFree.argtypes = [ctypes.c_void_p]
+            x.XFree(data)
+        return text, None
+    finally:
+        x.XCloseDisplay(d)
+
+
+def cmd_clipboard_get(args):
+    """The Frame's clipboard as text, for "Copy from Frame" (GitHub #413): Desktop Mode's Plasma clipboard (Klipper
+    over its own D-Bus), else the X clipboards of gamescope's Xwayland displays. Android apps in Lepton have no
+    clipboard service, so text copied inside them never gets here."""
+    for pid in run(["pgrep", "-x", "plasmashell"]).stdout.split():
+        try:
+            raw = open(f"/proc/{pid}/environ", "rb").read().split(b"\0")
+        except OSError:
+            continue
+        env = dict(kv.decode(errors="replace").split("=", 1) for kv in raw if b"=" in kv)
+        if env.get("DBUS_SESSION_BUS_ADDRESS") and shutil.which("qdbus6"):
+            try:
+                p = subprocess.run(["qdbus6", "org.kde.klipper", "/klipper", "getClipboardContents"],
+                                   capture_output=True, text=True, timeout=5,
+                                   env=dict(os.environ, DBUS_SESSION_BUS_ADDRESS=env["DBUS_SESSION_BUS_ADDRESS"]))
+            except (OSError, subprocess.SubprocessError):
+                p = None
+            if p is not None and p.returncode == 0 and p.stdout.strip("\n"):
+                return {"text": p.stdout[:-1] if p.stdout.endswith("\n") else p.stdout, "source": "desktop"}
+    displays = [session_env().get("DISPLAY")] + sorted(
+        ":" + n[1:] for n in (os.listdir("/tmp/.X11-unix") if os.path.isdir("/tmp/.X11-unix") else [])
+        if re.fullmatch(r"X\d+", n))
+    reasons = []
+    for display in dict.fromkeys(d for d in displays if d):
+        text, reason = x_clipboard_text(display)
+        if text:
+            return {"text": text, "source": display}
+        if reason:
+            reasons.append(f"{display}: {reason}")
+    return {"text": "", "source": None, "reasons": reasons}
+
+
+def keyboard_session(stdin, stdout, keyboard=None):
+    """Long-lived: prints {"ready": true} once the virtual keyboard exists, then reads one JSON object per line:
+    {"k": code, "v": 1|0|2} (key down/up/repeat) or {"text": "..."}; ends (keyboard removed) at EOF."""
+    try:
+        kb = keyboard or VirtualKeyboard()
+    except OSError as exc:
+        stdout.write(json.dumps({"ready": False, "error": f"can't create a virtual keyboard: {exc}"}) + "\n")
+        stdout.flush()
+        return 1
+    stdout.write(json.dumps({"ready": True}) + "\n")
+    stdout.flush()
+
+    def handle(line):
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            return
+        if "k" in msg:
+            kb.key(msg["k"], msg.get("v", 1))
+        elif "text" in msg:
+            skipped = kb.type_text(str(msg["text"]))
+            stdout.write(json.dumps({"typed": True, "skipped": skipped}) + "\n")
+            stdout.flush()
+    try:
+        try:
+            fd = stdin.fileno()
+        except (AttributeError, OSError, ValueError):  # tests: a StringIO
+            fd = None
+        if fd is None:
+            for line in stdin:
+                handle(line)
+        else:  # a real pipe: wake up between lines too, to release keys whose release never came (GitHub #411)
+            buf = b""
+            while True:
+                ready, _, _ = select.select([fd], [], [], 0.1)
+                if ready:
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        handle(line.decode("utf-8", "replace"))
+                kb.release_stale()
+    except (OSError, ValueError):
+        pass
+    finally:
+        kb.close()
+    return 0
+
+
+def steam_js(expression, timeout=5):
+    """Evaluate JavaScript in Steam's UI (SharedJSContext) through its CEF devtools port (127.0.0.1:8080, SteamOS
+    starts Steam with -cef-enable-debugging); returns the value. A minimal websocket client (stdlib only)."""
+    import base64
+    import socket
+    import urllib.request
+
+    targets = json.load(urllib.request.urlopen("http://127.0.0.1:8080/json", timeout=timeout))
+    url = next(t["webSocketDebuggerUrl"] for t in targets if t.get("title") == "SharedJSContext")
+    path = url.split("127.0.0.1:8080", 1)[1]
+    with socket.create_connection(("127.0.0.1", 8080), timeout=timeout) as sock:
+        key = base64.b64encode(os.urandom(16)).decode()
+        sock.sendall((f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nUpgrade: websocket\r\n"
+                      f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = sock.recv(1)
+            if not chunk:
+                raise AgentError("Steam's devtools closed the connection")
+            head += chunk
+        data = json.dumps({"id": 1, "method": "Runtime.evaluate",
+                           "params": {"expression": expression, "awaitPromise": True,
+                                      "returnByValue": True}}).encode()
+        mask, n = os.urandom(4), len(data)
+        size = bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack(">H", n)
+        sock.sendall(b"\x81" + size + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+        def exact(k):
+            buf = b""
+            while len(buf) < k:
+                chunk = sock.recv(k - len(buf))
+                if not chunk:
+                    raise AgentError("Steam's devtools closed the connection")
+                buf += chunk
+            return buf
+        while True:
+            _b1, b2 = exact(2)
+            k = b2 & 0x7F
+            k = struct.unpack(">H", exact(2))[0] if k == 126 else struct.unpack(">Q", exact(8))[0] if k == 127 else k
+            msg = json.loads(exact(k).decode("utf-8", "replace") or "{}")
+            if msg.get("id") == 1:
+                res = (msg.get("result") or {}).get("result") or {}
+                return res.get("value")
+
+
+class SteamDevtools:
+    """A held connection to Steam's UI (SharedJSContext) through its CEF devtools port, like steam_js: calls with
+    their replies, and the events that come in between (Runtime.bindingCalled) kept until asked for."""
+
+    def __init__(self, title="SharedJSContext", timeout=5, port=8080):
+        import socket
+        import urllib.request
+
+        targets = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=timeout))
+        try:
+            url = next(t["webSocketDebuggerUrl"] for t in targets if t.get("title") == title)
+        except StopIteration:
+            raise AgentError(f"Steam's UI has no {title}") from None
+        path = url.split(f"127.0.0.1:{port}", 1)[1]
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        self.timeout, self.next_id, self.events = timeout, 0, []
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n"
+                           f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+                          .encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            head += self._exact(1)
+        if b" 101 " not in head.split(b"\r\n", 1)[0]:
+            self.close()
+            raise AgentError("Steam's devtools refused the connection")
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def _exact(self, k):
+        buf = b""
+        while len(buf) < k:
+            chunk = self.sock.recv(k - len(buf))
+            if not chunk:
+                raise AgentError("Steam's devtools closed the connection")
+            buf += chunk
+        return buf
+
+    def _frame(self, opcode, data):
+        mask, n = os.urandom(4), len(data)
+        size = (bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack(">H", n) if n < 65536
+                else bytes([0x80 | 127]) + struct.pack(">Q", n))
+        self.sock.sendall(bytes([0x80 | opcode]) + size + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def _recv(self, timeout):
+        """The next message, or None when nothing came within `timeout` s (a frame is only read once it has begun to
+        arrive, so a timeout never leaves half a frame behind)."""
+        while True:
+            if not select.select([self.sock], [], [], max(0.0, timeout))[0]:
+                return None
+            b1, b2 = self._exact(2)
+            k = b2 & 0x7F
+            k = struct.unpack(">H", self._exact(2))[0] if k == 126 else \
+                struct.unpack(">Q", self._exact(8))[0] if k == 127 else k
+            data = self._exact(k)
+            op = b1 & 0x0F
+            if op == 8:
+                raise AgentError("Steam's devtools closed the connection")
+            if op == 9:
+                self._frame(10, data)
+                continue
+            if op in (1, 2, 0):
+                return json.loads(data.decode("utf-8", "replace") or "{}")
+
+    def call(self, method, params=None, timeout=None):
+        self.next_id += 1
+        mid = self.next_id
+        self._frame(1, json.dumps({"id": mid, "method": method, "params": params or {}}).encode())
+        end = time.monotonic() + (timeout or self.timeout)
+        while True:
+            left = end - time.monotonic()
+            msg = self._recv(left) if left > 0 else None
+            if msg is None:
+                raise AgentError(f"Steam's devtools didn't answer {method}")
+            if msg.get("id") == mid:
+                if msg.get("error"):
+                    raise AgentError(f"{method}: {msg['error'].get('message')}")
+                return msg.get("result") or {}
+            if "method" in msg:
+                self.events.append(msg)
+
+    def evaluate(self, expression, timeout=None):
+        res = self.call("Runtime.evaluate", {"expression": expression, "returnByValue": True}, timeout)
+        if res.get("exceptionDetails"):
+            raise AgentError("Steam's UI: " + str((res["exceptionDetails"].get("exception") or {})
+                                                  .get("description") or res["exceptionDetails"].get("text")))
+        return (res.get("result") or {}).get("value")
+
+    def event(self, method, timeout):
+        """The next event `method` (its params), or None after `timeout` s. Other events are dropped."""
+        end = time.monotonic() + timeout
+        while True:
+            while self.events:
+                msg = self.events.pop(0)
+                if msg.get("method") == method:
+                    return msg.get("params") or {}
+            left = end - time.monotonic()
+            if left <= 0:
+                return None
+            msg = self._recv(left)
+            if msg is None:
+                return None
+            if "method" in msg:
+                self.events.append(msg)
+
+
+# GitHub #480: Steam's own Exit game (the in-headset menu, the Quick Access menu, "exit the running game?" dialogs:
+# all `SteamClient.Apps.TerminateApp(gameid, false)` in Steam's UI, SharedJSContext; the menus are popups whose code
+# runs there) signals the game's whole process tree at once, Android's system_server included, so the launcher's
+# pause_game comes too late. While a FramePort game runs, its launcher's _exit_hook worker keeps a hook on
+# TerminateApp in Steam's UI (EXIT_HOOK_JS, re-applied every EXIT_HOOK_REFRESH s: Steam's UI reloads and restarts
+# lose it) and a devtools binding of its own: Exit game for that game's id calls the binding, the worker pauses the
+# game (pause_app) and answers, and only then does the hook call Steam's TerminateApp. Every other id (Steam games,
+# other shortcuts) goes straight through. Exit game is never held longer than EXIT_HOOK_CAP_MS, nor longer than
+# EXIT_HOOK_ACK_MS when the worker doesn't answer at once (gone, hung), and not at all when the worker's
+# registration is older than its lease (it renews it at every refresh).
+EXIT_HOOK_CAP_MS = 3000
+EXIT_HOOK_ACK_MS = 800
+EXIT_HOOK_REFRESH = 2.0
+EXIT_HOOK_LEASE_MS = 10000
+EXIT_HOOK_PAUSE_LIMIT = 2.7  # the worker's pause_app, inside the hook's cap
+EXIT_HOOK_JS = r"""(function (games, binding, cap, ack, lease) {
+  if (typeof SteamClient === 'undefined' || !SteamClient.Apps || typeof SteamClient.Apps.TerminateApp !== 'function')
+    return 'no SteamClient';
+  var A = SteamClient.Apps, H = window.__fpExit, out = 'ok';
+  if (H && A.TerminateApp !== H.hook) return 'TerminateApp was replaced by another script';
+  if (!H) {
+    H = window.__fpExit = {v: 1, orig: A.TerminateApp, games: {}, pending: {}, log: []};
+    H.unhooked = function () { return H.orig.apply(A, arguments); };
+    H.hook = function (gameid) {
+      var args = arguments, gid = String(gameid), g = H.games[gid], t0 = Date.now();
+      var fn = g && window[g.binding];
+      if (!g || t0 - g.seen > g.lease || typeof fn !== 'function') {
+        H.log.push([gid, 'passed', 0]); if (H.log.length > 20) H.log.shift();
+        return H.orig.apply(A, args);
+      }
+      if (H.pending[gid]) return;
+      var finished = false, p = {}, waitAck, waitCap;
+      p.finish = function (why) {
+        if (finished) return false;
+        finished = true; clearTimeout(waitAck); clearTimeout(waitCap); delete H.pending[gid];
+        H.log.push([gid, why, Date.now() - t0]); if (H.log.length > 20) H.log.shift();
+        try { H.orig.apply(A, args); } catch (e) {}
+        return true;
+      };
+      p.ack = function () { clearTimeout(waitAck); return !finished; };
+      H.pending[gid] = p;
+      waitAck = setTimeout(function () { p.finish('no answer'); }, g.ack);
+      waitCap = setTimeout(function () { p.finish('cap'); }, g.cap);
+      try { fn(JSON.stringify({gameid: gid})); } catch (e) { p.finish('binding failed'); }
+    };
+    A.TerminateApp = H.hook;
+    out = 'installed';
+  }
+  games.forEach(function (gid) {
+    var g = H.games[gid];
+    if (out === 'ok' && (!g || g.binding !== binding)) out = 'registered';
+    H.games[gid] = {binding: binding, cap: cap, ack: ack, lease: lease, seen: Date.now()};
+  });
+  return out;
+})(%s)"""
+EXIT_HOOK_UNREGISTER_JS = r"""(function (games, binding) {
+  var H = window.__fpExit;
+  if (!H) return 0;
+  var n = 0;
+  games.forEach(function (gid) { if (H.games[gid] && H.games[gid].binding === binding) { delete H.games[gid]; n++; } });
+  return n;
+})(%s)"""
+EXIT_HOOK_ACK_JS = "(function (g) { var p = window.__fpExit && __fpExit.pending[g]; return p ? p.ack() : false; })(%s)"
+EXIT_HOOK_DONE_JS = ("(function (g, why) { var p = window.__fpExit && __fpExit.pending[g]; "
+                     "return p ? p.finish(why) : false; })(%s)")
+
+
+def exit_hook_js(template, *args):
+    return template % ", ".join(json.dumps(a) for a in args)
+
+
+def terminate_app_js(gameid):
+    """Steam's Exit game for `gameid`, past FramePort's hook (the caller has paused the game already)."""
+    gid = json.dumps(str(gameid))
+    return (f"(window.__fpExit ? __fpExit.unhooked : SteamClient.Apps.TerminateApp.bind(SteamClient.Apps))"
+            f"({gid}, false)")
+
+
+def exit_gameids(pkg, appid, env=None):
+    """The Steam game ids Exit game uses for this FramePort game: its shortcut, its devkit entry (if any), and the
+    id Steam started this launcher with (SteamGameId)."""
+    ids = []
+    for a in (appid, (devkit_appid(devkit_gameid(pkg)) if devkit_gameid(pkg) else None)):
+        try:
+            if a and int(a) > 0:
+                ids.append(str(steam_gameid(int(a))))
+        except (TypeError, ValueError):
+            pass
+    sgid = (env if env is not None else os.environ).get("SteamGameId", "")
+    if sgid.isdigit() and int(sgid) > 0xFFFFFFFF:
+        ids.append(sgid)
+    return sorted(set(ids))
+
+
+def exit_hook_worker(pkg, appid, parent, devtools=None, pause=None, sleep=time.sleep, refresh=EXIT_HOOK_REFRESH,
+                     clock=time.monotonic, max_rounds=None):
+    """Keep Steam's Exit game for this game pausing it first (EXIT_HOOK_JS) while the launcher `parent` runs. Every
+    step is printed (the launcher sends it to exit-hook.log). Steam's UI unreachable: tried again every few s."""
+    pkg = check_pkg(pkg)
+    os.environ.pop("LD_PRELOAD", None)  # Steam's overlay libraries only add ld.so errors to podman's output
+    devtools = devtools or SteamDevtools
+    pause = pause or (lambda: pause_app(appid, pkg, limit=EXIT_HOOK_PAUSE_LIMIT))
+    binding = f"fpExitPause{os.getpid()}"
+    games = exit_gameids(pkg, appid)
+
+    def say(text):
+        print(f"{time.strftime('%H:%M:%S')} {text}", flush=True)
+
+    def alive():
+        try:
+            os.kill(int(parent), 0)
+        except (OSError, ValueError):
+            return False
+        try:  # an ended launcher its parent hasn't reaped yet
+            return _rd(f"{PROC}/{int(parent)}/stat").rsplit(")", 1)[-1].split()[:1] != ["Z"]
+        except (OSError, ValueError):
+            return True
+    say(f"exit hook for {pkg}: game ids {', '.join(games)}")
+    rounds, last, dt = 0, None, None
+    try:
+        while alive() and (max_rounds is None or rounds < max_rounds):
+            rounds += 1
+            try:
+                if dt is None:
+                    dt = devtools()
+                    dt.call("Runtime.addBinding", {"name": binding})
+                    last = None
+                state = dt.evaluate(exit_hook_js(EXIT_HOOK_JS, games, binding, EXIT_HOOK_CAP_MS, EXIT_HOOK_ACK_MS,
+                                                 EXIT_HOOK_LEASE_MS))
+                if state != "ok" or last is None:
+                    say(f"Steam's UI: {state}")
+                last = state
+                until = clock() + refresh
+                while alive() and clock() < until:
+                    ev = dt.event("Runtime.bindingCalled", max(0.05, until - clock()))
+                    if not ev or ev.get("name") != binding:
+                        continue
+                    try:
+                        gid = str(json.loads(ev.get("payload") or "{}").get("gameid"))
+                    except ValueError:
+                        continue
+                    t0 = clock()
+                    if not dt.evaluate(exit_hook_js(EXIT_HOOK_ACK_JS, gid)):
+                        say(f"Exit game {gid}: already ended by the hook's own deadline")
+                        continue
+                    say(f"Exit game {gid}: pausing the game first")
+                    result = pause()
+                    done = dt.evaluate(exit_hook_js(EXIT_HOOK_DONE_JS, gid, "paused"))
+                    say(f"paused ({result or 'no answer from the container'}) in {clock() - t0:.2f} s; "
+                        f"{'Steam ends it now' if done else 'Steam had ended it already (deadline)'}")
+            except Exception as exc:  # noqa: BLE001  (Steam restarting, UI reloading: try again)
+                if dt is not None:
+                    dt.close()
+                    dt = None
+                if last != "error":
+                    say(f"Steam's UI unreachable: {exc}")
+                last = "error"
+                sleep(3)
+    finally:
+        if dt is not None:
+            try:
+                dt.evaluate(exit_hook_js(EXIT_HOOK_UNREGISTER_JS, games, binding), timeout=2)
+            except Exception:  # noqa: BLE001
+                pass
+            dt.close()
+    return rounds
+
+
+FIRST_FRAME_MARKERS = (b"FrameBridge: new layer:", b"FrameBridge: pacing:")
+# SteamVR's dashboard UI logs a dashboard opened with the controller's button as "[ToggleDashboard]
+# toggle_dashboard_action" (SteamOS 0.4) or "[ShowDashboardOverlay] {"sReason":"open_dashboard_action"" (0.5.6: the
+# worker closed every press again, AC Nexus 2026-10-23); Steam's own start-up menu comes without either
+# (onShowOverlayRequestFromSteam / frame menu / SetDockLocation)
+USER_DASHBOARD_MARKERS = (b"toggle_dashboard_action", b"open_dashboard_action")
+
+
+def user_opened_dashboard(log, pos):
+    """(opened, new position): whether the player opened the dashboard (controller button) since `pos` in SteamVR's
+    vrwebhelper_systemui.txt. A missing log answers no (the worker then behaves as before)."""
+    try:
+        with open(log, "rb") as f:
+            f.seek(0, 2)
+            end = f.tell()
+            if pos is None or pos > end:  # first look, or the log was rotated: only what comes from now on
+                return False, end
+            f.seek(pos)
+            text = f.read()
+            return any(m in text for m in USER_DASHBOARD_MARKERS), end
+    except OSError:
+        return False, pos
+
+
+LOGCAT_EOF = "logcat: Unexpected EOF"
+# Lepton's mirror fails in more ways than one: it ends ("Unexpected EOF"), can't read ("Logcat read failure"), or
+# prints nothing at all after "Waiting for app" (seen on a first start after an APK change, 2026-10-14)
+LOGCAT_FAILURES = (LOGCAT_EOF, "logcat: Logcat read failure")
+LOGCAT_ROW = re.compile(r"\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} +\d+ +\d+ [VDIWEF] ")  # a logcat -v threadtime line
+LEPTON_ROW = re.compile(r"\x1b\[[0-9;]*m\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} ")  # Lepton's mirror colours its lines
+LOGCAT_SILENCE = 20.0  # seconds without a logcat line after "Waiting for app" = the mirror isn't working (a running
+# game's container logs all the time: FrameBridge alone every 5 s)
+LOGCAT_BUFFER = "16M"  # the container's log buffer: a chatty game overwrote its own first minutes in the default one
+
+
+def logcat_keeper(log, appid, parent, poll=2.0, restarts=5, popen=None, run=None, clock=None,
+                  silence=LOGCAT_SILENCE):
+    """Keep launch.log filling when Lepton's logcat mirror doesn't (LOGCAT_LINE): after "Waiting for app", a failure
+    line (LOGCAT_FAILURES) or `silence` seconds without a logcat line start our own reader of the container's logcat
+    (`logcat -T <epoch>`: from the launcher's start when the mirror never wrote a line, else from just before its
+    last one; nothing is lost while the buffer holds it); restarted from where it stopped if it ends while the game
+    runs (at most `restarts` times), stopped again when Lepton's own (coloured) lines come back. Enlarges the
+    container's log buffer once it has booted. Every decision is printed (the launcher sends it to
+    logcat-keeper.log). Ends with the launcher."""
+    popen = popen or subprocess.Popen
+    run = run or subprocess.run
+    clock = clock or time.time
+    container = f"lepton-steamlaunch-{appid}"
+    start = clock()  # the keeper starts with the launcher
+    # (Steam's LD_PRELOAD overlay libraries only add "ld.so: ... cannot be preloaded" lines to the log)
+    env = {k: v for k, v in os.environ.items() if k != "LD_PRELOAD"}
+
+    def say(text):
+        print(f"{time.strftime('%H:%M:%S')} {text}", flush=True)
+
+    def note(text):  # also into launch.log, where triage and the dashboard worker read
+        try:
+            with open(log, "a") as f:
+                f.write(f"FramePort: {text}\n")
+        except OSError:
+            pass
+
+    def alive():
+        try:
+            os.kill(int(parent), 0)
+            return True
+        except (OSError, ValueError):
+            return False
+
+    pos, booted, buffer_tries, waiting_since = 0, False, 0, None
+    lepton_rows, last_row, failure, proc, started = False, None, None, None, 0
+    while alive():
+        try:
+            with open(log, "rb") as f:
+                f.seek(pos)
+                chunk = f.read().decode("utf-8", "replace")
+                pos = f.tell()
+        except OSError:
+            chunk = ""
+        if not booted and "Boot complete!" in chunk:
+            booted = True
+        if booted and buffer_tries < 5:
+            buffer_tries += 1
+            try:
+                r = run(["podman", "exec", container, "logcat", "-G", LOGCAT_BUFFER], capture_output=True,
+                        text=True, timeout=15, env=env)
+                ok = r.returncode == 0
+                say(f"log buffer {LOGCAT_BUFFER}: {'set' if ok else (r.stdout + r.stderr).strip()[:200]}")
+            except (OSError, subprocess.SubprocessError) as exc:
+                ok = False
+                say(f"log buffer {LOGCAT_BUFFER}: {exc}")
+            if ok:
+                buffer_tries = 5
+        if waiting_since is None:
+            i = chunk.find("Waiting for app")
+            if i >= 0:
+                waiting_since, chunk = clock(), chunk[i:]
+                say("Lepton is waiting for the app; watching its logcat mirror")
+        if waiting_since is not None and chunk:
+            ours = proc is not None and proc.poll() is None
+            if ours and LEPTON_ROW.search(chunk):
+                proc.terminate()
+                proc, failure, lepton_rows, last_row = None, None, True, clock()
+                say("Lepton's mirror is writing again: stopped our reader")
+                note("Lepton's logcat is back; stopped FramePort's reader")
+            elif not ours:
+                if any(m in chunk for m in LOGCAT_FAILURES):
+                    failure = next(m for m in LOGCAT_FAILURES if m in chunk)
+                elif LOGCAT_ROW.search(chunk):
+                    lepton_rows, last_row = True, clock()
+        if waiting_since is not None and (proc is None or proc.poll() is not None):
+            if proc is not None:  # our reader ended while the game runs: go on from where it stopped
+                say(f"our reader ended ({proc.poll()})")
+                proc, lepton_rows, last_row = None, True, clock()  # (go on from about now)
+                failure = failure or "FramePort's reader ended"
+            quiet = clock() - (last_row or waiting_since)
+            after = "" if lepton_rows else " after the app started"
+            reason = failure or (None if quiet < silence else f"no logcat line for {quiet:.0f} s{after}")
+            if reason and started < restarts:
+                started += 1
+                # nothing came through yet: everything since the start; else from just before the last line seen
+                since = start if not lepton_rows else last_row - poll - 1
+                say(f"reading {container}'s logcat ourselves since {since:.3f} ({started}): {reason}")
+                note(f"Lepton's logcat isn't coming through ({reason}); reading {container}'s logcat ({started})")
+                out = open(log, "ab")
+                try:
+                    proc = popen(["podman", "exec", container, "logcat", "-v", "threadtime", "-T", f"{since:.3f}"],
+                                 stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env)
+                except OSError as exc:
+                    say(f"could not start logcat: {exc}")
+                    proc = None
+                finally:
+                    out.close()
+                # what our reader writes is ours: only Lepton's coloured lines count from here on
+                try:
+                    pos = os.path.getsize(log)
+                except OSError:
+                    pass
+        time.sleep(poll)
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+    say("launcher ended")
+
+
+# A VR app with device.text_input_window has Lepton's flat Android window (lepton-show-flatscreen) next to its VR
+# view. gamescope hands that window to SteamVR as the game's "desktop game" overlay (valve.steam.desktopgame.<appid>,
+# mouse input, its own cursor overlay). The window is there before the game's OpenXR session (Unity: 10-30 s), and
+# SteamVR's dashboard puts the window of a game that isn't a VR scene app yet into theater mode
+# (dashboard.autoShowGameTheater): the Android screen in front of the player with the controllers as a mouse
+# pointer. When the session starts, SteamVR docks the window back into the dashboard and opens the dashboard on it
+# (SetDockLocation), again the Android screen with a pointer, until something closes it (AC Nexus 2026-10-23, GitHub
+# #476/#477: "the game renders, the controllers do nothing"). With auto-theater off the window stays a page of the
+# game in the dashboard: nothing is shown on its own and the dashboard isn't opened on it, while Android keeps a
+# focused window (Steam's keyboard, Type on Frame). The setting is global, so FramePort turns it off only while such
+# a game runs (one hold per launcher, taken at its start by THEATER_LINE: the dashboard reads the change a few
+# seconds late, a hold taken with Lepton's start came after the window was theatered) and puts it back when the last
+# one ends (the dashboard worker, which lives as long as the launcher).
+THEATER_HOLDS = os.path.join(HOME, ".local/share/frameport/theater-holds")
+THEATER_RESTORE = "restore"  # in THEATER_HOLDS: FramePort turned auto-theater off and has to turn it on again
+THEATER_SETTING = ("dashboard", "autoShowGameTheater")
+
+
+def vr_text_window(pkg):
+    """Whether this game runs as VR with its Android window shown for typing (device.text_input_window), not as a
+    flat app: a 2D app (or a VR app the user set to "Flat window") needs SteamVR's theater to be seen at all, and so
+    does an app that opens a flat launcher before its VR part (recipe flat_launcher, agent v122; GitHub #475 Xelee:
+    held off, the launcher was only a dashboard page and the game never started its VR part)."""
+    try:
+        dep = deployment(check_pkg(pkg)) or {}
+    except AgentError:
+        return False
+    recipe = dep.get("recipe") or {}
+    if "device.text_input_window" not in (recipe.get("patches") or ()):
+        return False
+    if recipe.get("flat_launcher"):  # GitHub #475: a flat launcher (Xelee) is only seen in theater mode
+        return False
+    display = ((dep.get("configuration") or {}).get("patches") or {}).get("device.display_mode") or {}
+    if (display.get("params") or {}).get("mode") == "flat":
+        return False
+    return os.path.exists(os.path.join(dep["base"], "lepton-app", "lepton-show-flatscreen"))
+
+
+def _theater_holder_alive(pid):
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            return b"launch.sh" in f.read()  # (not a reused pid)
+    except OSError:
+        return False
+
+
+def _theater_holders():
+    """Live holds (launcher pids); holds of launchers that are gone are removed."""
+    live = []
+    for name in os.listdir(THEATER_HOLDS):
+        if not name.isdigit():
+            continue
+        if _theater_holder_alive(name):
+            live.append(int(name))
+        else:
+            try:
+                os.remove(os.path.join(THEATER_HOLDS, name))
+            except OSError:
+                pass
+    return live
+
+
+def _theater_setting(value=None):
+    """SteamVR's dashboard.autoShowGameTheater (None = SteamVR isn't running), set to `value` first if given."""
+    vr = SteamVRSettings.open()
+    if vr is None:
+        return None
+    try:
+        return vr.bool_setting(*THEATER_SETTING, value)
+    finally:
+        vr.close()
+
+
+def theater_hold(holder):
+    """Keep SteamVR from putting game windows into theater mode while `holder` (a game's launch.sh) runs."""
+    os.makedirs(THEATER_HOLDS, exist_ok=True)
+    with open(os.path.join(THEATER_HOLDS, ".lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _theater_holders()
+        restore = os.path.join(THEATER_HOLDS, THEATER_RESTORE)
+        if not os.path.exists(restore):
+            on = _theater_setting()
+            if on is None:
+                return "SteamVR isn't running: theater mode left as it is"
+            if on:
+                _theater_setting(False)
+                open(restore, "w").close()
+        open(os.path.join(THEATER_HOLDS, str(int(holder))), "w").close()
+        return "theater mode off while the game runs"
+
+
+def theater_settle(holder=None, force=False):
+    """Drop `holder`'s hold (and those of ended workers); when no hold is left (or `force`: FramePort is being removed)
+    turn auto-theater back on if FramePort turned it off. Returns what it did, or None."""
+    if not os.path.isdir(THEATER_HOLDS):
+        return None
+    with open(os.path.join(THEATER_HOLDS, ".lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if holder is not None:
+            try:
+                os.remove(os.path.join(THEATER_HOLDS, str(int(holder))))
+            except OSError:
+                pass
+        restore = os.path.join(THEATER_HOLDS, THEATER_RESTORE)
+        if not os.path.exists(restore) or (_theater_holders() and not force):
+            return None
+        if _theater_setting(True) is None:
+            return None  # SteamVR isn't running: try again next time
+        os.remove(restore)
+        return "theater mode back on"
+
+
+def dashboard_worker(log, parent, wait_start=240, window=120, poll=0.5, ui_log=None, max_hides=10):
+    """Close the dashboard at the game's first VR frame (close_start_dashboard) and, for a VR app with its Android
+    window shown (vr_text_window), keep SteamVR's theater mode off until the launcher ends."""
+    def alive():
+        try:
+            os.kill(int(parent), 0)
+            return True
+        except (OSError, ValueError):
+            return False
+    held = False
+    try:
+        if vr_text_window(os.path.basename(os.path.dirname(os.path.abspath(log)))):
+            try:
+                print(f"{time.strftime('%H:%M:%S')} {theater_hold(parent)}", flush=True)
+                held = True
+            except Exception as exc:  # noqa: BLE001 (SteamVR settings unavailable: behave as before)
+                print(f"theater mode: {exc}", flush=True)
+        else:
+            try:  # a worker that was killed with its game (Steam stopped) left theater mode off
+                theater_settle()
+            except Exception:  # noqa: BLE001
+                pass
+        close_start_dashboard(log, alive, wait_start, window, poll, ui_log, max_hides)
+        while held and alive():
+            time.sleep(2)
+    finally:
+        if held:
+            try:
+                done = theater_settle(parent)
+                if done:
+                    print(f"{time.strftime('%H:%M:%S')} {done}", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"theater mode: {exc}", flush=True)
+
+
+def close_start_dashboard(log, alive, wait_start=240, window=120, poll=0.5, ui_log=None, max_hides=10):
+    """Close SteamVR's dashboard (Steam's "Resume game" frame menu) that opens when the game submits its first VR
+    frame: watch from FrameBridge's first "new layer:" line (the first submitted frame; Steam showed the menu ~0.3 s
+    later with ITR2), checking every `poll` s for `window` s after it (at most `max_hides`; agent 59: 120 s / 10, the
+    menu came back after the first 30 s in the owner's sessions). Waiting for the first
+    "pacing:" summary (agent 44-51) was ~8 s too late: the owner had pressed Resume by then. Stops for good once the
+    player opens the dashboard with the controller (agent 52 closed it 60 ms after each press: the game had paused
+    for it and stayed paused). Ends with the launcher."""
+    if ui_log is None:
+        ui_log = os.path.join(STEAM, "logs/vrwebhelper_systemui.txt")
+    _, ui_pos = user_opened_dashboard(ui_log, None)
+    deadline, pos, tail = time.time() + wait_start, 0, b""
+    while time.time() < deadline and alive():
+        try:
+            with open(log, "rb") as f:
+                f.seek(pos)
+                chunk = f.read()
+                pos += len(chunk)
+            text = tail + chunk
+            if any(m in text for m in FIRST_FRAME_MARKERS):
+                break
+            tail = text[-64:]  # a marker split across two reads
+        except OSError:
+            pass
+        time.sleep(poll)
+    else:
+        print("no VR frames logged; dashboard left as it is")
+        return
+    print(f"{time.strftime('%H:%M:%S')} first VR frame")
+    hidden, end = 0, time.time() + window
+    while time.time() < end and hidden < max_hides and alive():
+        user, ui_pos = user_opened_dashboard(ui_log, ui_pos)
+        if user:  # the player wants the dashboard (or the game's menu button opened it): never close it on them
+            print(f"{time.strftime('%H:%M:%S')} dashboard opened with the controller: leaving it to the player")
+            return
+        try:
+            if steam_js("SteamClient.OpenVR.VROverlay.IsDashboardVisible()"):
+                steam_js("SteamClient.OpenVR.VROverlay.HideDashboard()")
+                hidden += 1
+                print(f"{time.strftime('%H:%M:%S')} dashboard hidden")
+        except Exception as exc:  # noqa: BLE001 (no devtools port, Steam restarting: leave it)
+            print(f"steam ui: {exc}")
+            return
+        time.sleep(poll)
+
+
+def not_started(text, waited, grace=30):
+    """Lepton's container didn't come up: "is not a running context" with no "Boot complete!" after it for `grace`
+    seconds. The first start after an APK change prints that message while it waits for the boot and then boots
+    normally (installing the new APK): agent 53 and older stopped those starts after a few seconds."""
+    i = text.rfind("is not a running context")
+    return i >= 0 and "Boot complete!" not in text[i:] and waited >= grace
+
+
+# ------------------------------------------------------------------------------------------ monitor
+# The GUI's Monitor tab: `_monitor` streams one JSON sample per tick (CPU/GPU/memory/temperatures/power/battery, the
+# running FramePort games with fps, processes) and takes control lines (interval, process filter, end a process or a
+# game) until stdin closes. Sources (dev Frame, SteamOS 0.4.3, kernel 6.18, 2026-10-07): GPU busy = summed DRM fdinfo
+# `drm-engine-gpu` ns of every render-node fd (msm), GPU clock from devfreq 3d00000.gpu, 48 thermal zones grouped by
+# type, max34417 power monitors (µW; vph = the whole system), the max1720x battery gauge, FrameBridge's `pacing:` lines
+# for fps. Cheap by design: a naive sample (fd scan of ~520 processes) cost 43 ms CPU, so kernel threads are skipped
+# after their first sighting and render fds are cached per process.
+PROC = "/proc"
+SYS = "/sys"
+MON_INTERVALS = (0.1, 0.25, 0.5, 1, 2, 5)  # seconds between samples; processes are scanned every 2 s at any of them
+MON_DEFAULT_INTERVAL = 0.5
+SCAN_SECONDS = 2.0
+MON_FILTERS = ("game", "steam", "all")
+# what a client can ask for ({"modules": [...]}, agent v73); without that message every module is collected
+MON_MODULES = ("games", "procs", "cpu", "gpu", "mem", "temps", "power", "battery", "net", "disk")
+MON_PROC_LIMIT = 150
+MON_CONTEXT = 3  # "game" filter: the busiest other processes, shown for context
+# processes never signalled: the session, SSH and system plumbing (killing them logs the user out or drops FramePort)
+MON_NEVER = ("systemd", "sshd", "sshd-session", "sshd-auth", "dbus-daemon", "dbus-broker", "dbus-broker-lau",
+             "(sd-pam)", "login", "agetty")
+# processes that end the headset session, Steam or the desktop when killed: the GUI asks again ("force")
+MON_CRITICAL = ("steam", "steamwebhelper", "reaper", "vrserver", "vrcompositor", "vrmonitor", "vrwebhelper",
+                "vrdashboard", "vrstartup", "XRServiceLoopTh", "XRService", "gamescope", "gamescope-wl", "Xwayland",
+                "plasmashell", "kwin_wayland", "kwin_x11", "pipewire", "pipewire-pulse", "wireplumber", "V4L2Cam",
+                "steamos-session", "gamescope-sessi")
+# processes whose command line can name a game (only these are read: cmdlines of ~500 processes cost too much)
+MON_ROOT_COMMS = ("conmon", "launch.sh", "reaper", "bash", "sh")
+MON_ROOT_PREFIXES = ("python", "proton", "pv-", "wine", "steam-runtime")
+AGENT_FILES = {os.path.abspath(__file__), os.path.realpath(__file__)}
+STEAM_GAME = "steam:"  # monitor: a game Steam started that FramePort didn't install ("steam:<appid>", e.g. a Lepton
+# game from Steam's store); its title comes from the appmanifest
+REAPER_APPID = re.compile(r"\bAppId=(\d+)")
+MON_GROUPS = (  # (group, comm prefixes), first match wins; games are found by their process tree
+    ("steamvr", ("vr", "XRService", "V4L2Cam", "eyetracking", "proxmicmute", "systemlayer")),
+    ("steam", ("steam", "reaper", "fossilize")),
+    ("desktop", ("gamescope", "Xwayland", "plasmashell", "kwin", "xdg-desktop", "pipewire", "wireplumber",
+                 "kded", "ksmserver")),
+)
+TEMP_GROUPS = (  # (group, zone type prefixes): the hottest zone of each group is shown
+    ("CPU", ("cpu",)), ("GPU", ("gpuss",)), ("Memory", ("ddr",)), ("Battery", ("max1720x",)), ("NPU", ("nsp",)),
+    ("Power ICs", ("pm8",)), ("Modem", ("modem",)), ("Camera", ("camera", "video")), ("Storage", ("ufs",)),
+)
+RAIL_GROUPS = {"vph": "system", "gfx": "gpu", "apc0": "cpu", "apc1": "cpu", "apc2": "cpu", "nsp1": "npu",
+               "nsp2": "npu"}
+PACING_RE = re.compile(rb"FrameBridge: pacing: ([0-9.]+) fps(?:, displayTime vs predicted: avg ([0-9.]+) ms)?")
+CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+
+def _rd(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except (OSError, ValueError):
+        return ""
+
+
+def _num(text, default=None):
+    try:
+        return int(text.strip())
+    except (ValueError, AttributeError):
+        return default
+
+
+def monitor_plan(modules=None):
+    """The collectors one tick runs for the requested modules (None, "all" or anything unusable = all of them).
+    mem includes PSI, temps the zone detail and the fan. The process scan ("scan") runs for games and procs and also
+    for gpu: GPU busy is summed from the render fds the scan finds; "gpu_ns" (per-process GPU time) for the same."""
+    if modules is None or modules == "all" or not isinstance(modules, (list, tuple, set, frozenset)):
+        wanted = set(MON_MODULES)
+    else:
+        wanted = {m for m in modules if m in MON_MODULES}
+    plan = set(wanted)
+    if wanted & {"games", "procs", "gpu"}:
+        plan |= {"scan", "gpu_ns"}
+    return frozenset(plan)
+
+
+def read_cpu_times():
+    """[total, core0, core1, …] as (busy, all) jiffies from /proc/stat."""
+    out = []
+    for line in _rd(f"{PROC}/stat").splitlines():
+        if not line.startswith("cpu"):
+            break
+        f = [int(x) for x in line.split()[1:9]]
+        idle = f[3] + f[4]  # idle + iowait
+        out.append((sum(f) - idle, sum(f)))
+    return out
+
+
+def cpu_percent(prev, cur):
+    """Busy % per entry of read_cpu_times() between two readings (0 when nothing elapsed)."""
+    res = []
+    for (b0, a0), (b1, a1) in zip(prev, cur, strict=False):
+        res.append(round(100.0 * (b1 - b0) / (a1 - a0), 1) if a1 > a0 else 0.0)
+    return res
+
+
+def read_clusters():
+    """[{"cpus": [0, 1], "max_mhz": 2265, "policy": path}] per cpufreq policy."""
+    out = []
+    policies = glob.glob(f"{SYS}/devices/system/cpu/cpufreq/policy*")
+    for p in sorted(policies, key=lambda s: _num(s.rsplit("policy", 1)[1], 0)):
+        cpus = [int(x) for x in _rd(f"{p}/related_cpus").split() if x.isdigit()]
+        out.append({"cpus": cpus, "max_mhz": (_num(_rd(f"{p}/cpuinfo_max_freq"), 0)) // 1000, "policy": p})
+    return out
+
+
+def find_gpu_devfreq():
+    for d in sorted(glob.glob(f"{SYS}/class/devfreq/*")):
+        if "gpu" in os.path.basename(d) or "gpu" in _rd(f"{d}/name"):
+            return d
+    return None
+
+
+def read_meminfo():
+    m = {}
+    for line in _rd(f"{PROC}/meminfo").splitlines():
+        k, _, v = line.partition(":")
+        if k in ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree"):
+            m[k] = _num(v.split()[0], 0) * 1024
+    return {"total": m.get("MemTotal", 0), "avail": m.get("MemAvailable", 0), "swap_total": m.get("SwapTotal", 0),
+            "swap_free": m.get("SwapFree", 0)}
+
+
+def read_psi():
+    """"some" avg10 of /proc/pressure/{cpu,memory,io}: % of time something waited on it in the last 10 s."""
+    out = {}
+    for k in ("cpu", "memory", "io"):
+        m = re.search(r"^some avg10=([0-9.]+)", _rd(f"{PROC}/pressure/{k}"), re.M)
+        if m:
+            out[k] = float(m.group(1))
+    return out
+
+
+def temp_zones():
+    """[(group, zone name, temp path)] for every thermal zone in a known group."""
+    out = []
+    for z in sorted(glob.glob(f"{SYS}/class/thermal/thermal_zone*"), key=lambda s: _num(s.rsplit("zone", 1)[1], 0)):
+        name = _rd(f"{z}/type").strip()
+        group = next((g for g, prefixes in TEMP_GROUPS if name.startswith(prefixes)), None)
+        if group:
+            out.append((group, name.replace("-thermal", ""), f"{z}/temp"))
+    return out
+
+
+def read_temps(zones):
+    """({group: hottest °C}, {group: {zone: °C}})"""
+    groups, detail = {}, {}
+    for group, name, path in zones:
+        v = _num(_rd(path))
+        if v is None or v <= -40000:
+            continue
+        c = round(v / 1000.0, 1)
+        detail.setdefault(group, {})[name] = c
+        groups[group] = max(groups.get(group, c), c)
+    return groups, detail
+
+
+def power_rails():
+    """[(label, power*_input path)] of the max34417 power monitors (µW) that RAIL_GROUPS names."""
+    out = []
+    for h in sorted(glob.glob(f"{SYS}/class/hwmon/hwmon*")):
+        for lab in sorted(glob.glob(f"{h}/power*_label")):
+            label = _rd(lab).strip()
+            if label in RAIL_GROUPS:  # only the rails the Monitor shows: each read is an I2C transfer
+                out.append((label, lab[:-len("_label")] + "_input"))
+    return out
+
+
+FAST_RAILS = ("vph", "gfx")  # read every tick; the others (CPU clusters, NPU) every 5 s
+
+
+class PowerReader:
+    """{"system", "cpu", "gpu", "npu": W, "rails": {label: W}} from the power monitors. Every read is an I2C transfer
+    (~0.5 ms of kernel time each, more under load), so only the system and GPU rails are read every tick."""
+
+    def __init__(self, rails):
+        self.rails, self.watts, self.slow_at = rails, {}, -1e9
+
+    def read(self, now):
+        slow = now - self.slow_at >= 5
+        if slow:
+            self.slow_at = now
+        for label, path in self.rails:
+            if slow or label in FAST_RAILS:
+                uw = _num(_rd(path))
+                if uw is not None:
+                    self.watts[label] = uw / 1e6
+        out = {"rails": {k: round(w, 3) for k, w in self.watts.items()}}
+        for label, w in self.watts.items():
+            group = RAIL_GROUPS.get(label)
+            if group:
+                out[group] = round(out.get(group, 0.0) + w, 3)
+        return out
+
+
+def find_fan():
+    for f in sorted(glob.glob(f"{SYS}/class/hwmon/hwmon*/fan1_input")):
+        return f
+    return None
+
+
+class BatteryReader:
+    """battery_state() fields + watts (negative = draining), seconds to empty/full, health, cycles, °C. The gauge sits
+    on I2C (~0.7 ms of kernel time per file on the Frame), so the paths are found once, current and voltage are read
+    every 2 s and everything else every 10 s."""
+    FAST = (("current", "current_now"), ("voltage", "voltage_now"))
+    SLOW = (("empty_s", "time_to_empty_now"), ("full_s", "time_to_full_now"), ("cycles", "cycle_count"),
+            ("full_uah", "charge_full"), ("design_uah", "charge_full_design"), ("temp", "temp"))
+
+    def __init__(self):
+        self.dir, self.chargers, self.slow, self.slow_at = None, [], {}, -1e9
+        self.fast, self.fast_at = {}, -1e9
+        try:
+            names = sorted(os.listdir(POWER_SUPPLY))
+        except OSError:
+            names = []
+        for name in names:
+            d = os.path.join(POWER_SUPPLY, name)
+            kind = _rd(f"{d}/type").strip()
+            if kind == "Battery" and self.dir is None and _rd(f"{d}/capacity").strip().isdigit():
+                self.dir = d
+            elif kind in CHARGER_TYPES:
+                self.chargers.append(f"{d}/online")
+
+    def read(self, now):
+        if not self.dir:
+            return None
+        if now - self.fast_at >= 2:
+            self.fast = {k: _num(_rd(f"{self.dir}/{f}")) for k, f in self.FAST}
+            self.fast_at = now
+        if now - self.slow_at >= 10:
+            self.slow = {k: _num(_rd(f"{self.dir}/{f}")) for k, f in self.SLOW}
+            if self.slow.get("temp") is not None:
+                self.slow["temp"] = self.slow["temp"] / 10.0
+            self.slow["health"] = _rd(f"{self.dir}/health").strip() or None
+            self.slow["percent"] = _num(_rd(f"{self.dir}/capacity"))
+            self.slow["status"] = _rd(f"{self.dir}/status").strip()
+            self.slow["_charger"] = any(_rd(c).strip() == "1" for c in self.chargers)
+            self.slow_at = now
+        status = self.slow.get("status") or ""
+        b = {"percent": steam_battery_percent(self.slow.get("percent")), "status": status,
+             "plugged": bool(self.slow.get("_charger")) or status in ("Charging", "Full"),
+             "draining": status == "Discharging"}
+        cur, volt = self.fast.get("current"), self.fast.get("voltage")
+        if cur is not None and volt is not None:
+            b["watts"] = round(cur * volt / 1e12, 2)
+        b.update({k: x for k, x in self.slow.items() if x is not None and k not in b and not k.startswith("_")})
+        return b
+
+
+def read_net():
+    """{iface: (rx bytes, tx bytes)} for the Frame's links."""
+    out = {}
+    for line in _rd(f"{PROC}/net/dev").splitlines()[2:]:
+        name, _, rest = line.partition(":")
+        name = name.strip()
+        if name.startswith(("wlan", "usb", "eth", "enp")):
+            f = rest.split()
+            out[name] = (int(f[0]), int(f[8]))
+    return out
+
+
+def proc_stat(pid):
+    """(comm, ppid, utime+stime jiffies, start jiffies, rss pages) from /proc/<pid>/stat, or None."""
+    s = _rd(f"{PROC}/{pid}/stat")
+    r = s.rfind(")")
+    if r < 0:
+        return None
+    comm = s[s.find("(") + 1:r]
+    f = s[r + 2:].split()
+    try:
+        return comm, int(f[1]), int(f[11]) + int(f[12]), int(f[19]), int(f[21])
+    except (IndexError, ValueError):
+        return None
+
+
+def drm_fds(pid):
+    """File descriptors of a process that are GPU render nodes (/dev/dri/renderD*; Lepton games see /dev/kgsl-3d0)."""
+    out = []
+    try:
+        fds = os.listdir(f"{PROC}/{pid}/fd")
+    except OSError:
+        return out
+    for fd in fds:
+        try:
+            t = os.readlink(f"{PROC}/{pid}/fd/{fd}")
+        except OSError:
+            continue
+        if t.startswith(("/dev/dri/render", "/dev/kgsl")):
+            out.append(fd)
+    return out
+
+
+def drm_engine_ns(pid, fds):
+    """{fd: (`drm-engine-gpu` ns, `drm-cycles-gpu`)} of the process's render fds (several fds = several DRM
+    clients); None if gone."""
+    out = {}
+    for fd in fds:
+        text = _rd(f"{PROC}/{pid}/fdinfo/{fd}")
+        i = text.find("drm-engine-gpu:")
+        if i < 0:
+            continue
+        j = text.find("drm-cycles-gpu:")
+        out[fd] = (_num(text[i + 15:].split(None, 1)[0], 0),
+                   _num(text[j + 15:].split(None, 1)[0], 0) if j >= 0 else None)
+    return out or None
+
+
+def gpu_busy_ns(prev, cur, dt, hz):
+    """GPU time (ns) one render fd used between two samples. msm sometimes reports garbage engine time (SteamVR's
+    compositor near 2**64, rising ~1000x faster than real time: the Monitor showed an idle Frame at 100 %), so a
+    delta longer than the interval is replaced by cycles / GPU clock."""
+    ns, cycles = cur[0] - prev[0], None if cur[1] is None or prev[1] is None else cur[1] - prev[1]
+    if 0 <= ns <= dt * 1.05e9:
+        return ns
+    if cycles is not None and cycles >= 0 and hz:
+        return min(cycles / hz * 1e9, dt * 1e9)
+    return 0
+
+
+def cgroup_dir(pid):
+    """The cgroup v2 directory of a process that has memory/cpu stats (walks up from a leaf without them)."""
+    for line in _rd(f"{PROC}/{pid}/cgroup").splitlines():
+        if line.startswith("0::"):
+            d = f"{SYS}/fs/cgroup" + line[3:].strip()
+            while len(d) > len(f"{SYS}/fs/cgroup") and not os.path.exists(f"{d}/memory.current"):
+                d = os.path.dirname(d)
+            return d if os.path.exists(f"{d}/memory.current") else None
+    return None
+
+
+def cgroup_usage(d):
+    """(cpu usage µs, memory bytes) of a cgroup directory."""
+    m = re.search(r"^usage_usec (\d+)", _rd(f"{d}/cpu.stat"), re.M)
+    return (int(m.group(1)) if m else None), _num(_rd(f"{d}/memory.current"))
+
+
+def monitor_group(comm):
+    for group, prefixes in MON_GROUPS:
+        if comm.startswith(prefixes):
+            return group
+    return "other"
+
+
+class Monitor:
+    """Sampling state: previous counters for deltas, caches (kernel threads, render fds, zones, rails, games)."""
+
+    def __init__(self, clock=time.monotonic, uid=None):
+        self.clock = clock
+        self.uid = os.getuid() if uid is None else uid
+        self.ncpu = max(1, len(read_cpu_times()) - 1)
+        self.clusters = read_clusters()
+        self.gpu = find_gpu_devfreq()
+        self.zones = temp_zones()
+        self.rails = power_rails()
+        self.fan = find_fan()
+        self.battery = BatteryReader()
+        self.power = PowerReader(self.rails)
+        self.page = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+        self.btime = next((int(x.split()[1]) for x in _rd(f"{PROC}/stat").splitlines() if x.startswith("btime ")), 0)
+        self.filter = "game"
+        self.plan = monitor_plan()  # collectors per tick (set_modules)
+        self.kthreads = set()
+        self.drm = {}       # pid -> (fds, time of the fd scan)
+        self.gpu_ns = {}    # pid -> {fd: (drm-engine ns, drm-cycles)} of the last sample
+        self.gpu_pct = {}   # pid -> GPU % in the last tick
+        self.gpu_acc = {}   # pid -> GPU ns since the last process scan (the table shows the average over it)
+        self.scan_at = -1e9
+        self.scan_prev = None  # time of the previous process scan
+        self.proc_prev = {}  # pid -> (cpu jiffies, time)
+        self.cpu_prev = None
+        self.net_prev = None
+        self.cg_prev = {}   # cgroup dir -> (usage µs, time)
+        self.logs = {}      # launch.log path -> [offset, fps, avg ms, time of the line]
+        self.deps = []
+        self.deps_at = -1e9
+        self.steam_titles = {}
+        self.tick = 0
+        self.last = None    # time of the previous sample
+        self.disk_at = -1e9
+        self.zone_detail_at = -1e9
+        self.temps, self.zone_detail, self.temps_at = None, {}, -1e9
+        self.procs = []     # last scan (all, unfiltered), for kill checks
+        self.games = []
+        self.roots = {}
+        self.root_cache = {}  # (pid, start, comm) -> (package, kind) | None
+        self.names = {}       # (pid, start, comm) -> full name of a process whose comm was truncated
+
+    def static(self):
+        gpu_max = _num(_rd(f"{self.gpu}/max_freq"), 0) // 1000000 if self.gpu else None
+        return {"agent": AGENT_VERSION, "cores": self.ncpu, "gpu_max_mhz": gpu_max,
+                "clusters": [{"cpus": c["cpus"], "max_mhz": c["max_mhz"]} for c in self.clusters],
+                "mem_total": read_meminfo()["total"], "rails": [r[0] for r in self.rails],
+                "temp_groups": sorted({z[0] for z in self.zones}, key=[g for g, _ in TEMP_GROUPS].index),
+                "fan": bool(self.fan), "intervals": list(MON_INTERVALS), "filters": list(MON_FILTERS),
+                "modules": list(MON_MODULES)}
+
+    def set_modules(self, modules):
+        """Collect only these modules from the next tick on (None/"all" = everything)."""
+        plan = monitor_plan(modules)
+        if ("scan" in plan and "scan" not in self.plan) or ("procs" in plan and "procs" not in self.plan):
+            self.scan_at = -1e9  # processes wanted (again): scan at once
+        self.plan = plan
+
+    # -------------------------------------------------------------------- games
+    def deployments(self, now):
+        if now - self.deps_at > 30:
+            self.deps = cmd_list_installed({})["games"]
+            self.deps_at = now
+        return self.deps
+
+    def fps(self, base, now):
+        """Latest FrameBridge pacing of a game's launch.log (read incrementally): (fps, avg ms) or (None, None)."""
+        path = os.path.join(base, "launch.log")
+        st = self.logs.setdefault(path, [None, None, None, 0.0])
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return None, None
+        if st[0] is None or size < st[0]:  # first look or a new launch truncated it: only the last 64 KiB
+            st[0] = max(0, size - 65536)
+        if size > st[0]:
+            with open(path, "rb") as f:
+                f.seek(st[0])
+                data = f.read(min(size - st[0], 1 << 20))
+            st[0] += len(data)
+            for m in PACING_RE.finditer(data):
+                st[1] = float(m.group(1))
+                st[2] = float(m.group(2)) if m.group(2) else None
+                st[3] = now
+        if st[1] is None or now - st[3] > 15:  # pacing comes every ~5 s; older = loading or gone
+            return None, None
+        return st[1], st[2]
+
+    # ---------------------------------------------------------------- processes
+    def scan(self, now, wall):
+        """Every process worth showing: uid 1000 + everything inside a game container. Groups by process tree."""
+        raw = {}
+        try:
+            names = os.listdir(PROC)
+        except OSError:
+            names = []
+        for name in names:
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            if pid in self.kthreads:
+                continue
+            st = proc_stat(pid)
+            if st is None:
+                continue
+            if st[1] == 2 or pid == 2:  # kernel threads: never shown, skipped from now on
+                self.kthreads.add(pid)
+                continue
+            try:
+                uid = os.stat(f"{PROC}/{pid}").st_uid
+            except OSError:
+                continue
+            raw[pid] = (st, uid)
+        self.kthreads &= {int(n) for n in names if n.isdigit()}
+        deps = self.deployments(now)
+        by_appid = {str(d.get("appid")): d for d in deps}
+        roots = {}  # pid -> (package, "container" | "launcher"): a game container's conmon, its launch.sh/reaper,
+        # Proton processes started in its folder (their whole process trees are the game)
+        bases = [(d["base"].rstrip("/") + "/", d["package"]) for d in deps if d.get("kind") in ("pcvr", "linux")]
+        anchors = [(os.path.join(ANCHORS, d["package"], "launch.sh"), d["package"]) for d in deps]
+        for pid, ((comm, _ppid, _cpu, start, _rss), uid) in raw.items():
+            if uid != self.uid or not (comm in MON_ROOT_COMMS or comm.startswith(MON_ROOT_PREFIXES)):
+                continue
+            key = (pid, start, comm)
+            if key not in self.root_cache:
+                cmd = _rd(f"{PROC}/{pid}/cmdline").replace("\0", " ")
+                root = None
+                if comm == "conmon":
+                    m = re.search(r"lepton-steamlaunch-(\d+)", cmd)
+                    if m and m.group(1) in by_appid:
+                        root = (by_appid[m.group(1)]["package"], "container")
+                elif not any(a in cmd for a in AGENT_FILES):
+                    # the agent's own workers name a game's launch.sh too (uninstall's shortcut removal while Steam
+                    # restarts): they aren't the game (helpers launch.sh starts still count, as its children)
+                    pkg = next((k for path, k in anchors if path in cmd), None) or \
+                        next((k for base, k in bases if base in cmd), None)
+                    root = (pkg, "launcher") if pkg else None
+                    m = REAPER_APPID.search(cmd) if comm == "reaper" and not pkg else None
+                    # any other game Steam runs (its reaper); not SteamVR itself, not a devkit entry of ours
+                    if m and m.group(1) not in by_appid and m.group(1) != STEAMVR_APPID and "/devkit-game/" not in cmd:
+                        root = (STEAM_GAME + m.group(1), "steam")
+                self.root_cache[key] = root
+            if self.root_cache[key]:
+                roots[pid] = self.root_cache[key]
+        children = {}
+        for pid, ((_comm, ppid, *_), _uid) in raw.items():
+            children.setdefault(ppid, []).append(pid)
+        game_of = {}
+        for root, (pkg, _kind) in roots.items():
+            stack = [root]
+            while stack:
+                p = stack.pop()
+                if p in game_of:
+                    continue
+                game_of[p] = pkg
+                stack.extend(children.get(p, ()))
+        out = []
+        for pid, ((comm, ppid, cpu, start, rss), uid) in raw.items():
+            pkg = game_of.get(pid)
+            if uid != self.uid and not pkg:
+                continue
+            prev = self.proc_prev.get(pid)
+            cpu_pct = 0.0
+            if prev and now > prev[1]:
+                cpu_pct = 100.0 * (cpu - prev[0]) / CLK_TCK / (now - prev[1]) / self.ncpu
+            self.proc_prev[pid] = (cpu, now)
+            name = comm
+            if len(comm) == 15:  # truncated by the kernel (Android shows "lus4xvrplayerov"): the command line's name
+                key = (pid, start, comm)
+                if key not in self.names:
+                    arg0 = _rd(f"{PROC}/{pid}/cmdline").split("\0", 1)[0]
+                    self.names[key] = os.path.basename(arg0) if comm in arg0 else comm
+                name = self.names[key] or comm
+            out.append({"pid": pid, "ppid": ppid, "name": name, "group": f"game:{pkg}" if pkg else monitor_group(comm),
+                        "game": pkg, "cpu": round(max(cpu_pct, 0.0), 1), "rss": rss * self.page,
+                        "age": max(0, int(wall - (self.btime + start / CLK_TCK))) if self.btime else None,
+                        "uid": uid, "critical": comm in MON_CRITICAL, "locked": comm in MON_NEVER})
+            # render fds: new processes now; a busy game process without any every 4 s for its first 2 min (Android
+            # games open the GPU a while after starting; a game container has ~90 mostly idle processes), others
+            # every 60 s (listing ~300 fds of a steamwebhelper costs)
+            fds = self.drm.get(pid)
+            young_game = pkg and (p_age := out[-1]["age"]) is not None and p_age < 120 and out[-1]["cpu"] >= 1.0
+            if fds is None or now - fds[1] > (4 if young_game and not fds[0] else 60):
+                self.drm[pid] = (drm_fds(pid), now)
+        alive = set(raw)
+        for d in (self.proc_prev, self.drm, self.gpu_ns, self.gpu_pct):
+            for pid in [p for p in d if p not in alive]:
+                del d[pid]
+        for cache in (self.root_cache, self.names):
+            for key in [k for k in cache if k[0] not in alive]:
+                del cache[key]
+        self.procs = out
+        self.roots = roots
+        return out
+
+    def gpu_sample(self, now, dt):
+        """GPU % per process (from the cached render fds) and the summed busy %."""
+        total = 0.0
+        hz = _num(_rd(f"{self.gpu}/cur_freq"), 0) if self.gpu else 0
+        for pid, (fds, _t) in list(self.drm.items()):
+            if not fds:
+                continue
+            cur = drm_engine_ns(pid, fds)
+            if cur is None:
+                continue
+            prev = self.gpu_ns.get(pid)
+            self.gpu_ns[pid] = cur
+            if prev is not None and dt > 0:
+                used = sum(gpu_busy_ns(prev[fd], c, dt, hz) for fd, c in cur.items() if fd in prev)
+                pct = min(100.0, used / 1e7 / dt)
+                self.gpu_pct[pid] = pct
+                self.gpu_acc[pid] = self.gpu_acc.get(pid, 0) + used
+                total += pct
+        return min(100.0, total)
+
+    def games_sample(self, now):
+        """Running FramePort games: title, kind, start time, CPU/memory of the container's cgroup, GPU %, fps."""
+        deps = {d["package"]: d for d in self.deployments(now)}
+        out = []
+        for pkg in sorted({v[0] for v in self.roots.values()}):
+            d = deps.get(pkg) or (self.steam_game(pkg[len(STEAM_GAME):]) if pkg.startswith(STEAM_GAME) else {})
+            pids = [p["pid"] for p in self.procs if p["game"] == pkg]
+            cpu = sum(p["cpu"] for p in self.procs if p["game"] == pkg)
+            rss = sum(p["rss"] for p in self.procs if p["game"] == pkg)
+            mem = None
+            conmon = [pid for pid, (k, kind) in self.roots.items() if k == pkg and kind == "container"]
+            kids = [p["pid"] for p in self.procs if p["ppid"] in conmon]
+            cg = cgroup_dir(kids[0]) if kids else None
+            if cg and cg != cgroup_dir(conmon[0]):  # the container's own cgroup (conmon's is the user's)
+                usage, mem = cgroup_usage(cg)
+                prev = self.cg_prev.get(cg)
+                self.cg_prev[cg] = (usage, now)
+                if usage is not None and prev and prev[0] is not None and now > prev[1]:
+                    cpu = 100.0 * (usage - prev[0]) / 1e6 / (now - prev[1]) / self.ncpu
+            ages = [p["age"] for p in self.procs if p["game"] == pkg and p["age"] is not None]
+            fps, ms = self.fps(d["base"], now) if d.get("base") else (None, None)
+            out.append({"package": pkg, "title": d.get("title") or pkg, "kind": d.get("kind", "quest"),
+                        "appid": d.get("appid"), "elapsed": max(ages) if ages else None,
+                        "cpu": round(max(cpu, 0.0), 1), "mem": mem if mem is not None else rss,
+                        "gpu": round(sum(self.gpu_pct.get(p, 0.0) for p in pids), 1),
+                        "fps": fps, "frame_ms": ms, "processes": len(pids), "overlay": is_overlay(d)})
+        # the game in front first: overlay apps (they run next to games) last, then the most recently started
+        out.sort(key=lambda g: (g["overlay"], g["elapsed"] is None, g["elapsed"] or 0))
+        self.games = out
+        return out
+
+    def steam_game(self, appid):
+        """{title, kind, appid} of a Steam game FramePort didn't install (cached: appmanifest/shortcuts reads)."""
+        if appid not in self.steam_titles:
+            app = find_app_id(appid)
+            name = (app or {}).get("name")
+            if not name:
+                for user in steam_users():
+                    name = shortcut_names(user).get(appid)
+                    if name:
+                        break
+            self.steam_titles[appid] = name or f"App {appid}"
+        return {"title": self.steam_titles[appid], "kind": "steam", "appid": appid}
+
+    def filtered(self, now=None):
+        procs = self.procs
+        span = (now - self.scan_prev) if now is not None and self.scan_prev is not None else 0.0
+        for p in procs:  # GPU % averaged over the time since the previous scan (per tick it's noisy at 0.1 s)
+            acc = self.gpu_acc.get(p["pid"], 0)
+            p["gpu"] = round(min(100.0, acc / 1e7 / span), 1) if span > 0 else \
+                round(self.gpu_pct.get(p["pid"], 0.0), 1)
+        self.gpu_acc = {}
+        if self.filter == "game":
+            shown = [p for p in procs if p["game"]]
+            others = sorted((p for p in procs if not p["game"]), key=lambda p: (-p["cpu"], -p["rss"]))
+            shown += [dict(p, context=True) for p in others[:MON_CONTEXT]]
+        elif self.filter == "steam":
+            shown = [p for p in procs if p["group"] in ("steam", "steamvr", "desktop")]
+        else:
+            shown = list(procs)
+        shown.sort(key=lambda p: (-p["cpu"], -p["gpu"], -p["rss"]))
+        return shown[:MON_PROC_LIMIT]
+
+    # ------------------------------------------------------------------- sample
+    def sample(self, wall=None):
+        t0 = time.process_time()
+        now = self.clock()
+        wall = time.time() if wall is None else wall
+        dt = now - self.last if self.last is not None else 0.0
+        self.last = now
+        out = {"t": round(wall, 3), "dt": round(dt, 3)}
+        plan = self.plan
+        if "cpu" in plan:
+            cur = read_cpu_times()
+            if self.cpu_prev:
+                pct = cpu_percent(self.cpu_prev, cur)
+                out["cpu"] = {"total": pct[0] if pct else 0.0, "cores": pct[1:]}
+            else:
+                out["cpu"] = {"total": 0.0, "cores": [0.0] * self.ncpu}
+            self.cpu_prev = cur
+            out["cpu"]["mhz"] = [_num(_rd(f"{c['policy']}/scaling_cur_freq"), 0) // 1000 for c in self.clusters]
+        else:
+            self.cpu_prev = None  # no average over the time it was off
+        if "mem" in plan:
+            out["mem"] = read_meminfo()
+            out["psi"] = read_psi()
+        if "temps" in plan:
+            if now - self.temps_at >= 2 or self.temps is None:  # 48 sensor files (~3 ms at idle clocks); heat is slow
+                self.temps, self.zone_detail = read_temps(self.zones)
+                self.temps_at = now
+            temps, detail = self.temps, self.zone_detail
+            out["temps"] = temps
+            if now - self.zone_detail_at >= 5:
+                out["zones"] = detail
+                self.zone_detail_at = now
+            if self.fan:
+                out["fan"] = _num(_rd(self.fan))
+        if "power" in plan:
+            out["power"] = self.power.read(now)
+        if "battery" in plan:
+            out["battery"] = self.battery.read(now)
+        if "net" in plan:
+            net = read_net()
+            if self.net_prev and dt > 0:
+                prev = self.net_prev
+                out["net"] = {k: [max(0, int((v[0] - prev[k][0]) / dt)), max(0, int((v[1] - prev[k][1]) / dt))]
+                              for k, v in net.items() if k in prev}
+            self.net_prev = net
+        else:
+            self.net_prev = None  # a delta over one tick's dt needs the previous tick's counters
+        if "disk" in plan and now - self.disk_at >= 30:
+            try:
+                st = os.statvfs(HOME)
+                out["disk"] = {"free": st.f_bavail * st.f_frsize, "total": st.f_blocks * st.f_frsize}
+            except OSError:
+                pass
+            self.disk_at = now
+        scan = "scan" in plan and (now - self.scan_at >= SCAN_SECONDS or not self.procs)
+        if scan:
+            self.scan(now, wall)
+            self.scan_at = now
+        if "gpu_ns" in plan:
+            busy = self.gpu_sample(now, dt)
+        else:
+            busy = None
+            self.gpu_ns, self.gpu_pct, self.gpu_acc = {}, {}, {}  # stale counters would spike on the next delta
+        if "gpu" in plan:
+            out["gpu"] = {"busy": round(busy, 1) if dt > 0 and busy is not None else None,
+                          "mhz": _num(_rd(f"{self.gpu}/cur_freq"), 0) // 1000000 if self.gpu else None}
+        if "games" in plan:
+            out["games"] = self.games_sample(now)
+        if scan and "procs" in plan:
+            out["procs"] = self.filtered(now)
+            out["filter"] = self.filter
+            self.scan_prev = now
+        elif scan:
+            self.gpu_acc = {}
+            self.scan_prev = now
+        self.tick += 1
+        out["self_ms"] = round((time.process_time() - t0) * 1000, 2)
+        return out
+
+    # ------------------------------------------------------------------ actions
+    def ancestors(self):
+        pids, p = set(), os.getpid()
+        while p > 1:
+            pids.add(p)
+            st = proc_stat(p)
+            if not st:
+                break
+            p = st[1]
+        return pids
+
+    def kill(self, pid, sig="TERM", force=False, wait=3.0):
+        """Signal one process the Monitor shows. TERM waits up to `wait` s and reports whether it ended."""
+        import signal
+
+        pid = int(pid)
+        st = proc_stat(pid)
+        if st is None:
+            return {"ended": True, "pid": pid, "note": "already gone"}
+        comm = st[0]
+        if pid <= 2 or pid in self.ancestors() or comm in MON_NEVER:
+            raise AgentError(f"{comm} ({pid}) is part of the system or of FramePort's connection; it can't be ended")
+        try:
+            uid = os.stat(f"{PROC}/{pid}").st_uid
+        except OSError:
+            return {"ended": True, "pid": pid, "note": "already gone"}
+        in_game = any(p["pid"] == pid and p["game"] for p in self.procs)
+        if uid != self.uid and not in_game:
+            raise AgentError(f"{comm} ({pid}) belongs to another user")
+        if comm in MON_CRITICAL and not force:
+            raise AgentError(f"CRITICAL: {comm}")
+        signum = signal.SIGKILL if sig == "KILL" else signal.SIGTERM
+        try:
+            os.kill(pid, signum)
+        except ProcessLookupError:
+            return {"ended": True, "pid": pid}
+        except PermissionError as exc:
+            raise AgentError(f"not allowed to end {comm} ({pid}): {exc}") from exc
+        end = time.monotonic() + wait
+        while time.monotonic() < end:
+            st = proc_stat(pid)
+            if st is None or _rd(f"{PROC}/{pid}/status").find("State:\tZ") >= 0:
+                return {"ended": True, "pid": pid, "name": comm}
+            time.sleep(0.1)
+        return {"ended": False, "pid": pid, "name": comm}
+
+
+def steam_app_running(appid):
+    """A Steam reaper runs this app id (a Steam game FramePort didn't install)."""
+    for name in os.listdir(PROC):
+        if name.isdigit() and _rd(f"{PROC}/{name}/comm").strip() == "reaper" and \
+                re.search(rf"\bAppId={appid}\b", _rd(f"{PROC}/{name}/cmdline").replace("\0", " ")):
+            return True
+    return False
+
+
+def monitor_end_game(pkg, wait=6.0):
+    """Steam's Exit game for a FramePort game (so Steam's session ends cleanly), then cmd_stop if it still runs.
+    A Steam game FramePort didn't install ("steam:<appid>"): Steam's Exit game only."""
+    if str(pkg).startswith(STEAM_GAME):
+        appid = str(pkg)[len(STEAM_GAME):]
+        if not appid.isdigit():
+            raise AgentError(f"bad Steam app id {appid!r}")
+        if not steam_app_running(appid):
+            return {"ended": True, "via": None, "package": pkg, "note": "not running"}
+        steam_js(f"SteamClient.Apps.TerminateApp('{appid}', false)")
+        end = time.monotonic() + wait
+        while time.monotonic() < end and steam_app_running(appid):
+            time.sleep(0.5)
+        return {"ended": not steam_app_running(appid), "via": "steam", "package": pkg}
+    pkg = check_pkg(pkg)
+    dep = deployment(pkg)
+    if not dep:
+        raise AgentError(f"{pkg} is not installed")
+
+    def running():
+        if dep.get("kind") in ("pcvr", "linux"):
+            return bool(pcvr_pids(dep["base"]))
+        return container_running(dep["appid"])
+    if not running():
+        return {"ended": True, "via": None, "package": pkg, "note": "not running"}
+    via = None
+    if dep.get("kind") not in ("pcvr", "linux"):
+        pause_app(dep["appid"], pkg)  # Android pauses the game first, whatever Steam ends next (GitHub #480)
+    devkit = devkit_gameid(pkg)
+    appid = (devkit_appid(devkit) if devkit else None) or dep.get("appid")
+    try:  # past FramePort's Exit game hook: the game is paused already
+        steam_js(terminate_app_js(steam_gameid(appid)))
+        via = "steam"
+        end = time.monotonic() + wait
+        while time.monotonic() < end and running():
+            time.sleep(0.5)
+    except Exception:  # noqa: BLE001  (Steam's UI unreachable: stop it directly)
+        pass
+    if running():
+        cmd_stop({"package": pkg})
+        via = "stop"
+        end = time.monotonic() + wait
+        while time.monotonic() < end and running():
+            time.sleep(0.5)
+    return {"ended": not running(), "via": via, "package": pkg}
+
+
+def monitor_session(stdin, stdout, monitor=None, sleep=time.sleep, max_ticks=None):
+    """Long-lived: prints {"ready": 1, "static": {...}}, then one sample per tick. Control lines on stdin:
+    {"interval": 1|2|5}, {"procs": "game"|"steam"|"all"}, {"pause": bool}, {"modules": [...]|"all"} (v73: only those
+    collectors run, see monitor_plan), {"id": n, "kill": pid, "sig": "TERM"|"KILL", "force": bool}, {"id": n,
+    "end_game": package} (each with an id gets {"reply": n, "ok": …}). Ends at EOF or when the SSH session (parent)
+    is gone."""
+    import threading
+
+    mon = monitor or Monitor()
+    lock = threading.Lock()
+    state = {"interval": MON_DEFAULT_INTERVAL, "stop": False, "pause": False}
+    wake = threading.Event()
+
+    def emit(obj):
+        with lock:
+            stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+            stdout.flush()
+
+    def act(msg):
+        try:
+            if "kill" in msg:
+                res = mon.kill(msg["kill"], msg.get("sig", "TERM"), bool(msg.get("force")))
+            else:
+                res = monitor_end_game(msg["end_game"])
+            emit({"reply": msg.get("id"), "ok": True, "result": res})
+        except AgentError as exc:
+            emit({"reply": msg.get("id"), "ok": False, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            emit({"reply": msg.get("id"), "ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        wake.set()  # a fresh sample shows the result
+
+    def reader():
+        try:
+            for line in stdin:
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("interval") in MON_INTERVALS:
+                    state["interval"] = float(msg["interval"])
+                if msg.get("procs") in MON_FILTERS:
+                    mon.filter = msg["procs"]
+                    mon.scan_at = -1e9  # rescan now
+                if "pause" in msg:
+                    state["pause"] = bool(msg["pause"])
+                if "modules" in msg and hasattr(mon, "set_modules"):
+                    mon.set_modules(msg["modules"])
+                if "kill" in msg or "end_game" in msg:
+                    threading.Thread(target=act, args=(msg,), daemon=True).start()
+                    continue
+                wake.set()
+        except (OSError, ValueError):
+            pass
+        state["stop"] = True
+        wake.set()
+
+    emit({"ready": 1, "static": mon.static()})
+    threading.Thread(target=reader, daemon=True).start()
+    ticks = 0
+    parent = os.getppid()
+    try:
+        while not state["stop"]:
+            if not state["pause"]:
+                emit(mon.sample())
+            ticks += 1
+            if max_ticks is not None and ticks >= max_ticks:
+                break
+            wake.clear()
+            if sleep is time.sleep:
+                wake.wait(state["interval"])
+            else:
+                sleep(state["interval"])
+            if os.getppid() != parent:  # SSH session gone without closing stdin
+                break
+    except (OSError, ValueError, BrokenPipeError):
+        pass
+    return 0
+
+
+# ------------------------------------------------------------------------------------------ save backups (#352)
+# Steam doesn't sync Quest games' saves: the PC app backs them up and restores them. The game's two storage roots (its
+# internal /data/data/<pkg> folder and its /sdcard/Android/data/<pkg> folder) go into one tar.gz streamed over the SSH
+# exec channel: `_backup_saves '<json>'` = archive on stdout, one result JSON line on stderr; `_restore_saves '<json>'`
+# = archive on stdin, one result JSON line on stdout. Both refuse while the game runs and hold its launch lock. Files
+# Lepton's containers own are read and written in podman's user namespace (`podman unshare`, where the steamos user
+# owns every mapped id). Caches, shader/program binaries, IL2CPP copies, FrameBridge's own files, videos/OBBs and
+# anything over SAVES_MAX_FILE stay out; the manifest (last member) lists files, sizes, sha256 and what was left out.
+SAVES_MANIFEST = "frameport-saves.json"
+SAVES_ROLLBACK = "saves-before-restore.tar.gz"
+SAVES_FORMAT = 1
+SAVES_MAX_FILE = 64 << 20          # larger files are left out of a backup (the manifest's "skipped", reason "size")
+SAVES_MAX_TOTAL = 4 << 30          # a bigger backup is refused (that's game content, not saves)
+SAVES_RESTORE_MAX_FILE = 1 << 30   # restore (untrusted input): one member at most this big ...
+SAVES_RESTORE_MAX_TOTAL = 8 << 30  # ... all of them together at most this big
+SAVES_RESTORE_MAX_MEMBERS = 200000
+SAVES_MANIFEST_MAX = 32 << 20
+# folder names (any depth, case-insensitive) that only hold what a game rebuilds by itself (Android's own backup
+# leaves out cache/code_cache/no_backup too)
+SAVES_SKIP_DIRS = {"cache", "code_cache", "code cache", "no_backup", "il2cpp", "unityshadercache", "gpucache",
+                   "shadercache", "grshadercache", "dawncache", "dawngraphitecache", "dawnwebgpucache",
+                   "programbinarycache", "vulkanprogrambinarycache", "pipelinecaches", "fp_vk_shaders", "fp_spirv",
+                   "cachestorage", "scriptcache"}
+SAVES_SKIP_UNDER_SAVED = {"logs", "crashes"}  # Unreal's Saved/Logs and Saved/Crashes
+SAVES_SKIP_EXT = (".obb", ".apk", ".foz", ".mp4", ".m4v", ".mkv", ".webm", ".mov")
+SAVES_SKIP_PREFIX = ("fb_snap_", "framebridge")  # FrameBridge's snapshots, config and state (FramePort writes them)
+
+
+def saves_roots(base, pkg):
+    """{"internal": .../internal/<pkg> (= /data/data/<pkg>), "external": .../external/Android/data/<pkg>}."""
+    data = os.path.join(base, "lepton-data")
+    return {"internal": os.path.join(data, "internal", pkg),
+            "external": os.path.join(data, "external", "Android", "data", pkg)}
+
+
+def _saves_skip_dir(rel_parts, name):
+    low = name.lower()
+    if low in SAVES_SKIP_DIRS:
+        return True
+    return low in SAVES_SKIP_UNDER_SAVED and bool(rel_parts) and rel_parts[-1].lower() == "saved"
+
+
+def _saves_skip_file(name):
+    low = name.lower()
+    return low.endswith(SAVES_SKIP_EXT) or low.startswith(SAVES_SKIP_PREFIX)
+
+
+def collect_saves(roots, max_file=SAVES_MAX_FILE):
+    """What a backup holds: {"dirs": [(arc, path, stat)], "files": [(arc, path, stat)], "skipped": [{path, size,
+    reason}]}, sorted. Symlinks (Lepton's links), devices and pipes are never followed or included."""
+    import stat as st_
+
+    out = {"dirs": [], "files": [], "skipped": []}
+    for key in sorted(roots):
+        root = roots[key]
+        try:
+            rst = os.lstat(root)
+        except OSError:
+            continue
+        if not st_.S_ISDIR(rst.st_mode):
+            out["skipped"].append({"path": key, "size": 0, "reason": "not a folder"})
+            continue
+        out["dirs"].append((key, root, rst))
+        for cur, dirs, files in os.walk(root, topdown=True, followlinks=False):
+            rel = os.path.relpath(cur, root)
+            parts = [] if rel == "." else rel.split(os.sep)
+            keep = []
+            for d in sorted(dirs):
+                p = os.path.join(cur, d)
+                arc = "/".join([key, *parts, d])
+                try:
+                    s = os.lstat(p)
+                except OSError:
+                    continue
+                if st_.S_ISLNK(s.st_mode):
+                    out["skipped"].append({"path": arc, "size": 0, "reason": "link"})
+                elif _saves_skip_dir(parts, d):
+                    out["skipped"].append({"path": arc + "/", "size": 0, "reason": "cache"})
+                else:
+                    keep.append(d)
+                    out["dirs"].append((arc, p, s))
+            dirs[:] = keep
+            for f in sorted(files):
+                p = os.path.join(cur, f)
+                arc = "/".join([key, *parts, f])
+                try:
+                    s = os.lstat(p)
+                except OSError:
+                    continue
+                if not st_.S_ISREG(s.st_mode):
+                    out["skipped"].append({"path": arc, "size": 0,
+                                           "reason": "link" if st_.S_ISLNK(s.st_mode) else "special"})
+                elif _saves_skip_file(f):
+                    out["skipped"].append({"path": arc, "size": s.st_size, "reason": "not a save"})
+                elif s.st_size > max_file:
+                    out["skipped"].append({"path": arc, "size": s.st_size, "reason": "size"})
+                elif not os.access(p, os.R_OK):
+                    out["skipped"].append({"path": arc, "size": s.st_size, "reason": "unreadable"})
+                else:
+                    out["files"].append((arc, p, s))
+    return out
+
+
+class _HashingReader:
+    """A file read for the archive, hashed on the way (tarfile reads exactly the member's size)."""
+
+    def __init__(self, f):
+        self.f, self.h = f, hashlib.sha256()
+
+    def read(self, n=-1):
+        data = self.f.read(n)
+        self.h.update(data)
+        return data
+
+
+def _saves_tarinfo(arc, s, is_dir):
+    import tarfile
+
+    ti = tarfile.TarInfo(arc)
+    ti.type = tarfile.DIRTYPE if is_dir else tarfile.REGTYPE
+    ti.mode = s.st_mode & 0o7777
+    ti.uid, ti.gid = s.st_uid, s.st_gid
+    ti.uname = ti.gname = ""
+    ti.mtime = int(s.st_mtime)
+    ti.size = 0 if is_dir else s.st_size
+    return ti
+
+
+def _dep_version(dep):
+    """The installed build's game version (deployments record the APK's version as source_version)."""
+    return str((dep or {}).get("version") or (dep or {}).get("source_version") or "")
+
+
+def write_saves_tar(out, pkg, roots, dep=None, max_file=SAVES_MAX_FILE, max_total=SAVES_MAX_TOTAL,
+                    automatic=False):
+    """Stream the game's saves as tar.gz to `out` (a binary file object). Returns the manifest (also the archive's
+    last member, frameport-saves.json)."""
+    import gzip
+    import io
+    import tarfile
+
+    found = collect_saves(roots, max_file)
+    total = sum(s.st_size for _a, _p, s in found["files"])
+    if total > max_total:
+        raise AgentError(f"{pkg}'s saves are {total / 2**30:.1f} GiB, more than the {max_total / 2**30:.0f} GiB a "
+                         f"save backup takes (that's game content, not saves)")
+    manifest = {"format": SAVES_FORMAT, "package": pkg, "title": (dep or {}).get("title") or pkg,
+                "version": _dep_version(dep), "created": time.time(), "agent": AGENT_VERSION,
+                "automatic": automatic, "roots": sorted(roots), "max_file": max_file,
+                "files": [], "dirs": [], "skipped": found["skipped"]}
+    gz = gzip.GzipFile(fileobj=out, mode="wb", compresslevel=6)
+    with tarfile.open(fileobj=gz, mode="w|", format=tarfile.PAX_FORMAT) as tar:
+        for arc, _p, s in found["dirs"]:
+            tar.addfile(_saves_tarinfo(arc, s, True))
+            manifest["dirs"].append({"path": arc, "mode": s.st_mode & 0o7777, "uid": s.st_uid, "gid": s.st_gid})
+        for arc, p, s in found["files"]:
+            with open(p, "rb") as f:
+                reader = _HashingReader(f)
+                tar.addfile(_saves_tarinfo(arc, s, False), reader)
+            manifest["files"].append({"path": arc, "size": s.st_size, "sha256": reader.h.hexdigest(),
+                                      "mode": s.st_mode & 0o7777, "uid": s.st_uid, "gid": s.st_gid,
+                                      "mtime": int(s.st_mtime)})
+        raw = json.dumps(manifest, indent=1).encode()
+        ti = tarfile.TarInfo(SAVES_MANIFEST)
+        ti.size, ti.mtime, ti.mode = len(raw), int(manifest["created"]), 0o644
+        tar.addfile(ti, io.BytesIO(raw))
+    gz.close()
+    return manifest
+
+
+def saves_summary(manifest):
+    return {"package": manifest.get("package"), "files": len(manifest.get("files") or []),
+            "bytes": sum(int(f.get("size") or 0) for f in manifest.get("files") or []),
+            "skipped": [s for s in manifest.get("skipped") or [] if s.get("reason") in ("size", "unreadable")],
+            "created": manifest.get("created"), "version": manifest.get("version")}
+
+
+def _saves_member_name(name):
+    """A member's path as parts, or None when it isn't confined to internal/ or external/ (absolute, '..', NUL,
+    backslashes, overlong)."""
+    if not isinstance(name, str) or not name or "\0" in name or "\\" in name or name.startswith("/"):
+        return None
+    parts = [p for p in name.split("/") if p not in ("", ".")]
+    if not parts or parts[0] not in ("internal", "external") or ".." in parts:
+        return None
+    if len(name) > 4096 or any(len(p) > 255 for p in parts):
+        return None
+    return parts
+
+
+def stage_saves_archive(inp, staging, max_file=SAVES_RESTORE_MAX_FILE, max_total=SAVES_RESTORE_MAX_TOTAL,
+                        max_members=SAVES_RESTORE_MAX_MEMBERS):
+    """Read an untrusted save archive from `inp` into `staging` (flat numbered files, never the members' names).
+    Returns (entries {parts tuple: {kind, mode, mtime, staged, size, sha256}}, manifest). Refuses links, devices, paths
+    outside the two roots, duplicates, oversize members and files that don't match the manifest."""
+    import tarfile
+
+    entries, manifest, total, count = {}, None, 0, 0
+    try:
+        tar = tarfile.open(fileobj=inp, mode="r|gz")
+    except (tarfile.TarError, OSError, EOFError) as exc:
+        raise AgentError(f"not a save backup (unreadable archive: {exc})") from None
+    try:
+        for m in tar:
+            count += 1
+            if count > max_members:
+                raise AgentError("the backup has too many files")
+            if m.name == SAVES_MANIFEST:
+                if not m.isreg() or m.size > SAVES_MANIFEST_MAX or manifest is not None:
+                    raise AgentError("the backup's manifest is invalid")
+                try:
+                    manifest = json.loads(tar.extractfile(m).read().decode("utf-8"))
+                except ValueError:
+                    raise AgentError("the backup's manifest is invalid") from None
+                continue
+            parts = _saves_member_name(m.name)
+            if parts is None:
+                raise AgentError(f"the backup has a file outside the game's save folders: {m.name[:200]!r}")
+            key = tuple(parts)
+            if key in entries:
+                raise AgentError(f"the backup has {m.name[:200]!r} twice")
+            if m.isdir():
+                entries[key] = {"kind": "dir", "mode": m.mode & 0o7777, "mtime": int(m.mtime or 0)}
+                continue
+            if not m.isreg():
+                raise AgentError(f"the backup has a link or special file: {m.name[:200]!r}")
+            if len(parts) < 2:
+                raise AgentError(f"the backup has a file in place of a save folder: {m.name[:200]!r}")
+            if m.size > max_file:
+                raise AgentError(f"{m.name[:200]!r} in the backup is too big ({m.size} bytes)")
+            total += m.size
+            if total > max_total:
+                raise AgentError("the backup is too big to restore")
+            staged = os.path.join(staging, f"{len(entries):08d}")
+            src = tar.extractfile(m)
+            h = hashlib.sha256()
+            with open(staged, "wb") as f:
+                left = m.size
+                while left:
+                    chunk = src.read(min(left, 1 << 20))
+                    if not chunk:
+                        raise AgentError("the backup is cut off")
+                    h.update(chunk)
+                    f.write(chunk)
+                    left -= len(chunk)
+            entries[key] = {"kind": "file", "mode": m.mode & 0o7777, "mtime": int(m.mtime or 0), "staged": staged,
+                            "size": m.size, "sha256": h.hexdigest()}
+    except (tarfile.TarError, EOFError, zlib.error, OSError) as exc:
+        raise AgentError(f"the backup is damaged or cut off ({exc})") from None
+    finally:
+        try:
+            tar.close()
+        except Exception:  # noqa: BLE001
+            pass
+    if not isinstance(manifest, dict) or manifest.get("format") != SAVES_FORMAT:
+        raise AgentError("not a FramePort save backup (no manifest)")
+    listed = {}
+    for f in manifest.get("files") or []:
+        parts = _saves_member_name(str((f or {}).get("path", "")))
+        if parts is not None:
+            listed[tuple(parts)] = f
+    for key, e in entries.items():
+        if e["kind"] != "file":
+            continue
+        f = listed.get(key)
+        if not f or f.get("sha256") != e["sha256"] or f.get("size") != e["size"]:
+            raise AgentError(f"the backup is damaged: {'/'.join(key)[:200]} doesn't match its manifest")
+    return entries, manifest
+
+
+def _saves_dest(roots, parts):
+    return os.path.join(roots[parts[0]], *parts[1:])
+
+
+def check_saves_destinations(roots, entries):
+    """No restored path may pass through or replace a link, or swap a file for a folder (Lepton keeps links in a
+    game's storage: writing through one would land outside it)."""
+    import stat as st_
+
+    for key, e in entries.items():
+        for i in range(1, len(key) + 1):
+            sub = key[:i]
+            path = _saves_dest(roots, sub)
+            try:
+                s = os.lstat(path)
+            except FileNotFoundError:
+                break  # the rest gets created
+            if st_.S_ISLNK(s.st_mode):
+                raise AgentError(f"won't restore through the link {'/'.join(sub)}")
+            want_dir = i < len(key) or e["kind"] == "dir"
+            if want_dir and not st_.S_ISDIR(s.st_mode):
+                raise AgentError(f"{'/'.join(sub)} is a file on the Frame but a folder in the backup")
+            if not want_dir and not st_.S_ISREG(s.st_mode):
+                raise AgentError(f"{'/'.join(sub)} is a folder on the Frame but a file in the backup")
+
+
+def _saves_parent_stat(path):
+    """stat of path's nearest existing folder."""
+    p = path
+    while True:
+        try:
+            return os.stat(p)
+        except OSError:
+            parent = os.path.dirname(p)
+            if parent == p:
+                raise
+            p = parent
+
+
+def _saves_chown(path, uid, gid):
+    try:
+        s = os.lstat(path)
+        if (s.st_uid, s.st_gid) != (uid, gid):
+            os.chown(path, uid, gid)
+    except OSError:
+        pass  # (outside podman's namespace only our own ids can be set)
+
+
+def _saves_mkdir(path, mode=None):
+    """Create a missing folder (and its parents) owned like its parent folder; mode None = the parent's mode."""
+    if os.path.isdir(path):
+        return
+    parent = os.path.dirname(path)
+    _saves_mkdir(parent)
+    ps = os.stat(parent)
+    os.mkdir(path)
+    os.chmod(path, ((ps.st_mode if mode is None else mode) & 0o2777) | 0o700)
+    _saves_chown(path, ps.st_uid, ps.st_gid)
+
+
+def apply_staged_saves(roots, entries, manifest):
+    """Put staged files in place: existing files keep their owner and mode, new ones get their folder's owner and the
+    backup's mode (at least u+rw); each file is swapped in with one rename. Save files the backup doesn't have go
+    (the same rules as a backup decide what's a save; files too big for the backup stay). Returns counts."""
+    import stat as st_
+
+    restored = removed = 0
+    for key in sorted((k for k, e in entries.items() if e["kind"] == "dir"), key=len):
+        _saves_mkdir(_saves_dest(roots, key), entries[key]["mode"])
+    for root in roots.values():
+        _saves_mkdir(root)
+    for key, e in sorted(entries.items()):
+        if e["kind"] != "file":
+            continue
+        dest = _saves_dest(roots, key)
+        _saves_mkdir(os.path.dirname(dest))
+        try:
+            s = os.lstat(dest)
+            uid, gid, mode = s.st_uid, s.st_gid, st_.S_IMODE(s.st_mode)
+        except FileNotFoundError:
+            ps = _saves_parent_stat(os.path.dirname(dest))
+            uid, gid, mode = ps.st_uid, ps.st_gid, (e["mode"] & 0o777) | 0o600
+        staged = e["staged"]
+        os.chmod(staged, mode)
+        _saves_chown(staged, uid, gid)
+        if e.get("mtime"):
+            os.utime(staged, (e["mtime"], e["mtime"]))
+        os.replace(staged, dest)
+        restored += 1
+    keep = {"/".join(k) for k, e in entries.items() if e["kind"] == "file"}
+    max_file = manifest.get("max_file")
+    current = collect_saves(roots, max_file if isinstance(max_file, int) and max_file > 0 else SAVES_MAX_FILE)
+    for arc, path, _s in current["files"]:
+        if arc not in keep:
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+    return {"restored": restored, "removed": removed}
+
+
+def saves_context(args):
+    """(pkg, dep, roots) of an installed Quest game (its roots are real folders, or missing)."""
+    pkg = check_pkg(args.get("package"))
+    dep = deployment(pkg)
+    if not dep:
+        raise AgentError(f"{pkg} is not installed")
+    if dep.get("kind") in ("pcvr", "linux"):
+        raise AgentError("save backups are for Quest (Android) games only")
+    base = dep["base"]
+    if not os.path.isdir(os.path.join(base, "lepton-app")) and not os.path.isdir(os.path.join(base, "lepton-data")):
+        raise AgentError(f"{pkg}'s files are missing at {base} (storage not mounted?)")
+    roots = saves_roots(base, pkg)
+    data = os.path.realpath(os.path.join(base, "lepton-data"))
+    for r in roots.values():
+        if os.path.islink(r) or (os.path.lexists(r) and not _inside(os.path.realpath(r), data)):
+            raise AgentError(f"{r} is a link: refusing")
+    return pkg, dep, roots
+
+
+class _SavesLock:
+    """The game's launch lock (launch.sh holds it while the game runs): a backup or restore never overlaps a play
+    session, and a Play meanwhile is ignored like a double launch."""
+
+    def __init__(self, dep):
+        self.path, self.fd = os.path.join(dep["base"], ".launch.lock"), None
+
+    def __enter__(self):
+        if fcntl is None:
+            return self
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(self.fd)
+            self.fd = None
+            raise AgentError("the game is running") from None
+        return self
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def saves_running(dep):
+    return bool(dep.get("appid")) and container_running(dep["appid"])
+
+
+def _saves_in_namespace(op, args):
+    """Run op again inside podman's user namespace (stdio inherited); None = run it in this process."""
+    owner = as_owner()
+    if not owner or os.environ.get("FRAMEPORT_SAVES_NS") == "1":
+        return None
+    env = dict(os.environ, FRAMEPORT_SAVES_NS="1")
+    return subprocess.run(owner + [sys.executable or "python3", os.path.abspath(__file__), "_saves_ns", op,
+                                   json.dumps(args)], env=env).returncode
+
+
+def saves_backup_session(args, out, err):
+    """`_backup_saves`: the archive on `out`, one JSON line (ok + summary, or error) on `err`; exit 0 = complete."""
+    def emit(obj):
+        err.write(json.dumps(obj) + "\n")
+        err.flush()
+
+    def here():
+        pkg, dep, roots = saves_context(args)
+        manifest = write_saves_tar(out, pkg, roots, dep, int(args.get("max_file") or SAVES_MAX_FILE),
+                                   int(args.get("max_total") or SAVES_MAX_TOTAL))
+        out.flush()
+        emit({"ok": True, "result": saves_summary(manifest)})
+        return 0
+    try:
+        return _saves_run("backup", args, here)
+    except AgentError as exc:
+        emit({"ok": False, "error": str(exc)})
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        emit({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        return 1
+
+
+def saves_restore_session(args, inp, out):
+    """`_restore_saves`: the archive on `inp` (or the rollback copy with args.rollback), one JSON line on `out`."""
+    def emit(obj):
+        out.write(json.dumps(obj) + "\n")
+        out.flush()
+
+    def here():
+        emit({"ok": True, "result": restore_saves(args, inp)})
+        return 0
+    try:
+        return _saves_run("restore", args, here)
+    except AgentError as exc:
+        emit({"ok": False, "error": str(exc)})
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        emit({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        return 1
+
+
+def _saves_run(op, args, here):
+    """Outside podman's namespace: check the game, take its launch lock, then run `op` in the namespace (stdio
+    inherited). Inside it (FRAMEPORT_SAVES_NS=1), or without podman (tests): run `here` in this process."""
+    if os.environ.get("FRAMEPORT_SAVES_NS") == "1":
+        return here()
+    _pkg, dep, _roots = saves_context(args)
+    if saves_running(dep):
+        raise AgentError("the game is running")
+    with _SavesLock(dep):
+        code = _saves_in_namespace(op, args)
+        return here() if code is None else code
+
+
+def restore_saves(args, inp):
+    """Stage (and check) the whole archive first, keep the current saves as <base>/saves-before-restore.tar.gz (one
+    copy), then swap the files in. A failure while swapping puts the rollback copy back. args.rollback restores that
+    copy instead of `inp` (the current saves become the new rollback copy: undo of the undo)."""
+    pkg, dep, roots = saves_context(args)
+    base = dep["base"]
+    rollback = os.path.join(base, SAVES_ROLLBACK)
+    staging = tempfile.mkdtemp(prefix=".saves-restore-", dir=base)
+    limits = (SAVES_RESTORE_MAX_FILE, SAVES_RESTORE_MAX_TOTAL, SAVES_RESTORE_MAX_MEMBERS)
+    try:
+        if args.get("rollback"):
+            if not os.path.isfile(rollback):
+                raise AgentError("there's no copy of the saves from before the last restore")
+            with open(rollback, "rb") as f:
+                entries, manifest = stage_saves_archive(f, staging, *limits)
+        else:
+            entries, manifest = stage_saves_archive(inp, staging, *limits)
+        if manifest.get("package") != pkg:
+            raise AgentError(f"this backup is of {manifest.get('package')}, not {pkg}")
+        check_saves_destinations(roots, entries)
+        tmp = rollback + ".tmp"
+        with open(tmp, "wb") as f:
+            write_saves_tar(f, pkg, roots, dep, SAVES_MAX_FILE, 1 << 62)
+        os.replace(tmp, rollback)
+        try:
+            counts = apply_staged_saves(roots, entries, manifest)
+        except Exception as exc:  # noqa: BLE001
+            undo = os.path.join(staging, "undo")
+            os.mkdir(undo)
+            try:
+                with open(rollback, "rb") as f:
+                    back, back_manifest = stage_saves_archive(f, undo)
+                apply_staged_saves(roots, back, back_manifest)
+                state = "the saves from before were put back"
+            except Exception as again:  # noqa: BLE001
+                state = f"putting the saves from before back failed too ({again}); they're in {rollback}"
+            raise AgentError(f"restoring failed ({exc}); {state}") from exc
+        return {**counts, "package": pkg, "rollback": rollback, "rollback_size": os.path.getsize(rollback),
+                "backup_created": manifest.get("created"), "backup_version": manifest.get("version")}
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _saves_info(found):
+    return {"files": len(found["files"]), "bytes": sum(s.st_size for _a, _p, s in found["files"]),
+            "skipped": [s for s in found["skipped"] if s["reason"] in ("size", "unreadable")]}
+
+
+def cmd_saves_info(args):
+    """What a save backup of the game would hold now (files, bytes, large files left out), whether the game runs, and
+    the rollback copy of the last restore."""
+    pkg, dep, roots = saves_context(args)
+    max_file = int(args.get("max_file") or SAVES_MAX_FILE)
+    owner = as_owner()
+    if owner:  # the app's files may belong to mapped ids: count them in podman's namespace
+        p = run(owner + [sys.executable or "python3", os.path.abspath(__file__), "_saves_ns", "info",
+                         json.dumps(args)], env=dict(os.environ, FRAMEPORT_SAVES_NS="1"))
+        try:
+            info = json.loads(p.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            raise AgentError(f"couldn't read {pkg}'s saves: {p.stderr.strip()[-300:]}") from None
+    else:
+        info = _saves_info(collect_saves(roots, max_file))
+    rollback = os.path.join(dep["base"], SAVES_ROLLBACK)
+    info.update(package=pkg, running=saves_running(dep), version=_dep_version(dep),
+                rollback={"size": os.path.getsize(rollback), "time": os.path.getmtime(rollback)}
+                if os.path.isfile(rollback) else None)
+    return info
+
+
+def cmd_saves_rollback_delete(args):
+    """Remove the copy of the saves from before the last restore."""
+    _pkg, dep, _roots = saves_context(args)
+    path = os.path.join(dep["base"], SAVES_ROLLBACK)
+    if os.path.isfile(path):
+        os.remove(path)
+        return {"removed": True}
+    return {"removed": False}
+
+
+def saves_ns_main(op, raw):
+    """`_saves_ns <op> '<json>'`: the part of a save command that runs inside `podman unshare`."""
+    os.environ["FRAMEPORT_SAVES_NS"] = "1"
+    args = json.loads(raw)
+    if op == "backup":
+        return saves_backup_session(args, sys.stdout.buffer, sys.stderr)
+    if op == "restore":
+        return saves_restore_session(args, sys.stdin.buffer, sys.stdout)
+    if op == "snapshot":
+        print(json.dumps(create_save_snapshot(args["package"])))
+        return 0
+    if op == "files":
+        try:
+            print(json.dumps({"ok": True, "result": saves_files_here(args)}))
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({"ok": False, "error": str(exc) if isinstance(exc, AgentError)
+                              else f"{type(exc).__name__}: {exc}"}))
+        return 0
+    if op == "get":
+        return saves_get_session(args, sys.stdout.buffer, sys.stderr)
+    if op == "put":
+        return saves_put_session(args, sys.stdin.buffer, sys.stdout)
+    if op == "move":
+        return files_move_session(args, sys.stdout)
+    if op == "info":
+        try:
+            _pkg, _dep, roots = saves_context(args)
+            print(json.dumps(_saves_info(collect_saves(roots, int(args.get("max_file") or SAVES_MAX_FILE)))))
+            return 0
+        except AgentError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    return 2
+
+
+SNAPSHOT_ROOT = os.path.expanduser("~/.local/share/frameport/save-snapshots")
+SNAPSHOT_NAME = re.compile(r"^[0-9]+-[a-f0-9]{64}\.tar\.gz$")
+
+
+def cmd_save_snapshot_settings(args):
+    """Global opt-in, read at every game exit, including when the PC is disconnected."""
+    os.makedirs(SNAPSHOT_ROOT, exist_ok=True)
+    flag = os.path.join(SNAPSHOT_ROOT, "enabled")
+    if args.get("enabled") and not os.path.isfile(flag):
+        with open(flag + ".tmp", "w") as f:
+            f.write("1\n")
+        os.replace(flag + ".tmp", flag)
+    elif not args.get("enabled") and os.path.exists(flag):
+        os.remove(flag)
+    return {"enabled": os.path.isfile(flag)}
+
+
+def snapshot_files(pkg):
+    folder = os.path.join(SNAPSHOT_ROOT, check_pkg(pkg))
+    return sorted((p for p in glob.glob(os.path.join(folder, "*.tar.gz"))
+                   if SNAPSHOT_NAME.fullmatch(os.path.basename(p)) and not os.path.islink(p)), reverse=True)
+
+
+def cmd_save_snapshots(args):
+    out = []
+    for folder in sorted(glob.glob(os.path.join(SNAPSHOT_ROOT, "*"))):
+        pkg = os.path.basename(folder)
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+", pkg) or os.path.islink(folder):
+            continue
+        for path in reversed(snapshot_files(pkg)):  # oldest first: PC retention keeps the newest
+            name = os.path.basename(path)
+            out.append({"package": pkg, "snapshot": name, "sha256": name.split("-", 1)[1][:-7]})
+    return {"snapshots": out}
+
+
+def create_save_snapshot(pkg):
+    """Called in the user namespace with the launch lock held; publish complete archives only."""
+    pkg, dep, roots = saves_context({"package": pkg})
+    if saves_running(dep):
+        raise AgentError("the game is running")
+    folder = os.path.join(SNAPSHOT_ROOT, pkg)
+    os.makedirs(folder, exist_ok=True)
+    found = collect_saves(roots)
+    if sum(st.st_size for _arc, _path, st in found["files"]) > SAVES_MAX_TOTAL:
+        raise AgentError("saves exceed the snapshot size limit")
+    entries = []
+    for arc, path, st in found["files"]:
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+        entries.append((arc, st.st_size, digest.hexdigest()))
+    fingerprint = hashlib.sha256(json.dumps(entries).encode()).hexdigest()
+    previous = snapshot_files(pkg)
+    if previous:
+        try:
+            with open(previous[0] + ".json") as f:
+                if json.load(f).get("fingerprint") == fingerprint:
+                    return {"created": False, "reason": "unchanged"}
+        except (OSError, ValueError):
+            pass  # damaged metadata must not prevent a new backup
+    part = os.path.join(folder, "snapshot.part")
+    try:
+        with open(part, "wb") as f:
+            write_saves_tar(f, pkg, roots, dep, automatic=True)
+        digest = hashlib.sha256()
+        with open(part, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+        name = f"{time.time_ns()}-{digest.hexdigest()}.tar.gz"
+        dest = os.path.join(folder, name)
+        with open(dest + ".json", "w") as f:
+            json.dump({"fingerprint": fingerprint}, f)
+        os.replace(part, dest)
+        for old in snapshot_files(pkg)[3:]:
+            os.remove(old)
+            if os.path.exists(old + ".json"):
+                os.remove(old + ".json")
+        return {"created": True, "snapshot": name}
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
+
+
+def snapshot_close(pkg):
+    if not os.path.isfile(os.path.join(SNAPSHOT_ROOT, "enabled")):
+        return 0
+    _pkg, dep, _roots = saves_context({"package": pkg})
+    # Never trust an environment variable claiming the game is stopped: verify the inherited lock itself.
+    lock = os.stat(os.path.join(dep["base"], ".launch.lock"))
+    inherited = os.fstat(9)
+    if (lock.st_dev, lock.st_ino) != (inherited.st_dev, inherited.st_ino) or fcntl is None:
+        raise AgentError("snapshot needs the launcher's lock")
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    owner = as_owner()
+    if owner:
+        return subprocess.run(owner + [sys.executable or "python3", os.path.abspath(__file__),
+                                       "_saves_ns", "snapshot", json.dumps({"package": pkg})],
+                              pass_fds=(9,)).returncode
+    print(json.dumps(create_save_snapshot(pkg)))
+    return 0
+
+
+def fetch_save_snapshot(args, out, err):
+    try:
+        pkg, name = check_pkg(args.get("package")), args.get("snapshot") or ""
+        if not SNAPSHOT_NAME.fullmatch(name):
+            raise AgentError("invalid save snapshot")
+        path = os.path.join(SNAPSHOT_ROOT, pkg, name)
+        if path not in snapshot_files(pkg) or os.path.islink(os.path.dirname(path)):
+            raise AgentError("save snapshot no longer available")
+        with open(path, "rb") as f:
+            shutil.copyfileobj(f, out, 1 << 16)
+        out.flush()
+        err.write(json.dumps({"ok": True}) + "\n")
+        return 0
+    except (OSError, AgentError) as exc:
+        err.write(json.dumps({"ok": False, "error": str(exc)}) + "\n")
+        return 1
+
+
+# ------------------------------------------------------------------------------------------ Files tab (GitHub #532)
+# The PC's Files tab browses most locations over SFTP. Two things need the agent: a game's internal storage (Lepton's
+# /data/data/<pkg>, where Unreal and Unity keep saves), whose files belong to the container's mapped user ids and are
+# only reachable in podman's user namespace (like save backups), and "Move to…", which copies on the Frame when the
+# two folders are on different file systems. Saves are never changed while the game runs (its launch lock is held).
+FILES_CHUNK = 1 << 20
+
+
+def _files_checked(root, path, follow=False):
+    """`path` (absolute, or relative to root) normalised; refused outside root. Also checked through links: the
+    folder holding it (follow=False: the item itself may be a link, which is acted on, never followed) or the path
+    itself (follow=True, e.g. a folder to list or to move into) must really be inside root."""
+    root = os.path.normpath(root)
+    path = os.path.normpath(path if os.path.isabs(path) else os.path.join(root, path))
+    if not _inside(path, root):
+        raise AgentError(f"{path} is outside {root}")
+    probe = path if follow or path == root else os.path.dirname(path)
+    if not _inside(os.path.realpath(probe), os.path.realpath(root)):
+        raise AgentError(f"{path} leads outside {root} (through a link)")
+    return path
+
+
+def _files_name(name):
+    name = (name or "").strip()
+    if not name or name in (".", "..") or "/" in name or "\0" in name:
+        raise AgentError(f"not a valid name: {name!r}")
+    return name
+
+
+def _files_lepton_link(path):
+    """One of Lepton's links at the top of a game's /sdcard (Movies → ~/Videos, …): moving it breaks the game's view
+    of the shared folders."""
+    parent = os.path.dirname(os.path.normpath(path))
+    return (os.path.islink(path) and os.path.basename(parent) == "external"
+            and os.path.basename(os.path.dirname(parent)) == "lepton-data")
+
+
+def saves_files_here(args):
+    """A Files-tab operation on the game's internal storage, run where its files are reachable (podman's namespace)."""
+    import stat as st_
+
+    pkg, _dep, roots = saves_context(args)
+    root, op = roots["internal"], args.get("op")
+    if op == "info":
+        return {"root": root, "android": f"/data/data/{pkg}", "exists": os.path.isdir(root)}
+    if not os.path.isdir(root):
+        raise AgentError("the game hasn't created its storage yet: start it once")
+    if op == "list":
+        path = _files_checked(root, args.get("path") or root, follow=True)
+        out = []
+        for name in sorted(os.listdir(path)):
+            if name.startswith(".") and not args.get("hidden"):
+                continue
+            full = os.path.join(path, name)
+            try:
+                s = t = os.lstat(full)
+            except OSError:
+                continue
+            link = st_.S_ISLNK(s.st_mode)
+            if link:
+                try:
+                    t = os.stat(full)
+                except OSError:
+                    pass
+            out.append({"name": name, "path": full, "is_dir": st_.S_ISDIR(t.st_mode), "size": t.st_size,
+                        "mtime": s.st_mtime, "link": link})
+        return {"entries": out}
+    if op == "mkdir":
+        parent = _files_checked(root, args.get("parent") or root, follow=True)
+        path = os.path.join(parent, _files_name(args.get("name")))
+        if os.path.lexists(path):
+            raise AgentError(f"{os.path.basename(path)} already exists")
+        _saves_mkdir(path)
+        return {"path": path}
+    if op == "rename":
+        path = _files_checked(root, args.get("path"))
+        if path == root:
+            raise AgentError("the location itself can't be renamed")
+        new = os.path.join(os.path.dirname(path), _files_name(args.get("name")))
+        if os.path.lexists(new):
+            raise AgentError(f"{os.path.basename(new)} already exists")
+        os.rename(path, new)
+        return {"path": new}
+    if op == "delete":
+        paths = [_files_checked(root, p) for p in args.get("paths") or []]
+        if root in paths:
+            raise AgentError("the location itself can't be deleted")
+        for p in paths:
+            if os.path.isdir(p) and not os.path.islink(p):
+                shutil.rmtree(p)
+            elif os.path.lexists(p):
+                os.remove(p)
+        return {"deleted": len(paths)}
+    raise AgentError(f"unknown saves files operation {op!r}")
+
+
+SAVES_FILES_WRITE = ("mkdir", "rename", "delete")
+
+
+def _saves_ns_reply(op, args, here):
+    """Run `here(args)` in podman's namespace (`_saves_ns <op>`, one JSON reply line) or, without podman, here."""
+    owner = as_owner()
+    if not owner or os.environ.get("FRAMEPORT_SAVES_NS") == "1":
+        return here(args)
+    p = run(owner + [sys.executable or "python3", os.path.abspath(__file__), "_saves_ns", op, json.dumps(args)],
+            env=dict(os.environ, FRAMEPORT_SAVES_NS="1"))
+    line = next((ln for ln in reversed(p.stdout.splitlines()) if ln.startswith("{")), "")
+    try:
+        reply = json.loads(line)
+    except ValueError:
+        raise AgentError(f"couldn't reach the game's storage: {p.stderr.strip()[-300:]}") from None
+    if not reply.get("ok"):
+        raise AgentError(reply.get("error") or "the game's storage couldn't be changed")
+    return reply["result"]
+
+
+def cmd_saves_files(args):
+    """The Files tab's "<game> — saves" location (the game's /data/data/<pkg>): op info | list (path, hidden) |
+    mkdir (parent, name) | rename (path, name) | delete (paths). Changes are refused while the game runs and hold its
+    launch lock; info and list also work while it runs (info says whether it does)."""
+    _pkg, dep, _roots = saves_context(args)
+    op = args.get("op")
+    if op not in ("info", "list", *SAVES_FILES_WRITE):
+        raise AgentError(f"unknown saves files operation {op!r}")
+    running = saves_running(dep)
+    if op in SAVES_FILES_WRITE:
+        if running:
+            raise AgentError("the game is running: close it before changing its saves")
+        with _SavesLock(dep):
+            return _saves_ns_reply("files", args, saves_files_here)
+    result = _saves_ns_reply("files", args, saves_files_here)
+    if op == "info":
+        result["running"] = running
+    return result
+
+
+def saves_get_here(args, out):
+    """Files below the game's internal storage as one plain tar on `out` (folders keep their structure; links,
+    devices and pipes are left out). Returns {files, bytes}."""
+    import stat as st_
+    import tarfile
+
+    _pkg, _dep, roots = saves_context(args)
+    root = roots["internal"]
+    files = size = 0
+    with tarfile.open(fileobj=out, mode="w|") as tar:
+        for p in args.get("paths") or []:
+            p = _files_checked(root, p)
+            top = os.path.dirname(p)
+            for cur, dirs, names in os.walk(p) if os.path.isdir(p) and not os.path.islink(p) else [(None, [], [p])]:
+                if cur is not None:
+                    dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(cur, d)))
+                    tar.add(cur, arcname=os.path.relpath(cur, top), recursive=False)
+                for name in sorted(names):
+                    full = name if cur is None else os.path.join(cur, name)
+                    s = os.lstat(full)
+                    if not st_.S_ISREG(s.st_mode):
+                        continue
+                    ti = tar.gettarinfo(full, arcname=os.path.relpath(full, top))
+                    ti.uid = ti.gid = 0
+                    ti.uname = ti.gname = ""
+                    with open(full, "rb") as f:
+                        tar.addfile(ti, f)
+                    files, size = files + 1, size + s.st_size
+    out.flush()
+    return {"files": files, "bytes": size}
+
+
+def saves_put_here(args, inp):
+    """Unpack a plain tar from the PC into a folder of the game's internal storage (untrusted input: folders and
+    regular files only, nothing outside the folder or through a link). New files and folders belong to the folder's
+    owner (the game's user id), an existing file keeps its owner and mode. Returns {files, bytes, folders}."""
+    import stat as st_
+    import tarfile
+
+    _pkg, _dep, roots = saves_context(args)
+    root = roots["internal"]
+    if not os.path.isdir(root):
+        raise AgentError("the game hasn't created its storage yet: start it once")
+    dest = _files_checked(root, args.get("dest") or root, follow=True)
+    files = size = folders = 0
+    with tarfile.open(fileobj=inp, mode="r|") as tar:
+        for m in tar:
+            parts = [x for x in m.name.replace("\\", "/").split("/") if x and x != "."]
+            if not parts or any(x == ".." for x in parts) or m.name.startswith("/"):
+                raise AgentError(f"refusing the path {m.name[:200]!r}")
+            if not (m.isdir() or m.isreg()):
+                continue
+            for i in range(1, len(parts) + 1):  # nothing on the way may be a link (or a file where a folder goes)
+                p = os.path.join(dest, *parts[:i])
+                try:
+                    s = os.lstat(p)
+                except FileNotFoundError:
+                    break
+                if st_.S_ISLNK(s.st_mode):
+                    raise AgentError(f"won't write through the link {'/'.join(parts[:i])}")
+                if (i < len(parts) or m.isdir()) and not st_.S_ISDIR(s.st_mode):
+                    raise AgentError(f"{'/'.join(parts[:i])} is a file on the Frame, not a folder")
+                if i == len(parts) and m.isreg() and not st_.S_ISREG(s.st_mode):
+                    raise AgentError(f"{'/'.join(parts)} is a folder on the Frame, not a file")
+            target = os.path.join(dest, *parts)
+            if m.isdir():
+                if not os.path.isdir(target):
+                    _saves_mkdir(target)
+                    folders += 1
+                continue
+            _saves_mkdir(os.path.dirname(target))
+            old = os.lstat(target) if os.path.lexists(target) else None
+            ps = os.stat(os.path.dirname(target))
+            tmp = os.path.join(os.path.dirname(target), f".fp-upload-{os.getpid()}-{parts[-1]}"[:255])
+            src = tar.extractfile(m)
+            try:
+                if os.path.lexists(tmp):  # a leftover of a cut-off upload (removed, never followed)
+                    os.remove(tmp)
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                with os.fdopen(fd, "wb") as f:
+                    shutil.copyfileobj(src, f, FILES_CHUNK)
+                os.chmod(tmp, old.st_mode & 0o7777 if old else 0o660)
+                _saves_chown(tmp, old.st_uid if old else ps.st_uid, old.st_gid if old else ps.st_gid)
+                os.replace(tmp, target)
+            finally:
+                if os.path.lexists(tmp):
+                    os.remove(tmp)
+            files, size = files + 1, size + m.size
+    return {"files": files, "bytes": size, "folders": folders}
+
+
+def _saves_stream(op, args, here, write):
+    """Outside podman's namespace: check the game (write: not running, launch lock held), then run `op` in the
+    namespace with stdio inherited. Inside it, or without podman: `here()`."""
+    if os.environ.get("FRAMEPORT_SAVES_NS") == "1":
+        return here()
+    _pkg, dep, _roots = saves_context(args)
+    if not write:
+        code = _saves_in_namespace(op, args)
+        return here() if code is None else code
+    if saves_running(dep):
+        raise AgentError("the game is running: close it before changing its saves")
+    with _SavesLock(dep):
+        code = _saves_in_namespace(op, args)
+        return here() if code is None else code
+
+
+def saves_get_session(args, out, err):
+    """`_saves_get '<json>'`: a tar of the paths on `out`, one JSON line (ok + {files, bytes}, or error) on `err`."""
+    def here():
+        err.write(json.dumps({"ok": True, "result": saves_get_here(args, out)}) + "\n")
+        err.flush()
+        return 0
+    try:
+        return _saves_stream("get", args, here, write=False)
+    except Exception as exc:  # noqa: BLE001
+        err.write(json.dumps({"ok": False, "error": str(exc) if isinstance(exc, AgentError)
+                              else f"{type(exc).__name__}: {exc}"}) + "\n")
+        err.flush()
+        return 1
+
+
+def saves_put_session(args, inp, out):
+    """`_saves_put '<json>'`: a tar on `inp` unpacked into args.dest, one JSON line on `out`."""
+    def here():
+        out.write(json.dumps({"ok": True, "result": saves_put_here(args, inp)}) + "\n")
+        out.flush()
+        return 0
+    try:
+        return _saves_stream("put", args, here, write=True)
+    except Exception as exc:  # noqa: BLE001
+        out.write(json.dumps({"ok": False, "error": str(exc) if isinstance(exc, AgentError)
+                              else f"{type(exc).__name__}: {exc}"}) + "\n")
+        out.flush()
+        return 1
+
+
+# --- Move to…
+def _files_end(end):
+    """(root, package or None) of one end of a move: {"saves": pkg} = that game's internal storage, else {"root":
+    an absolute folder} (one of the Files tab's locations; never / itself)."""
+    if not isinstance(end, dict):
+        raise AgentError("bad location")
+    if end.get("saves"):
+        pkg, _dep, roots = saves_context({"package": end["saves"]})
+        return roots["internal"], pkg
+    root = end.get("root") or ""
+    if not root.startswith("/") or os.path.normpath(root) == "/":
+        raise AgentError(f"bad location {root!r}")
+    return os.path.normpath(root), None
+
+
+def _files_same_fs(src, folder):
+    """Whether moving src into folder is a rename (one file system) rather than a copy."""
+    return os.lstat(src).st_dev == os.stat(folder).st_dev
+
+
+def _files_tree_size(path):
+    import stat as st_
+
+    s = os.lstat(path)
+    if st_.S_ISREG(s.st_mode):
+        return s.st_size
+    if not st_.S_ISDIR(s.st_mode):
+        return 0
+    total = 0
+    for cur, _dirs, names in os.walk(path):
+        for n in names:
+            try:
+                s = os.lstat(os.path.join(cur, n))
+            except OSError:
+                continue
+            if st_.S_ISREG(s.st_mode):
+                total += s.st_size
+    return total
+
+
+def _files_copy(src, dst, tick):
+    """Copy a file, link or folder (links stay links, devices and pipes are left out); tick(n) after each chunk."""
+    import stat as st_
+
+    s = os.lstat(src)
+    if st_.S_ISLNK(s.st_mode):
+        os.symlink(os.readlink(src), dst)
+    elif st_.S_ISDIR(s.st_mode):
+        os.mkdir(dst)
+        for name in sorted(os.listdir(src)):
+            _files_copy(os.path.join(src, name), os.path.join(dst, name), tick)
+        shutil.copystat(src, dst, follow_symlinks=False)
+    elif st_.S_ISREG(s.st_mode):
+        with open(src, "rb") as fi, open(dst, "wb") as fo:
+            while True:
+                chunk = fi.read(FILES_CHUNK)
+                if not chunk:
+                    break
+                fo.write(chunk)
+                tick(len(chunk))
+        shutil.copystat(src, dst, follow_symlinks=False)
+
+
+def _files_chown_tree(path, uid, gid):
+    _saves_chown(path, uid, gid)
+    if os.path.isdir(path) and not os.path.islink(path):
+        for cur, dirs, names in os.walk(path):
+            for n in dirs + names:
+                _saves_chown(os.path.join(cur, n), uid, gid)
+
+
+def files_move_here(args, emit):
+    """Move args.items (inside the source location) into args.folder (inside the destination location): one rename
+    when both are on the same file system, else a copy and then the original deleted (a failed copy removes its
+    partial copy and keeps the original). Nothing is overwritten. Into or out of a game's internal storage the
+    moved files get the destination folder's owner (the game's user id, or the steamos user). emit(progress dict)
+    reports copied bytes. Returns {moved, renamed, copied, bytes}."""
+    src_root, src_pkg = _files_end(args.get("src"))
+    dest_root, dest_pkg = _files_end(args.get("dest"))
+    folder = _files_checked(dest_root, args.get("folder") or dest_root, follow=True)
+    if not os.path.isdir(folder):
+        raise AgentError(f"{folder} is not a folder")
+    items = []
+    for p in args.get("items") or []:
+        p = _files_checked(src_root, p)
+        if p == src_root:
+            raise AgentError("the location itself can't be moved")
+        if not os.path.lexists(p):
+            raise AgentError(f"{os.path.basename(p)} isn't there any more")
+        if _files_lepton_link(p):
+            raise AgentError(f"{os.path.basename(p)} is one of Lepton's links: the game needs it where it is")
+        target = os.path.join(folder, os.path.basename(p))
+        if _inside(folder, p):
+            raise AgentError(f"{os.path.basename(p)} can't be moved into itself")
+        if os.path.normpath(os.path.dirname(p)) == folder:
+            raise AgentError(f"{os.path.basename(p)} is already in that folder")
+        if os.path.lexists(target):
+            raise AgentError(f"{os.path.basename(p)} already exists in {folder}")
+        items.append((p, target))
+    if not items:
+        raise AgentError("nothing to move")
+    owner = None
+    if (src_pkg or dest_pkg) and os.environ.get("FRAMEPORT_SAVES_NS") == "1":
+        fs = os.stat(folder)
+        owner = (fs.st_uid, fs.st_gid)
+    plan = [(p, t, _files_same_fs(p, folder)) for p, t in items]
+    total = sum(_files_tree_size(p) for p, _t, same in plan if not same)
+    done = {"bytes": 0, "at": 0.0}
+    renamed = copied = 0
+
+    def tick(n, name=""):
+        done["bytes"] += n
+        now = time.monotonic()
+        if now - done["at"] >= 0.25 or not n:
+            done["at"] = now
+            emit({"progress": done["bytes"], "total": total, "item": name})
+
+    for p, target, same in plan:
+        name = os.path.basename(p)
+        if same:
+            try:
+                os.rename(p, target)
+                renamed += 1
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
+                    raise
+                same = False
+                total += _files_tree_size(p)
+        if not same:
+            try:
+                _files_copy(p, target, lambda n, name=name: tick(n, name))
+            except BaseException:
+                if os.path.isdir(target) and not os.path.islink(target):
+                    shutil.rmtree(target, ignore_errors=True)
+                elif os.path.lexists(target):
+                    os.remove(target)
+                raise
+            try:
+                if os.path.isdir(p) and not os.path.islink(p):
+                    shutil.rmtree(p)
+                else:
+                    os.remove(p)
+            except OSError as exc:
+                raise AgentError(f"{name} was copied to {folder}, but the original couldn't be removed completely: "
+                                 f"{exc}") from exc
+            copied += 1
+        if owner:
+            _files_chown_tree(target, *owner)
+        tick(0, name)
+    return {"moved": len(plan), "renamed": renamed, "copied": copied, "bytes": done["bytes"]}
+
+
+def files_move_session(args, out):
+    """`_files_move '<json>'`: progress lines ({"progress", "total", "item"}) and one result line on `out`. Moves into
+    or out of a game's internal storage run in podman's namespace, refused while that game runs, its launch lock held.
+    A closed channel (Cancel on the PC) stops a copy and removes its partial copy."""
+    def emit(obj):
+        out.write(json.dumps(obj) + "\n")
+        out.flush()
+
+    def here():
+        emit({"ok": True, "result": files_move_here(args, emit)})
+        return 0
+    try:
+        if os.environ.get("FRAMEPORT_SAVES_NS") == "1":
+            return here()
+        games = sorted({e["saves"] for e in (args.get("src"), args.get("dest"))
+                        if isinstance(e, dict) and e.get("saves")})
+        if not games:
+            return here()
+        with contextlib.ExitStack() as stack:
+            for pkg in games:
+                _pkg, dep, _roots = saves_context({"package": pkg})
+                if saves_running(dep):
+                    raise AgentError("the game is running: close it before changing its saves")
+                stack.enter_context(_SavesLock(dep))
+            code = _saves_in_namespace("move", args)
+            return here() if code is None else code
+    except BrokenPipeError:
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        try:
+            emit({"ok": False, "error": str(exc) if isinstance(exc, AgentError) else f"{type(exc).__name__}: {exc}"})
+        except OSError:
+            pass
+        return 1
+
+
+COMMANDS = {n[4:]: f for n, f in globals().items() if n.startswith("cmd_")}
+
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "_openxr_manifest":
+        dep = deployment(check_pkg(sys.argv[2])) or {}
+        if dep.get("static_openxr_loader"):
+            write_openxr_runtime_manifest(dep["base"], True)
+        return
+    if len(sys.argv) >= 3 and sys.argv[1] == "_snapshot_close":
+        return snapshot_close(sys.argv[2])
+    if len(sys.argv) >= 3 and sys.argv[1] == "_fetch_save_snapshot":
+        return fetch_save_snapshot(json.loads(sys.argv[2]), sys.stdout.buffer, sys.stderr)
+    if len(sys.argv) >= 2 and sys.argv[1] == "_keyboard":
+        return keyboard_session(sys.stdin, sys.stdout)
+    if len(sys.argv) >= 2 and sys.argv[1] == "_vr_overlay_watch":
+        vr_overlay_watch()
+        return
+    if len(sys.argv) >= 2 and sys.argv[1] == "_vr_overlay_round":
+        print(json.dumps(overlay_autostart_round()), flush=True)
+        return
+    if len(sys.argv) >= 3 and sys.argv[1] == "_backup_saves":
+        return saves_backup_session(json.loads(sys.argv[2]), sys.stdout.buffer, sys.stderr)
+    if len(sys.argv) >= 3 and sys.argv[1] == "_restore_saves":
+        return saves_restore_session(json.loads(sys.argv[2]), sys.stdin.buffer, sys.stdout)
+    if len(sys.argv) >= 3 and sys.argv[1] == "_saves_get":
+        return saves_get_session(json.loads(sys.argv[2]), sys.stdout.buffer, sys.stderr)
+    if len(sys.argv) >= 3 and sys.argv[1] == "_saves_put":
+        return saves_put_session(json.loads(sys.argv[2]), sys.stdin.buffer, sys.stdout)
+    if len(sys.argv) >= 3 and sys.argv[1] == "_files_move":
+        return files_move_session(json.loads(sys.argv[2]), sys.stdout)
+    if len(sys.argv) >= 4 and sys.argv[1] == "_saves_ns":
+        return saves_ns_main(sys.argv[2], sys.argv[3])
+    if len(sys.argv) >= 2 and sys.argv[1] == "_monitor":
+        return monitor_session(sys.stdin, sys.stdout)
+    if len(sys.argv) >= 3 and sys.argv[1] == "_shortcuts_worker":
+        shortcuts_worker(sys.argv[2])
+        return 0
+    if len(sys.argv) >= 3 and sys.argv[1] == "_purge_worker":
+        purge_worker(sys.argv[2])
+        return 0
+    if len(sys.argv) >= 3 and sys.argv[1] == "_room_capture":
+        room_capture_worker(sys.argv[2])
+        return 0
+    if len(sys.argv) >= 3 and sys.argv[1] == "_move_worker":
+        move_worker(sys.argv[2])
+        return 0
+    if len(sys.argv) >= 3 and sys.argv[1] == "_xr_probe":
+        xr_probe(sys.argv[2])
+        return 0
+    if len(sys.argv) >= 5 and sys.argv[1] == "_logcat_keeper":
+        logcat_keeper(sys.argv[2], sys.argv[3], sys.argv[4])
+        return 0
+    if len(sys.argv) >= 4 and sys.argv[1] == "_offline_guard":
+        offline_guard(sys.argv[2], sys.argv[3])
+        return 0
+    if len(sys.argv) >= 2 and sys.argv[1] == "_steam_locale":
+        print(steam_locale())
+        return 0
+    if len(sys.argv) >= 4 and sys.argv[1] == "_extra_folder":
+        print(extra_folder(sys.argv[2], check_pkg(sys.argv[3]), os.environ.get(FOLDER_ENV, "")))
+        return 0
+    if len(sys.argv) >= 4 and sys.argv[1] == "_gamepad_links":
+        gamepad_links(sys.argv[2], sys.argv[3])
+        return 0
+    if len(sys.argv) >= 5 and sys.argv[1] == "_restart_requested":
+        return 0 if restart_requested(sys.argv[2], sys.argv[3], sys.argv[4]) else 1
+    if len(sys.argv) >= 5 and sys.argv[1] == "_exit_hook":
+        exit_hook_worker(sys.argv[2], sys.argv[3], sys.argv[4])
+        return 0
+    if len(sys.argv) >= 4 and sys.argv[1] == "_dashboard_worker":
+        dashboard_worker(sys.argv[2], sys.argv[3])
+        return 0
+    if len(sys.argv) >= 3 and sys.argv[1] == "_scan_watch":
+        scan_watch_worker(sys.argv[2])
+        return 0
+    if len(sys.argv) >= 3 and sys.argv[1] == "_room_sync":
+        print(json.dumps(room_sync_worker(sys.argv[2])))
+        return 0
+    if len(sys.argv) >= 3 and sys.argv[1] == "_config_sync":
+        config_sync_worker(sys.argv[2])
+        return 0
+    if len(sys.argv) >= 4 and sys.argv[1] == "_theater_hold":
+        theater_hold_worker(sys.argv[2], sys.argv[3])
+        return 0
+    if len(sys.argv) >= 3 and sys.argv[1] == "_refresh_rate":
+        refresh_rate_worker(sys.argv[2])
+        return 0
+    if len(sys.argv) >= 3 and sys.argv[1] == "_tools_worker":
+        tools_worker(sys.argv[2])
+        return 0
+    if len(sys.argv) != 2 or sys.argv[1] not in COMMANDS:
+        print(json.dumps({"ok": False, "error": f"usage: frameport_agent.py <{'|'.join(sorted(COMMANDS))}>"}))
+        return 2
+    if sys.argv[1] == "library_pending" and hasattr(signal, "alarm"):
+        signal.alarm(LIBRARY_HOOK_SECONDS + 5)  # Steam's ExecStartPre: own deadline too, should timeout(1) be missing
+    raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+    try:
+        args = json.loads(raw) if raw.strip() else {}
+        result = COMMANDS[sys.argv[1]](args)
+        print(json.dumps({"ok": True, "result": result}))
+        return 0
+    except AgentError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}))
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

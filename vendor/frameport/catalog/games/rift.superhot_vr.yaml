@@ -1,0 +1,23 @@
+package: rift.superhot_vr
+title: SUPERHOT VR
+status: works
+notes: 'Supports SteamVR/OpenXR itself: runs directly, without Revive. Older builds with both Oculus and SteamVR support
+  (SUPERHOTVR.exe) start with -vrmode OpenVR.'
+engine: Unity
+xr: OpenXR
+kind: rift
+pcvr:
+- pcvr.launch_args
+- pcvr.xr_timefix
+- pcvr.steamvr_tuning
+pcvr_remove:
+- pcvr.revive
+as_is: true
+verified:
+  date: '2026-10-05'
+  known_good_sha256: 143dd3c6a93a45819a98e3cca8fd1535b461cdf860c927d955ca54815faf5d7b
+  app: 0.6.3
+  overport_cli: 1.2.5
+  issue: 28
+updated: '2026-10-09'
+source_hint: SUPERHOT VR

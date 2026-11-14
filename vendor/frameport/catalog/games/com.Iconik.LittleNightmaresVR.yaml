@@ -1,0 +1,20 @@
+package: com.Iconik.LittleNightmaresVR
+title: Little Nightmares VR
+status: works
+tested_version: 1.0.31
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+- frame.hw_video_decode
+device:
+- device.text_input_window
+verified:
+  date: '2026-10-18'
+  known_good_sha256: 171e586bf35ee4494874c6f2c37fb734f718e5b81744b2df9095919398d70839
+  app: 1.2.1
+  overport_cli: 1.2.5
+  frame_build: '20261015.6141207'
+  agent: 96
+  issue: 421
+source_hint: Little Nightmares VR- Altered Echoes

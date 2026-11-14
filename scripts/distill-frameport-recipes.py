@@ -20,7 +20,7 @@ import sys
 import yaml
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-FRAMEPORT_COMMIT = "5424e429e46e53fe51497babac124dd91dbb73bf"
+FRAMEPORT_COMMIT = "72c71fbbd303886992ab62cbc1aea6287100f935"
 
 
 def main() -> None:

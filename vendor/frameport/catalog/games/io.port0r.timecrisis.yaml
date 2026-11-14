@@ -1,0 +1,20 @@
+package: io.port0r.timecrisis
+title: 'Port0r: Time Crisis VR'
+status: issues
+notes: Immersive mode shows a black screen (only the arm and gun); the flat and 3D screen modes work
+  (game menu, setup button).
+tested_version: 0.2.2
+engine: Other
+xr: OpenXR
+adapter:
+  refresh_rate: 90.0
+as_is: true
+verified:
+  date: '2026-10-25'
+  known_good_sha256: 4208f5bf16ecc2cfcf3fbb6cb5abf2d632eeffdc3a74115c0b03e861c1bdee43
+  app: 1.3.0
+  overport_cli: 1.2.5
+  frame_build: '20261020.6124238'
+  agent: 109
+  issue: 497
+source_hint: Port0r-TimeCrisisVR-v0.2.2-quest3

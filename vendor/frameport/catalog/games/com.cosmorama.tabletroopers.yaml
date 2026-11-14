@@ -1,0 +1,24 @@
+package: com.cosmorama.tabletroopers
+title: Table Troopers
+status: works
+tested_version: 2026.40.4
+engine: Unity
+xr: OpenXR
+frame:
+- frame.gms_platform_version
+- frame.photon_voice_audio_route
+- frame.unity_text_input
+device:
+- device.text_input_window
+adapter:
+  haptic_fix: 1
+  scale: 2.0
+verified:
+  date: '2026-10-17'
+  known_good_sha256: b0a4b0e29855277712b580bd5507721fff137bde77b1911b34cca89c627feef1
+  app: 1.2.1
+  overport_cli: 1.2.5
+  frame_build: '20261007.6125817'
+  agent: 96
+  issue: 391
+source_hint: Troopers

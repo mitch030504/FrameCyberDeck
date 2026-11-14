@@ -1,0 +1,15 @@
+package: com.noghost.thegrandgetaway
+title: Wallace & Gromit in The Grand Getaway
+tested_version: 1.0.34
+source_hint: Wallace & Gromit in The Grand Getaway
+engine: Unreal
+xr: OpenXR
+status: works
+notes: Missing Meta platform functions stubbed.
+alt_overport:
+- patch_remove_unreal_force_quit
+verified:
+  date: '2026-09-28'
+  overport_cli: 1.2.3
+  overport_runtime: 3.4.3-23204ea
+  known_good_sha256: 1866e552ce19cf3de9d11fcc12b3431e7a2c355d47b5f4519d230c287252aa93

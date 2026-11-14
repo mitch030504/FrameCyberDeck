@@ -1,0 +1,19 @@
+package: com.owlchemylabs.jobsimulator
+title: Job Simulator
+status: works
+notes: 'Without Lepton''s Android window: with it, the hands froze after a few seconds (GitHub #193).'
+tested_version: 1.4.0.6515
+engine: Unity
+xr: OpenXR
+frame_remove:
+- frame.unity_text_input
+verified:
+  date: '2026-10-03'
+  known_good_sha256: 64638d7f93bb93cc61f422a43a08bb0d35b9bb4b463e90a42da7002147f03d1b
+  app: 0.6.2
+  overport_cli: 1.2.5
+  frame_build: '20260930.6234839'
+  agent: 33
+  issue: 11
+updated: '2026-10-11'
+source_hint: Job Simulator

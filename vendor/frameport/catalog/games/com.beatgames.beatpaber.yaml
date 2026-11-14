@@ -1,0 +1,23 @@
+package: com.beatgames.beatpaber
+title: Beat Saber (co-existence build)
+status: works
+notes: A Beat Saber build with its own package name, so a modded and an unmodded Beat Saber can be installed side by
+  side.
+details: The submitted build's app label was very long and the game didn't appear in the Frame's Steam library (GitHub
+  issue 27, a shortcut Steam dropped again; fixed in 0.7.0); the recipe's title names it.
+tested_version: 1.45.1_27839
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+device:
+- device.text_input_window
+verified:
+  date: '2026-10-05'
+  known_good_sha256: 9965b01d5d1a3707bce1762f60d5419ce3e89bc095c63586f6940bb69696e9fd
+  app: 0.6.3
+  overport_cli: 1.2.5
+  frame_build: '20260930.6234839'
+  agent: 35
+  issue: 29
+source_hint: Beat Saber

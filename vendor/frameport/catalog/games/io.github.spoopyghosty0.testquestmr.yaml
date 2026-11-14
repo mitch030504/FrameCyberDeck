@@ -1,0 +1,20 @@
+package: io.github.spoopyghosty0.testquestmr
+title: Test Quest MR
+status: works
+notes: An MR debug viewer that shows what the Meta MR APIs return (room, planes, mesh, anchors, play area). With
+  FramePort's emulated room it shows a room made from the play area.
+tested_version: 0.2.1
+engine: Other
+xr: OpenXR
+frame:
+- frame.meta_permissions
+adapter:
+  scene_emul: 1
+verified:
+  date: '2026-10-18'
+  known_good_sha256: 98936ca80d548a753a6645ab89610af19f6e8c3190b5f5f67854cf854691fba5
+  app: 1.2.1
+  overport_cli: 1.2.5
+  frame_build: '20261015.6141207'
+  agent: 102
+source_hint: Test Quest MR

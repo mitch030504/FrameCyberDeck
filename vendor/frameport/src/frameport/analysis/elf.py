@@ -1,0 +1,476 @@
+"""ELF helpers (pure Python: pyelftools for reading, capstone for disassembly, own DT_NEEDED writer)."""
+from __future__ import annotations
+
+import io
+import struct
+from functools import lru_cache
+
+from elftools.elf.dynamic import DynamicSection
+from elftools.elf.elffile import ELFFile
+from elftools.elf.sections import SymbolTableSection
+
+ELF_MAGIC = b"\x7fELF"
+
+
+def is_elf(data: bytes) -> bool:
+    return data[:4] == ELF_MAGIC
+
+
+def _elf(data: bytes) -> ELFFile:
+    return ELFFile(io.BytesIO(data))
+
+
+def dynsym_section(elf: ELFFile):
+    """The dynamic symbol table, found by section type: some shipped libraries have a scrambled section name table
+    (GitHub #349: Transformers Beyond Reality's libOVRPlugin.so calls .dynsym "text"), types and links are intact."""
+    sec = elf.get_section_by_name(".dynsym")
+    if isinstance(sec, SymbolTableSection) and sec["sh_type"] == "SHT_DYNSYM":
+        return sec
+    return next((s for s in elf.iter_sections() if s["sh_type"] == "SHT_DYNSYM"), None)
+
+
+def dynstr_section(elf: ELFFile, dynsym=None):
+    """The string table of the dynamic symbols (dynsym's sh_link; by name as a fallback)."""
+    dynsym = dynsym if dynsym is not None else dynsym_section(elf)
+    if dynsym is not None and 0 < dynsym["sh_link"] < elf.num_sections():
+        return elf.get_section(dynsym["sh_link"])
+    return elf.get_section_by_name(".dynstr")
+
+
+def needed(data: bytes) -> list[str]:
+    elf = _elf(data)
+    for sec in elf.iter_sections():
+        if isinstance(sec, DynamicSection):
+            return [t.needed for t in sec.iter_tags() if t.entry.d_tag == "DT_NEEDED"]
+    return []
+
+
+def soname(data: bytes) -> str | None:
+    elf = _elf(data)
+    for sec in elf.iter_sections():
+        if isinstance(sec, DynamicSection):
+            for t in sec.iter_tags():
+                if t.entry.d_tag == "DT_SONAME":
+                    return t.soname
+    return None
+
+
+def dyn_symbols(data: bytes, defined: bool) -> set[str]:
+    """Dynamic symbols that are defined (exports) or undefined (imports)."""
+    if not is_elf(data):
+        return set()
+    return _dyn_symbols_cached(data, defined)
+
+
+@lru_cache(maxsize=256)
+def _dyn_symbols_cached(data: bytes, defined: bool) -> frozenset[str]:
+    elf = _elf(data)
+    sec = dynsym_section(elf)
+    out = set()
+    if isinstance(sec, SymbolTableSection):
+        for sym in sec.iter_symbols():
+            if not sym.name or sym["st_info"]["type"] not in ("STT_FUNC", "STT_NOTYPE", "STT_OBJECT"):
+                continue
+            is_def = sym["st_shndx"] != "SHN_UNDEF"
+            if is_def == defined:
+                out.add(sym.name.split("@")[0])
+    return frozenset(out)
+
+
+def find_symbols(data: bytes, names) -> dict[str, tuple[int, int]]:
+    """(address, size) of the defined dynamic symbols `names` (ELF64 little-endian). Looks the names up in .dynstr and
+    their entries in .dynsym by byte search instead of reading every symbol: engine libraries (libUE4.so) have
+    hundreds of thousands."""
+    import struct
+
+    if not is_elf(data) or data[4] != 2 or data[5] != 1:
+        return {}
+    elf = _elf(data)
+    dynsym = dynsym_section(elf)
+    dynstr = dynstr_section(elf, dynsym)
+    if dynsym is None or dynstr is None:
+        return {}
+    sym_off, sym_size = dynsym["sh_offset"], dynsym["sh_size"]
+    str_off, str_end = dynstr["sh_offset"], dynstr["sh_offset"] + dynstr["sh_size"]
+    out = {}
+    for name in names:
+        raw = name.encode() + b"\0"
+        at = data.find(raw, str_off, str_end)
+        while at >= 0 and name not in out:
+            needle = struct.pack("<I", at - str_off)
+            hit = data.find(needle, sym_off, sym_off + sym_size)
+            while hit >= 0:
+                if (hit - sym_off) % 24 == 0:
+                    _, _, _, shndx, value, size = struct.unpack_from("<IBBHQQ", data, hit)
+                    if shndx and value:
+                        out[name] = (value, size)
+                        break
+                hit = data.find(needle, hit + 1, sym_off + sym_size)
+            at = data.find(raw, at + 1, str_end)
+    return out
+
+
+def is_64bit(data: bytes) -> bool:
+    return is_elf(data) and data[4] == 2
+
+
+def load_segments(data: bytes) -> list[tuple[int, int, int]]:
+    """(vaddr, file offset, filesz) for PT_LOAD segments."""
+    elf = _elf(data)
+    return [(s["p_vaddr"], s["p_offset"], s["p_filesz"]) for s in elf.iter_segments() if s["p_type"] == "PT_LOAD"]
+
+
+def vaddr_to_offset(segments: list[tuple[int, int, int]], va: int) -> int | None:
+    return next((va - v + o for v, o, sz in segments if v <= va < v + sz), None)
+
+
+def text_instructions(data: bytes):
+    """Yield (address, mnemonic, op_str) for executable sections (arm64 only)."""
+    import capstone
+
+    elf = _elf(data)
+    md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+    md.skipdata = True
+    for sec in elf.iter_sections():
+        if sec["sh_type"] == "SHT_PROGBITS" and sec["sh_flags"] & 0x4:  # SHF_EXECINSTR
+            code = sec.data()
+            for ins in md.disasm_lite(code, sec["sh_addr"]):
+                yield ins[0], ins[2], ins[3]
+
+
+def replace_rodata_string(data: bytes, old: str, new: str) -> tuple[bytes, int]:
+    """Replace NUL-terminated `old` with `new` (not longer; NUL-padded) inside .rodata only, in place (nothing moves;
+    .dynstr, e.g. DT_NEEDED names, is untouched). Returns (data, number of replacements)."""
+    if len(new) > len(old):
+        raise ValueError("replacement must not be longer")
+    sec = _elf(data).get_section_by_name(".rodata")
+    if sec is None:
+        return data, 0
+    start, end = sec["sh_offset"], sec["sh_offset"] + sec["sh_size"]
+    needle, repl = old.encode() + b"\0", new.encode().ljust(len(old) + 1, b"\0")
+    buf, count, i = bytearray(data), 0, start
+    while (i := buf.find(needle, i, end)) != -1:
+        if i == start or buf[i - 1] == 0:  # a whole string, not the tail of a longer one
+            buf[i:i + len(needle)] = repl
+            count += 1
+        i += len(needle)
+    return bytes(buf), count
+
+
+def hide_exports(data: bytes, names) -> tuple[bytes, list[str]]:
+    """Make the exported functions `names` invisible to symbol lookup without removing them: their .dynsym entries
+    become STB_LOCAL (name, value and section stay, nothing moves, the hash tables are untouched). Both bionic's and
+    glibc's lookups only match GLOBAL/WEAK entries, so a lookup for such a name (a game's import, or dlsym on this
+    library's handle) goes on to the next library in the dependency list; code that reads the library's own .dynsym
+    (native/langpack) still finds the original address. Returns (data, names actually hidden); ELF64 only."""
+    if not is_elf(data) or not is_64bit(data) or data[5] != 1:
+        return data, []
+    sec = dynsym_section(_elf(data))
+    if not isinstance(sec, SymbolTableSection):
+        return data, []
+    wanted = set(names)
+    entsize, start = sec["sh_entsize"] or 24, sec["sh_offset"]
+    buf, hidden = bytearray(data), []
+    for i, sym in enumerate(sec.iter_symbols()):
+        if (sym.name in wanted and sym["st_shndx"] != "SHN_UNDEF"
+                and sym["st_info"]["bind"] in ("STB_GLOBAL", "STB_WEAK")):
+            at = start + i * entsize + 4  # Elf64_Sym.st_info: binding in the high nibble, type in the low one
+            buf[at] &= 0x0F
+            hidden.append(sym.name)
+    return bytes(buf), sorted(hidden)
+
+
+def redirect_exports(data: bytes, names) -> tuple[bytes, list[str]]:
+    """Turn definitions into imports, so both dlsym and this ELF's relocations use a dependency's implementation.
+
+    Unlike hide_exports, this also redirects self-references through the PLT. Code and symbol indices stay put;
+    callers using direct branch instructions are NOT redirected and must be reviewed before using this operation.
+    ELF64, little endian only. Returns (data, definitions actually redirected).
+    """
+    if not is_elf(data) or not is_64bit(data) or data[5] != 1:
+        return data, []
+    sec = dynsym_section(_elf(data))
+    if not isinstance(sec, SymbolTableSection):
+        return data, []
+    wanted = set(names)
+    buf, redirected = bytearray(data), []
+    for i, sym in enumerate(sec.iter_symbols()):
+        if (sym.name in wanted and sym["st_shndx"] != "SHN_UNDEF"
+                and sym["st_info"]["bind"] in ("STB_GLOBAL", "STB_WEAK")
+                and sym["st_info"]["type"] == "STT_FUNC"):
+            at = sec["sh_offset"] + i * (sec["sh_entsize"] or 24)
+            struct.pack_into("<HQQ", buf, at + 6, 0, 0, 0)  # shndx, value, size; keep GLOBAL and the name
+            redirected.append(sym.name)
+    return bytes(buf), sorted(redirected)
+
+
+def rename_imports(data: bytes, renames: dict[str, str]) -> tuple[bytes, list[str]]:
+    """Rename imported (undefined) dynamic symbols in place: `.dynstr` bytes of each import's name are overwritten
+    with the new name (not longer; NUL-padded), so its relocations bind to whatever library exports the new name
+    (add it to DT_NEEDED). Nothing moves; defined symbols and names that other entries share (string-tail merging,
+    DT_NEEDED/version names) are never touched — such a rename raises. A renamed import's `.gnu.version` entry
+    becomes 1 (global): the replacement has no version, and keeping e.g. LIBC would make bionic look for it in libc
+    only. Returns (data, old names renamed); ELF64 little-endian only. Names already renamed count as done."""
+    import struct
+
+    if not is_elf(data) or not is_64bit(data) or data[5] != 1:
+        return data, []
+    for old, new in renames.items():
+        if len(new) > len(old):
+            raise ValueError(f"{new} is longer than {old}")
+    elf = _elf(data)
+    dynsym = dynsym_section(elf)
+    dynstr = dynstr_section(elf, dynsym)
+    if not isinstance(dynsym, SymbolTableSection) or dynstr is None:
+        return data, []
+    versym = next((s for s in elf.iter_sections() if s["sh_type"] == "SHT_GNU_versym"), None)
+    str_off = dynstr["sh_offset"]
+    targets, refs = {}, {}  # dynsym index -> st_name of an import to rename; st_name -> referencing dynsym indices
+    for i, sym in enumerate(dynsym.iter_symbols()):
+        refs.setdefault(sym["st_name"], []).append(i)
+        if sym.name in renames and sym["st_shndx"] == "SHN_UNDEF":
+            targets[i] = sym["st_name"]
+    others = set()  # string offsets used by anything else: other symbols, dynamic tags, version records
+    for sec in elf.iter_sections():
+        if isinstance(sec, DynamicSection):
+            others |= {t.entry.d_val for t in sec.iter_tags()
+                       if t.entry.d_tag in ("DT_NEEDED", "DT_SONAME", "DT_RPATH", "DT_RUNPATH")}
+        elif sec["sh_type"] == "SHT_GNU_verneed":
+            for vn, aux in sec.iter_versions():
+                others.add(vn["vn_file"])
+                others |= {a["vna_name"] for a in aux}
+        elif sec["sh_type"] == "SHT_GNU_verdef":
+            for _vd, aux in sec.iter_versions():
+                others |= {a["vda_name"] for a in aux}
+    buf, done = bytearray(data), []
+    for i, name_off in sorted(targets.items()):
+        old = bytes(buf[str_off + name_off:buf.index(b"\0", str_off + name_off)]).decode()
+        span = range(name_off, name_off + len(old) + 1)
+        shared = [o for o in others if o in span] + [o for o, users in refs.items()
+                                                    if o in span and any(u not in targets for u in users)]
+        if shared:
+            raise ValueError(f"{old}: its name is shared with another entry; not renamed")
+        buf[str_off + name_off:str_off + name_off + len(old) + 1] = renames[old].encode().ljust(len(old) + 1, b"\0")
+        if versym is not None:
+            struct.pack_into("<H", buf, versym["sh_offset"] + i * 2, 1)
+        done.append(old)
+    if versym is not None:  # imports renamed earlier: keep their version entry global too
+        new_names = set(renames.values())
+        for i, sym in enumerate(dynsym.iter_symbols()):
+            if sym.name in new_names and sym["st_shndx"] == "SHN_UNDEF":
+                struct.pack_into("<H", buf, versym["sh_offset"] + i * 2, 1)
+    return bytes(buf), sorted(set(done))
+
+
+def add_needed(data: bytes, library: str, first: bool = True) -> bytes:
+    """Add a DT_NEEDED entry in front of the existing ones (same effect as `patchelf --add-needed`; being first matters
+    for symbol interposition, e.g. the GL shim must precede libEGL). `first=False` puts it after the existing ones,
+    for libraries that must only be loaded, never interpose (a Vulkan layer exports vkEnumerate*Properties).
+
+    Nothing already in the file moves: the extended .dynstr and a rebuilt .dynamic are appended in a new PT_LOAD
+    (page aligned to 16 KiB), which reuses the PT_NOTE program header (bionic ignores notes in shared libraries).
+    PT_DYNAMIC, DT_STRTAB/DT_STRSZ and the section headers are re-pointed. Handles ELF32 and ELF64 little-endian."""
+    import struct
+
+    if not is_elf(data) or data[5] != 1:
+        raise ValueError("not a little-endian ELF")
+    if library in needed(data):
+        return data
+    is64 = data[4] == 2
+    buf = bytearray(data)
+    if is64:
+        eh = struct.unpack_from("<16sHHIQQQIHHHHHH", buf, 0)
+        phoff, shoff, phentsize, phnum, shentsize, shnum = eh[5], eh[6], eh[9], eh[10], eh[11], eh[12]
+        ph_fmt, dyn_fmt, sh_fmt = "<IIQQQQQQ", "<qQ", "<IIQQQQIIQQ"
+    else:
+        eh = struct.unpack_from("<16sHHIIIIIHHHHHH", buf, 0)
+        phoff, shoff, phentsize, phnum, shentsize, shnum = eh[5], eh[6], eh[9], eh[10], eh[11], eh[12]
+        ph_fmt, dyn_fmt, sh_fmt = "<IIIIIIII", "<iI", "<IIIIIIIIII"
+    PT_LOAD, PT_DYNAMIC, PT_NOTE = 1, 2, 4
+    DT_NULL, DT_NEEDED, DT_STRTAB, DT_STRSZ = 0, 1, 5, 10
+    PAGE = 16384
+
+    def ph(i):
+        vals = list(struct.unpack_from(ph_fmt, buf, phoff + i * phentsize))
+        if is64:  # p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align
+            return {"type": vals[0], "flags": vals[1], "offset": vals[2], "vaddr": vals[3], "filesz": vals[5],
+                    "memsz": vals[6], "align": vals[7]}
+        # p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align
+        return {"type": vals[0], "offset": vals[1], "vaddr": vals[2], "filesz": vals[4], "memsz": vals[5],
+                "flags": vals[6], "align": vals[7]}
+
+    def write_ph(i, p):
+        if is64:
+            vals = (p["type"], p["flags"], p["offset"], p["vaddr"], p["vaddr"], p["filesz"], p["memsz"], p["align"])
+        else:
+            vals = (p["type"], p["offset"], p["vaddr"], p["vaddr"], p["filesz"], p["memsz"], p["flags"], p["align"])
+        struct.pack_into(ph_fmt, buf, phoff + i * phentsize, *vals)
+
+    phs = [ph(i) for i in range(phnum)]
+    dyn_i = next((i for i, p in enumerate(phs) if p["type"] == PT_DYNAMIC), None)
+    note_i = next((i for i, p in enumerate(phs) if p["type"] == PT_NOTE), None)
+    if dyn_i is None:
+        raise ValueError("no PT_DYNAMIC")
+    loads = [p for p in phs if p["type"] == PT_LOAD]
+    segs = [(p["vaddr"], p["offset"], p["filesz"]) for p in loads]
+
+    def va2off(va):
+        off = vaddr_to_offset(segs, va)
+        if off is None:
+            raise ValueError(f"vaddr {va:#x} not in a loaded segment")
+        return off
+
+    # read dynamic entries
+    dyn = phs[dyn_i]
+    esz = struct.calcsize(dyn_fmt)
+    entries = []
+    for k in range(dyn["filesz"] // esz):
+        tag, val = struct.unpack_from(dyn_fmt, buf, dyn["offset"] + k * esz)
+        entries.append([tag, val])
+        if tag == DT_NULL:
+            break
+    tags = {t: v for t, v in entries}
+    strtab_va, strsz = tags[DT_STRTAB], tags[DT_STRSZ]
+    old_str = bytes(buf[va2off(strtab_va): va2off(strtab_va) + strsz])
+    new_str = old_str + library.encode() + b"\0"
+    name_off = len(old_str)
+
+    body_entries = [e for e in entries if e[0] != DT_NULL]
+    needed_at = [k for k, e in enumerate(body_entries) if e[0] == DT_NEEDED]
+    at = (needed_at[0] if first else needed_at[-1] + 1) if needed_at else 0
+    body_entries.insert(at, [DT_NEEDED, name_off])
+    body_entries += [[DT_NULL, 0]] * 2
+
+    file_end = (len(buf) + PAGE - 1) // PAGE * PAGE
+    va_end = max(p["vaddr"] + p["memsz"] for p in loads)
+    va_start = (va_end + PAGE - 1) // PAGE * PAGE  # both page multiples, so vaddr ≡ offset (mod PAGE)
+    PT_PHDR = 6
+    relocate = note_i is None  # no spare header: move the program header table into the new segment
+    new_phnum = phnum + (2 if relocate and not any(p["type"] == PT_PHDR for p in phs) else 1 if relocate else 0)
+    phdr_bytes = new_phnum * phentsize if relocate else 0
+    str_off = (phdr_bytes + 15) // 16 * 16
+    dyn_off = (str_off + len(new_str) + 15) // 16 * 16
+    for e in body_entries:
+        if e[0] == DT_STRTAB:
+            e[1] = va_start + str_off
+        elif e[0] == DT_STRSZ:
+            e[1] = len(new_str)
+    dyn_bytes = b"".join(struct.pack(dyn_fmt, t, v) for t, v in body_entries)
+    blob_len = dyn_off + len(dyn_bytes)
+    new_load = {"type": PT_LOAD, "flags": 6, "offset": file_end, "vaddr": va_start, "filesz": blob_len,
+                "memsz": blob_len, "align": PAGE}  # PF_R|PF_W
+    new_dyn = {**dyn, "offset": file_end + dyn_off, "vaddr": va_start + dyn_off, "filesz": len(dyn_bytes),
+               "memsz": len(dyn_bytes)}
+
+    table = [dict(p) for p in phs]
+    table[dyn_i] = new_dyn
+    if relocate:
+        phdr_entry = {"type": PT_PHDR, "flags": 4, "offset": file_end, "vaddr": va_start, "filesz": phdr_bytes,
+                      "memsz": phdr_bytes, "align": 8}
+        existing = next((i for i, p in enumerate(table) if p["type"] == PT_PHDR), None)
+        if existing is not None:
+            table[existing] = phdr_entry
+        else:
+            table.insert(0, phdr_entry)  # PT_PHDR must precede the loadable segments
+        table.append(new_load)
+    else:
+        table[note_i] = new_load
+    # PT_LOAD entries must stay sorted by vaddr (bionic); the new one has the highest vaddr.
+    load_slots = [i for i, p in enumerate(table) if p["type"] == PT_LOAD]
+    for i, p in zip(load_slots, sorted((table[i] for i in load_slots), key=lambda p: p["vaddr"]), strict=True):
+        table[i] = p
+
+    buf += b"\0" * (file_end - len(buf))
+    buf += b"\0" * blob_len
+    buf[file_end + str_off:file_end + str_off + len(new_str)] = new_str
+    buf[file_end + dyn_off:file_end + dyn_off + len(dyn_bytes)] = dyn_bytes
+    if relocate:
+        phoff = file_end
+        if is64:
+            struct.pack_into("<Q", buf, 32, phoff)
+            struct.pack_into("<H", buf, 56, new_phnum)
+        else:
+            struct.pack_into("<I", buf, 28, phoff)
+            struct.pack_into("<H", buf, 44, new_phnum)
+        phnum = new_phnum
+    for i, p in enumerate(table):
+        write_ph(i, p)
+
+    # section headers: point .dynamic / .dynstr at the new copies (for tools; the loader uses program headers)
+    # Found by type and link, not by name: some shipped libraries have a scrambled section name table (GitHub #349,
+    # Transformers Beyond Reality's libOVRPlugin.so names .dynamic "dding"), whose types and links are still right.
+    if shoff and shnum:
+        SHT_DYNAMIC = 6
+        def sh(i):
+            return list(struct.unpack_from(sh_fmt, buf, shoff + i * shentsize))
+        headers = [sh(i) for i in range(shnum)]  # sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size, sh_link
+        dyn_secs = [i for i, h in enumerate(headers) if h[1] == SHT_DYNAMIC]
+        str_secs = {headers[i][6] for i in dyn_secs if 0 < headers[i][6] < shnum}
+        str_secs |= {i for i, h in enumerate(headers) if h[3] == strtab_va and h[3]}  # .dynstr by address
+        for i in dyn_secs:
+            h = headers[i]
+            h[3], h[4], h[5] = va_start + dyn_off, file_end + dyn_off, len(dyn_bytes)
+            struct.pack_into(sh_fmt, buf, shoff + i * shentsize, *h)
+        for i in str_secs - set(dyn_secs):
+            h = headers[i]
+            h[3], h[4], h[5] = va_start + str_off, file_end + str_off, len(new_str)
+            struct.pack_into(sh_fmt, buf, shoff + i * shentsize, *h)
+    result = bytes(buf)
+    got = needed(result)
+    if not got or (got[0] if first else got[-1]) != library:
+        raise RuntimeError(f"add_needed({library}) produced NEEDED={got}")
+    return result
+
+
+def offset_to_vaddr(segments: list[tuple[int, int, int]], off: int) -> int | None:
+    """The virtual address of a file offset inside a PT_LOAD segment (load_segments' tuples)."""
+    return next((off - o + v for v, o, sz in segments if o <= off < o + sz), None)
+
+
+def append_segment(data: bytes, blob: bytes, flags: int = 5) -> tuple[bytes, int]:
+    """Add `blob` as a new PT_LOAD segment (default PF_R|PF_X: new code for a byte patch to branch to) and return
+    (new library, the blob's virtual address). Nothing already in the file moves, as in add_needed: the segment is
+    appended at the end of the file and above every existing segment (both 16 KiB aligned) and takes the PT_NOTE
+    program header (bionic ignores notes in shared libraries); without a spare header the program header table moves
+    into the new segment (with a PT_PHDR entry). 64-bit little-endian only."""
+    if not is_elf(data) or data[5] != 1 or data[4] != 2:
+        raise ValueError("not a 64-bit little-endian ELF")
+    PT_LOAD, PT_NOTE, PT_PHDR, PAGE = 1, 4, 6, 16384
+    ph_fmt = "<IIQQQQQQ"  # p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align
+    buf = bytearray(data)
+    phoff = struct.unpack_from("<Q", buf, 32)[0]
+    phentsize, phnum = struct.unpack_from("<HH", buf, 54)
+    table = [list(struct.unpack_from(ph_fmt, buf, phoff + i * phentsize)) for i in range(phnum)]
+    loads = [p for p in table if p[0] == PT_LOAD]
+    if not loads:
+        raise ValueError("no PT_LOAD")
+    file_end = (len(buf) + PAGE - 1) // PAGE * PAGE
+    va_start = (max(p[3] + p[6] for p in loads) + PAGE - 1) // PAGE * PAGE  # vaddr ≡ offset (mod PAGE)
+    note_i = next((i for i, p in enumerate(table) if p[0] == PT_NOTE), None)
+    relocate = note_i is None
+    new_phnum = phnum + (0 if not relocate else 1 if any(p[0] == PT_PHDR for p in table) else 2)
+    head = (new_phnum * phentsize + 15) // 16 * 16 if relocate else 0
+    size = head + len(blob)
+    new_load = [PT_LOAD, flags, file_end, va_start, va_start, size, size, PAGE]
+    if relocate:
+        phdr = [PT_PHDR, 4, file_end, va_start, va_start, new_phnum * phentsize, new_phnum * phentsize, 8]
+        existing = next((i for i, p in enumerate(table) if p[0] == PT_PHDR), None)
+        if existing is not None:
+            table[existing] = phdr
+        else:
+            table.insert(0, phdr)  # PT_PHDR must precede the loadable segments
+        table.append(new_load)
+    else:
+        table[note_i] = new_load
+    slots = [i for i, p in enumerate(table) if p[0] == PT_LOAD]  # PT_LOAD entries stay sorted by vaddr (bionic)
+    for i, p in zip(slots, sorted((table[i] for i in slots), key=lambda p: p[3]), strict=True):
+        table[i] = p
+    buf += b"\0" * (file_end - len(buf) + size)
+    buf[file_end + head:file_end + size] = blob
+    if relocate:
+        phoff = file_end
+        struct.pack_into("<Q", buf, 32, phoff)
+        struct.pack_into("<H", buf, 56, new_phnum)
+    for i, p in enumerate(table):
+        struct.pack_into(ph_fmt, buf, phoff + i * phentsize, *p)
+    return bytes(buf), va_start + head

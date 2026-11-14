@@ -1,0 +1,16 @@
+package: com.Solfar.InDeath
+title: 'In Death: Unchained'
+tested_version: 1.8.0
+source_hint: 'In Death- Unchained'
+engine: Unreal
+xr: OpenXR
+status: works
+notes: Online leaderboards unavailable.
+details: Online leaderboards likely unavailable.
+alt_overport:
+- patch_remove_unreal_force_quit
+verified:
+  date: '2026-09-28'
+  overport_cli: 1.2.3
+  overport_runtime: 3.4.3-23204ea
+  known_good_sha256: afffdbdff8c545f2f8d6ddabb99993e33136e8f5b120e83ba77479c444ccfa5c

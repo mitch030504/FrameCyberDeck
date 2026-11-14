@@ -16,6 +16,7 @@ import gameService from './services/gameService'
 import { createGameDescriptionService } from './services/gameDescription/gameDescriptionService'
 import downloadService from './services/downloadService'
 import frameDevkitService from './services/frame/frameDevkitService'
+import framePortEngineService from './services/frame/framePortEngineService'
 import uploadService from './services/uploadService'
 import metaAccountService from './services/metaAccountService'
 import metaSyncService from './services/metaSyncService'
@@ -580,6 +581,8 @@ app.whenReady().then(async () => {
   typedIpcMain.handle('frame:recorded-source-packages', () =>
     frameDevkitService.getRecordedSourcePackages()
   )
+  typedIpcMain.handle('frame:engine-status', () => framePortEngineService.getStatus())
+  typedIpcMain.handle('frame:engine-prepare', () => framePortEngineService.prepare())
 
   // --- Game Handlers ---
   typedIpcMain.handle('games:get-games', async () => gameService.getGames())

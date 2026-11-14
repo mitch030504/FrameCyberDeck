@@ -1,0 +1,19 @@
+package: com.resolutiongames.cookinggame
+title: Cook-Out
+status: works
+tested_version: 1.20.0.10625-release
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+device:
+- device.text_input_window
+verified:
+  date: '2026-10-03'
+  known_good_sha256: 7217649c503adf76f3a959fc72858c446c2a42a9ce9e209286977b1950397915
+  app: 0.6.1
+  overport_cli: 1.2.5
+  frame_build: '20260930.6234839'
+  agent: 33
+  issue: 3
+source_hint: com.resolutiongames.cookinggame

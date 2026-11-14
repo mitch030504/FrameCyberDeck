@@ -1,0 +1,22 @@
+package: com.astrobotquest.vrhost
+title: Astro VR Host
+status: works
+notes: Runs your own Astro Bot Rescue Mission files (the unpacked CUSA12392 folder, not the .pkg). With the Files
+  tab, copy the folder to Android/data/com.astrobotquest.vrhost/files/games/ in the game's storage and add Android/data/com.astrobotquest.vrhost/files/vrhost.txt
+  with the lines language=<your language, e.g. en-US> and refresh_rate=80. Set FoV to 100% in the game.
+details: 'Tested with AstroQuest v0.23 (https://github.com/bigmak94/AstroQuest). The port caps the resolution at
+  1440 px per eye; vrhost.txt can''t change that. Other vrhost.txt options: https://github.com/bigmak94/AstroQuest/blob/main/README-QUEST-VR.md#installing-and-running'
+tested_version: '0.23'
+engine: Other
+xr: OpenXR
+adapter:
+  refresh_rate: 80.0
+verified:
+  date: '2026-10-22'
+  known_good_sha256: c2e13ab155b947c0037362635bd34112c16b69b804af82b347021f2261ef5bfb
+  app: 1.3.0
+  overport_cli: 1.2.5
+  frame_build: '20261015.6141207'
+  agent: 109
+  issue: 464
+source_hint: AstroQuest

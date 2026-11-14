@@ -1,0 +1,23 @@
+package: com.BanzaiStudios.GAZZLERS
+title: GAZZLERS
+status: unknown
+notes: Stopped at start with "Current Platform is not supported" (GitHub issue 404); the recipe makes the game take
+  its Meta Quest path. The fix builds and applies offline; not yet checked on the Frame.
+details: The game chooses between its Meta Quest and PICO code from SystemInfo.deviceModel and throws for any other
+  device; Lepton's Android reports Valve Lepton (write-once ro.product properties). frame.gazzlers_quest_platform
+  makes PlatformDeterminer.GetAndroidPlatform return Platform.Meta.
+tested_version: 1.4.1.7857
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+- frame.gazzlers_quest_platform
+device:
+- device.text_input_window
+adapter:
+  haptic_fix: 1
+verified:
+  date: '2026-10-23'
+  issue: 404
+updated: '2026-10-23'
+source_hint: Gazzlers

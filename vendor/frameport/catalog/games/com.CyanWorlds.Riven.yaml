@@ -1,0 +1,20 @@
+package: com.CyanWorlds.Riven
+title: Riven
+status: works
+notes: Plays as expected.
+tested_version: 1.9.0
+engine: Unreal
+xr: OpenXR
+alt_overport:
+- patch_remove_unreal_force_quit
+adapter:
+  equirect_emul: 1
+verified:
+  date: '2026-10-04'
+  known_good_sha256: 7c211588f39c21d67998ac6a6aeb44a8ad66c6551a1b0feb1bcf44e2cef98bdf
+  app: 0.6.3
+  overport_cli: 1.2.5
+  frame_build: '20260930.6234839'
+  agent: 35
+  issue: 26
+source_hint: Riven

@@ -1,0 +1,22 @@
+package: com.Armature.SportsScramble
+title: Sports Scramble (Santa Cruz)
+tested_version: '1.0'
+source_hint: Sports Scramble
+engine: Unreal
+xr: VrApi
+status: works
+notes: 32-bit only (armeabi-v7a), runs through FramePort's 32-bit bridge (experimental). Both controllers work as
+  Touch controllers. The first start shows a one-time "optimizing" screen (a bit jittery) and then starts the game
+  again by itself.
+details: 'Unreal Engine 4 NativeActivity with OVRPlugin + VrApi, GLES, OBB. The bridge needed AAsset_getBuffer
+  (copied into guest memory), AKeyEvent_getFlags and the remaining AConfiguration getters. A Santa Cruz (early
+  Quest) build: it requires 6DoF head tracking, so the bridge passes both Frame controllers through as Touch
+  controllers (assets/fp_a32_headset.txt) instead of the Gear VR remote. Unreal restarts the app after its
+  first-run shader precompile; the launcher starts Lepton again for it (agent 86). Plays in the headset (owner,
+  2026-10-13).'
+frame:
+- frame.a32_bridge
+pcvr_alternative: Rift only; not on the Revive compatibility list.
+verified:
+  date: '2026-10-13'
+min_app: 0.12.1

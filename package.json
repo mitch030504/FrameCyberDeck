@@ -15,6 +15,8 @@
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
     "test": "vitest run",
     "test:watch": "vitest",
+    "sync:frameport": "python3 scripts/sync-frameport-engine.py",
+    "check:frameport": "python3 scripts/sync-frameport-engine.py --check",
     "start": "electron-vite preview",
     "dev": "electron-vite dev",
     "build": "npm run typecheck && electron-vite build",

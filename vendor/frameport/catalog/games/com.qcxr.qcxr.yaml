@@ -1,0 +1,29 @@
+package: com.qcxr.qcxr
+title: QuestCraft
+status: works
+notes: Minecraft runs in VR (Vivecraft, about 72 fps; drops while worlds load). Needs FramePort 0.10.0 or newer for
+  the picture (older versions show black). On first start QuestCraft downloads its Java runtime, which didn't unpack on
+  the Frame once (see details).
+details: QuestCraft downloads its Java runtime (JRE.zip from QuestCraft's GitHub releases) into files/runtimes/JRE
+  on first start; on the Frame that step once left nothing behind ("libjvm.so not found"; unpacked by hand). Two
+  Frame fixes, both owner-verified 2026-10-05. (1) Minecraft 1.21.5 checks GL errors strictly and aborted with
+  "OpenGL error 1282", an error the Frame's Mesa (Zink) reports where Quest's driver doesn't; QuestCraft's GL-to-GLES
+  layer (LTW) ignores GL errors when LIBGL_NOERROR is set, which Lepton passes from LEPTON_ENV_LIBGL_NOERROR. (2) LTW
+  passes desktop GL_DEPTH_COMPONENT32 through, which Mesa rejects, so every framebuffer was incomplete and the picture
+  black; frame.ltw_depth (automatic for APKs with libltw.so) loads GLES through a shim that asks for
+  GL_DEPTH_COMPONENT32F. Left over, harmless so far - Mesa still reports about 4 GL_INVALID_OPERATION per frame
+  ("in glthread", so the call is unknown; mesa_glthread=false would name it).
+tested_version: 6.0.0-RC4
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+- frame.pojlib_connection
+device:
+- device.text_input_window
+lepton_env:
+  LEPTON_ENV_LIBGL_NOERROR: '1'
+verified:
+  date: '2026-10-05'
+updated: '2026-10-23'
+source_hint: QuestCraft

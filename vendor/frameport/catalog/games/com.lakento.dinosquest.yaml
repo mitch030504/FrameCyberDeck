@@ -1,0 +1,19 @@
+package: com.lakento.dinosquest
+title: Dinosaur Island
+status: works
+tested_version: 1.7.5
+engine: Unity
+xr: VrApi
+frame:
+- frame.unity_text_input
+device:
+- device.text_input_window
+verified:
+  date: '2026-10-03'
+  known_good_sha256: 41ecbc728dc533eebcc3980e140fe1764fbd1958735d8a299c63fa9cda13a923
+  app: 0.6.2
+  overport_cli: 1.2.5
+  frame_build: '20260930.6234839'
+  agent: 33
+  issue: 12
+source_hint: DINOSAUR ISLAND

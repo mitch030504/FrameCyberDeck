@@ -1,0 +1,22 @@
+package: com.drbeef.jkxr
+title: JKXR
+status: works
+notes: Runs smoothly with gl_error_clear (stutters and freezes after a few minutes without it; issues 441, 502).
+  Cinematics need FramePort's GL state guard (in builds after 1.4.0); before that they play black.
+tested_version: 1.1.28
+engine: Other
+xr: OpenXR
+frame:
+- frame.tbxr_vendor
+verified:
+  date: '2026-10-20'
+  known_good_sha256: 771e48b22d3a558ea11869aa1e9070b11908b17ab47a9e8866769bb67efc30a5
+  app: 1.3.0
+  overport_cli: 1.2.5
+  frame_build: '20261007.6125817'
+  agent: 109
+  issue: 441
+source_hint: QuestAPKs
+adapter:
+  gl_error_clear: 1
+updated: '2026-11-09'

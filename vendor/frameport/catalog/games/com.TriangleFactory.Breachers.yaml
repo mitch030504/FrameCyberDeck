@@ -1,0 +1,11 @@
+package: com.TriangleFactory.Breachers
+title: Breachers
+status: unsupported
+notes: Online-only multiplayer that needs Meta's online services, which aren't available on the Frame. The game's own
+  copy of Meta's platform library (libovr_custom.so) quits at start ("Failed to launch SystemActivities").
+tested_version: 40.0.23
+engine: Unity
+xr: OpenXR
+verified:
+  date: '2026-10-17'
+  issue: 357

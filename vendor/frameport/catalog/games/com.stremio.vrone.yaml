@@ -1,0 +1,21 @@
+package: com.stremio.vrone
+title: Stremio
+status: works
+notes: 'Unity 6 VR media centre (its interface is web pages in Vuplex 3D WebView). Text fields closed at once on the
+  Frame (no system keyboard): frame.unity_text_input keeps them selected and device.text_input_window shows the
+  Android window so Steam''s on-screen keyboard (or Type on Frame from the PC) types into them; confirmed in the
+  headset by the owner (2026-10-03), who confirmed it working. Note: the add-ons page can stay blank in VR (the
+  add-on sync itself succeeds). "Play in an external player" can''t reach another app: Lepton sends every link to
+  Steam''s browser.'
+details: 'Patches: frame.unity_text_input (TMP_InputField.TouchScreenKeyboardShouldBeUsed -> false,
+  isKeyboardUsingEvents -> true; uGUI InputField too), device.text_input_window (lepton-show-flatscreen).'
+tested_version: 0.7.5
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+device:
+- device.text_input_window
+verified:
+  date: '2026-10-03'
+source_hint: Stremio

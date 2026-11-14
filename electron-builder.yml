@@ -13,6 +13,7 @@ files:
   - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
   - '!screenshots/**/*'
   - '!AUR/**/*'
+  - '!vendor/**/*'
   - '!{PULL_REQUEST.md,todo.txt,LICENSE}'
 asarUnpack:
   - resources/**
@@ -37,6 +38,12 @@ extraResources:
     to: frame-devkit-bridge.py
   - from: resources/frame-convert.py
     to: frame-convert.py
+  - from: resources/frameport-engine.py
+    to: frameport-engine.py
+  - from: vendor/frameport
+    to: vendor/frameport
+    filter:
+      - '**/*'
   - from: resources/frameport-recipes.json
     to: frameport-recipes.json
   - from: resources/sounds

@@ -1,0 +1,20 @@
+package: com.crytek.climb2
+title: The Climb 2
+tested_version: '2.2'
+source_hint: The Climb 2
+engine: CryEngine
+xr: VrApi
+status: works
+notes: 'CryEngine direct VrApi (Vulkan): VrApi bridge + platform compat; user.cfg disables VRS.'
+details: CryEngine calls libvrapi directly; overport cannot translate it, so the VrApi bridge replaces libvrapi.so.
+frame:
+- frame.vrapi_bridge
+device_files:
+  user.cfg: 'r_variable_rate_shading = 0
+
+    '
+verified:
+  date: '2026-09-28'
+  overport_cli: 1.2.3
+  overport_runtime: 3.4.3-23204ea
+  known_good_sha256: 94914163f0ba1d0e72f8714801f6fb551e0565c9f2e91818e7d89b0a28e20bd4

@@ -1,0 +1,15 @@
+package: com.VRFactory.VRBartender
+title: BARTENDER VR SIMULATOR
+tested_version: 1.9.2.7
+source_hint: BARTENDER VR SIMULATOR
+engine: Unreal
+xr: OpenXR
+status: works
+notes: Native Pico build exists (not relevant for Frame).
+alt_overport:
+- patch_remove_unreal_force_quit
+verified:
+  date: '2026-09-28'
+  overport_cli: 1.2.3
+  overport_runtime: 3.4.3-23204ea
+  known_good_sha256: 17d2ab60d52ad32181ca02a88527947f7e65a63d0feac858e6e57a80bc68c41a

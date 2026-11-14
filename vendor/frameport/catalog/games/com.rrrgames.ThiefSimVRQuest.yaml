@@ -1,0 +1,12 @@
+package: com.rrrgames.ThiefSimVRQuest
+title: Thief Simulator
+status: unsupported
+notes: Quits at start with the game's own "installed from unknown source" message. Lepton installs the game itself at
+  every start (there is no Meta store app on the Frame), so the game never sees the Meta store as its source.
+tested_version: 1.1.7.3
+engine: Unity
+xr: OpenXR
+verified:
+  date: '2026-10-17'
+  issue: 368
+updated: '2026-10-17'

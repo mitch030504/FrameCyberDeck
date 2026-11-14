@@ -1,0 +1,21 @@
+package: com.WenklyStudio.SurvivalNation
+title: Survival Nation
+status: works
+tested_version: 1.14.1
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+device:
+- device.text_input_window
+adapter:
+  scale: 1.8
+verified:
+  date: '2026-10-18'
+  known_good_sha256: 7903dfee1c9c36d19e1c6c78a1f0ede1f0b25ce6a6065811997297e701009250
+  app: 1.2.1
+  overport_cli: 1.2.5
+  frame_build: '20261007.6125817'
+  agent: 96
+  issue: 401
+source_hint: survival nation

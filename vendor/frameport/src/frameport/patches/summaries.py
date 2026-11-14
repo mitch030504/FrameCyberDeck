@@ -1,0 +1,217 @@
+"""One plain sentence per patch: what it does for the player, no jargon. The game page shows these by default; the
+technical description (patch.description) is shown with "Show technical details" and in the CLI.
+Game settings (adapter.*) use their Game settings help line (patches/settings.UI) instead; entries here are the
+fallback for settings that dialog doesn't show."""
+
+SUMMARIES = {
+    "frame.static_openxr_loader": "Makes an embedded OpenXR loader use FrameBridge and your game settings.",
+    # OVRPort (the Quest → OpenXR conversion)
+    "patch_copy_libraries": "Adds the parts that let a Quest game run on the Steam Frame. Needed for every Quest "
+                            "game.",
+    "patch_copy_ovrplugin_vrapi": "Gives older Quest games a newer version of Meta's VR plugin that can be converted.",
+    "patch_disable_controller_offset": "Removes a controller position adjustment, for games whose hands look "
+                                       "misplaced.",
+    "patch_disable_meta_xr_audio_telemetry": "Stops Meta's audio library from reporting to Meta (only matters on PC "
+                                             "emulators).",
+    "patch_disable_space_warp": "Turns off Meta's frame-rate trick, which causes glitches or hangs outside Quest "
+                                "headsets.",
+    "patch_fix_min_android_sdk": "Raises the minimum Android version the game declares, so the new parts load.",
+    "patch_fix_unreal_crash": "Prevents a start-up crash in some Unreal games.",
+    "patch_force_passthrough": "Lets mixed-reality games start even though they insist on a camera view of your room.",
+    "patch_generate_config": "Writes the conversion's settings into the game.",
+    "patch_launcher_entry": "Makes sure the game has an entry that can be started.",
+    "patch_mark_allow_backup": "Allows the game's data to be backed up.",
+    "patch_mark_as_debuggable": "Allows reading the game's logs, which helps find problems.",
+    "patch_meta_xr_audio": "Makes Meta's 3D audio library work outside Quest headsets.",
+    "patch_oculus_unity": "Lets Unity games accept a headset that isn't a Quest.",
+    "patch_oculus_unreal": "Lets Unreal games accept a headset that isn't a Quest.",
+    "patch_remove_localized_names": "Keeps one name for the game, so it shows the same everywhere.",
+    "patch_remove_unreal_force_quit": "Stops some Unreal games from closing themselves right after starting.",
+    "patch_remove_uses_library": "Removes requirements for Quest-only system parts.",
+    "patch_remove_vrapi": "Removes Meta's old VR library when the game doesn't need it.",
+    "patch_replace_icon_label": "Uses the store's name and icon for the game.",
+    "patch_vr_metadata": "Marks the game as a VR app so headsets show it as one.",
+    "patch_vrapi_openxr": "OVRPort's own converter for games that use Meta's oldest VR interface (experimental).",
+    "patch_ac_nexus_no_appsw_72": "Assassin's Creed Nexus: smoother picture at 72 Hz (turns off Meta's frame-rate "
+                                  "trick).",
+    "patch_ac_nexus_no_appsw_90": "Assassin's Creed Nexus: smoother picture at 90 Hz (turns off Meta's frame-rate "
+                                  "trick).",
+    "patch_clean_up_frida": "Removes debugging leftovers some game files contain.",
+    # Steam Frame patches
+    "frame.adapter": "FramePort's layer between the game and the Steam Frame: fills in what the Frame lacks "
+                     "(controllers, room, passthrough). Needed for every converted game.",
+    "frame.launcher": "Makes the game start from the Frame's Steam library.",
+    "frame.main_process": "Keeps the game from being closed about a minute after it starts (it runs in a separate "
+                          "Android process the Frame doesn't watch).",
+    "frame.start_activity": "Opens the app straight in VR, skipping its flat launcher screen. Turn off to use the "
+                            "launcher, for example to import new content.",
+    "frame.gl_multiview_fbo": "Experimental: shows HUDs, menus and other flat panels that stay black on the Frame "
+                              "(for example Doom3Quest's HUD and PDA).",
+    "frame.ltw_depth": "Stops a black picture in Minecraft launchers (for example QuestCraft).",
+    "frame.unity_gl_shim": "Stops a gray or frozen screen in Unity games that turn on anti-aliasing while running "
+                           "(for example The Room VR).",
+    "frame.unreal_gl_shim": "Stops a crash a few seconds after start in some Unreal games with anti-aliasing (for "
+                            "example Star Wars Pinball VR).",
+    "frame.unreal_ovrp_entrypoints": "Lets older Unreal games start VR on the Frame (for example Star Wars Pinball "
+                                     "VR).",
+    "frame.pac_hints": "Stops a crash on the Frame's processor in games whose code the Quest runs more leniently "
+                       "(for example Star Wars Pinball VR).",
+    "frame.unity_no_overlay_copy": "Stops a gray screen crash in some Unity games by skipping their overlay layers "
+                                   "(for example The Room VR).",
+    "frame.gazzlers_quest_platform": "Lets GAZZLERS start on the Frame (it stopped with \"Current Platform is not "
+                                     "supported\" because it didn't recognise the device).",
+    "frame.vermillion_scene_canvas": "Keeps the hand and brush visible over Vermillion's painting canvas (the "
+                                     "canvas is drawn in the scene instead of as a layer in front).",
+    "frame.nodebug": "Stops strict debugging checks that make some games quit.",
+    "frame.meta_permissions": "Declares Meta's permissions some mixed-reality games ask for, so they don't stop.",
+    "frame.meta_depth_occlusion": "Keeps objects visible up close in mixed-reality games that would hide them behind "
+                                  "your room using Meta's depth sensor, which the Frame lacks (for example Laser "
+                                  "Dance).",
+    "frame.unity_scene_active_rooms": "Lets a mixed-reality game load the room even if it thinks you stand outside "
+                                      "it (for example Laser Dance asking again and again to scan your room).",
+    "frame.ovrplatformcompat": "Adds a small piece of Meta's platform library that some games need to start.",
+    "frame.ovrstubs": "Provides stand-ins for Meta store functions the game expects, so it doesn't crash at start.",
+    "frame.langpacks": "Lets the game use language files already in its data instead of waiting for a download that "
+                       "never comes.",
+    "frame.ovr_trace": "For troubleshooting: records the game's requests to Meta's online services.",
+    "frame.slz_vulkan_hooks": "Stops a start-up crash in Stress Level Zero games (for example BONELAB).",
+    "frame.unity_user_presence": "Counts the headset as worn, so games that only move the player while it's worn "
+                                 "get head tracking and controls (for example BONELAB).",
+    "frame.unity_no_msaa": "Turns off a smoothing setting that crashes some older Unity games on the Frame.",
+    "frame.unity_runtime_msaa_off": "Keeps a smoothing setting off that the game turns on itself and that can freeze "
+                                    "the Frame.",
+    "frame.sdl_clipboard": "Lets SDL and LÖVE games start on the Frame (they'd crash looking for a clipboard).",
+    "frame.godot_clipboard": "Lets Godot games start on the Frame (they'd crash looking for a clipboard).",
+    "frame.horizon_platform_stub": "Lets games built with Meta's newer platform SDK get past their start (they'd "
+                                   "wait forever). Licence and purchase checks still aren't answered.",
+    "frame.browser_handoff": "For apps that say no browser is installed (e.g. when signing in): their web pages "
+                             "open in Steam's browser instead.",
+    "frame.unreal_skip_obb_delivery": "Skips a separate data-file check when an Unreal game still hangs at startup "
+                                      "with the content check off. Experimental; the game still needs its data.",
+    "frame.unreal_skip_obb_check": "Starts Unreal games without re-checking their data file (they'd seem to hang "
+                                   "on an invisible check screen).",
+    "frame.gms_platform_version": "Lets games with Google Play services code start on the Frame (they'd crash at "
+                                  "start on an Android 12 call).",
+    "frame.usb_midi_watcher": "Lets apps with a USB MIDI driver start on the Frame (they'd crash looking for USB "
+                               "devices); USB MIDI devices aren't available there.",
+    "frame.unity_appui_vibrator": "Lets games built with Unity's App UI start on the Frame (they'd quit at once on an "
+                                  "Android 12 vibrator call).",
+    "frame.bhaptics_permission": "Stops bHaptics from asking for a Bluetooth permission the Frame doesn't have (the "
+                                 "game would freeze on its loading screen).",
+    "device.shared_folder": "Makes a folder of this game's storage the same as another game's (e.g. a companion app "
+                            "that manages its game's mods), as on a Quest where all apps share one storage.",
+    "frame.pojlib_connection": "Lets QuestCraft download its Java runtime: it waits for Wi-Fi, and the Frame's "
+                                "Android reports its network as Ethernet.",
+    "frame.eos_keychain_loop":"Stops Epic Online Services from retrying its login keychain forever (the game "
+                               "would never finish starting).",
+    "frame.unity_tls_key_pool": "Lets Unity 6 games with many native libraries start when they run out of thread keys "
+                                 "(they'd abort with \"cannot create thread specific key\"), for example Wander.",
+    "frame.obb_mount_emul": "Lets games whose data files are disk images start on the Frame (they'd quit with "
+                            "\"Can't mount OBB\"), for example GRID Legends. The images are unpacked on the Frame.",
+    "frame.vivox_audio_route": "Lets games with Vivox voice chat start on the Frame (they'd crash on an Android 12 "
+                               "audio call).",
+    "frame.photon_voice_audio_route": "Stops games with Photon Voice chat from crashing on the Frame when voice chat "
+                                      "starts (an Android 12 audio call).",
+    "frame.unity_mic_ring": "Stops the microphone of Unity games cutting in and out for other players (voice chat).",
+    "frame.unity_oculus_check": "Lets older Unity games start VR without Meta's system apps (they'd stay on a 2D "
+                                "screen).",
+    "frame.unity_multipass": "Draws each eye separately. Try it when one eye shows a gray or broken picture.",
+    "frame.swapchain_limit": "Allows very large pictures (8K video, theaters) instead of quitting.",
+    "frame.vrapi_stub": "Stops Meta's old VR library from closing the game at start (for example Jurassic World "
+                        "Aftermath).",
+    "adapter.zink_shader_fix": "Repairs OpenGL ES shaders that hang the graphics chip, from the game's recipe.",
+    "adapter.surface_native": "Shows Batman: Arkham Shadow's cutscenes; set by that game's recipe.",
+    "frame.hw_video_decode": "Plays the game's videos on the Frame's video hardware, so 4K and 8K video runs "
+                             "smoothly.",
+    "frame.tbxr_vendor": "Lets Team Beef ports (for example Lambda1VR) start on the Frame.",
+    "frame.asset_files": "Lets the game find extra content it keeps next to its data (for example Star Wars Tales' "
+                         "seasons).",
+    "frame.ovr_microphone": "Stops a crash a few seconds after the logo in games with voice chat.",
+    "frame.ovr_stable_user": "Keeps your progress in games that file their saves under your Meta user.",
+    "frame.stable_android_id": "Keeps saves readable in games that lock or file them under the device id "
+                               "(for example RUNNER).",
+    "frame.keep_system_libraries": "Lets apps start that need one of Android's optional libraries (for example "
+                                   "YouTube VR).",
+    "frame.cortopia_org_id": "Gets Cortopia games (for example Escaping Wonderland) past their loading screen.",
+    "frame.ovrp_controller_battery": "Stops games from warning that your controllers are empty (for example In "
+                                     "Death: Unchained): they get a full battery level instead of 0 %.",
+    "frame.ovr_org_scoped_id":"Answers Meta's request for your org-scoped user id, which games such as Eleven Table "
+                               "Tennis wait for on their loading screen.",
+    "frame.ovr_app_version": "Gets games past a black screen when they wait for Meta's app version check before "
+                             "their menu (for example C-Smash VRS).",
+    "frame.luajit_pointers": "Lets games with a verified older Lua engine get past a startup crash on the Frame.",
+    "frame.avatar_stub": "Lets games start that would stop at Meta's avatars (for example BlazeRush). No Meta "
+                         "avatars.",
+    "frame.vrapi_bridge": "Lets games built on Meta's oldest VR interface run on the Frame.",
+    "frame.blazerush": "Makes BlazeRush's menus and controllers work without Meta's avatars, and lets its shader "
+                       "fixes take effect.",
+    "frame.justdance_local_save": "Makes Just Dance VR keep your progress between sessions (it only kept it online, "
+                                  "after a Meta sign-in).",
+    "frame.a32_bridge": "Runs a 32-bit game (Gear VR, Oculus Go, early Quest) on the Frame, which only runs "
+                        "64-bit code. Experimental.",
+    "frame.gl_shim": "Corrects graphics code the Frame's drivers reject (black screen with sound).",
+    "frame.metaxr_telemetry": "Skips a Quest-only reporting step in Meta's audio library that crashes some games.",
+    "frame.isdk_telemetry": ("Turns off Quest-only telemetry in Meta's Interaction SDK, which crashes some games "
+                             "at start."),
+    "frame.oculusos": "Provides stand-ins for Quest system calls some games make at start.",
+    "frame.unity_text_input": "Lets you type into this app's text fields on the Frame (they'd close at once).",
+    "frame.vk_sanitize": "Cleans up graphics data that crashes some Unreal games on the Frame.",
+    "frame.unreal_quest_precompile": "Lets the game leave its loading screen: it waited for a Quest-only step that "
+                                     "never starts on the Frame (for example Vader Immortal).",
+    "frame.unreal_quest_keymap": "Makes grip, trigger and touch controls reach the game's hands (it picked the "
+                                 "empty Gear VR controls on the Frame, for example Vader Immortal).",
+    "frame.unreal_splash_bypass": "Lets the game finish loading when its separate loading splash stalls the "
+                                  "render thread.",
+    "frame.unreal_noreserve": "Lets the game load: it reserves more memory at start than the Frame grants in one "
+                              "piece and crashed before its first frame (for example Transformers Beyond Reality).",
+    "frame.unreal_multiview_depth": "Shows the full environment when its upper part is clipped but menu panels "
+                                    "look correct.",
+    "frame.unreal_thumb_touch": "Makes the hands' thumbs follow what your thumb touches (they always pointed up: the "
+                                "Frame doesn't sense a thumb hovering, for example Vader Immortal).",
+    "frame.zink_shader_fix":"Repairs shaders that hang the graphics chip at certain effects, from the game's "
+                             "recipe (for example Vader Immortal's lightspeed jump).",
+    # Files and environment on the Frame
+    "device.files": "Puts settings files next to the game on the Frame, for example to turn off an unsupported "
+                    "effect.",
+    "device.config_sync": "Keeps the resolution the game saves in step with the headset's picture size (else the "
+                          "picture is shifted, with black borders, after a render resolution change).",
+    "device.language": "Games that follow the system language use Steam's language; choose another one here. The "
+                       "game must include it. A chosen language applies with Update on Frame.",
+    "device.offline": "Blocks this game's network connections, for example to stop ads in an app that also works "
+                      "offline. Online features (sign-in, multiplayer, downloads, cloud saves) stop working.",
+    "device.extra_folder": "Makes a folder of the Frame (for example ROMs) available to this game in its storage, "
+                           "like Videos, Downloads and Documents.",
+    "device.hide_navbar": "Hides Android's back, home and recents buttons, which cover the app's own buttons.",
+    "device.text_input_window": "Lets typing reach this app from Steam's on-screen keyboard or your PC's keyboard. VR "
+                                "keeps working.",
+    "device.display_mode": "Choose Flat window if a phone or tablet app shows nothing in the headset, VR if a VR app "
+                           "opens as a flat window.",
+    "device.hybrid_app": "Lets apps that start as a 2D panel (e.g. YouTube) switch into VR for 360° videos and full "
+                         "screen.",
+    "device.steam_gamepad": "Lets the game use your controllers as a gamepad instead of a pointer, for 2D games with "
+                            "touch controls (for example SDL games).",
+    "device.lepton_env": "Extra settings for the Android container (for testing).",
+    "device.foveation": "Render less detail outside your gaze; adjust the full-resolution area or darken "
+                        "coarse regions to test it.",
+    # PC VR
+    "pcvr.repack_launcher": "Starts the game with the launcher that came with your copy.",
+    "pcvr.launch_args": "Starts the game with options, for example to choose SteamVR or OpenXR.",
+    "pcvr.revive": "Lets games made for Oculus PCs run on SteamVR.",
+    "pcvr.libovr_redirect": "Points Oculus games at Revive on the Frame.",
+    "pcvr.no_crash_reporter": "Stops Unreal's crash reporter, which can block the game from starting.",
+    "pcvr.oculus_unreal": "Lets Unreal games accept a headset that isn't an Oculus Rift.",
+    "pcvr.revive_openvr": "On this PC, runs Revive through SteamVR (works with more headsets).",
+    "pcvr.xr_timefix": "Lets games written for newer OpenXR versions run on the Frame.",
+    "pcvr.vr_overlay": "Lets SteamVR on the Frame show this overlay app over your games (and start it with SteamVR).",
+    "pcvr.proton_log": "Writes a detailed Proton log for troubleshooting.",
+    "pcvr.proton_tool": "Which Proton runs the game on the Frame. Stable is smoother; try Experimental if the game "
+                        "doesn't start or runs badly.",
+    "pcvr.steamvr_tuning": "Picks a refresh rate and motion smoothing that suit the game on this PC.",
+    "pcvr.proton_env": "Extra settings for Proton (for testing).",
+    # Game settings the Game settings dialog doesn't show (the others use their help line there)
+    "adapter.gl_int_attribs": "Shows models whose shapes come from bone data the Frame's graphics driver misreads "
+                              "(for example BlazeRush's cars). Comes from a game's recipe.",
+    "adapter.gl_highp_markers": "Computes some of the game's effects more precisely, so they don't draw streaks or "
+                                "flashes (for example BlazeRush's particles). Comes from a game's recipe.",
+    "adapter.vk_shader_fix": "Corrects specific shaders that hang the game on the Frame. Comes from a game's recipe.",
+}

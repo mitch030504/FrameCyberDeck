@@ -1,0 +1,23 @@
+package: rift.rick_and_morty_virtual_rick_ality
+title: 'Rick and Morty: Virtual Rick-ality'
+kind: rift
+tested_version: v2288226
+source_hint: 'Rick and Morty - Virtual Rick-ality'
+engine: Unity
+xr: OpenVR
+status: works
+notes: Runs on the Frame under Proton without Revive (this build talks to SteamVR directly). Slight stutter.
+details: The dump's executable already uses SteamVR (OpenVR), so it is installed as it is; Proton's VR bridge only
+  starts with FramePort's OpenXR layer (the Frame runtime accepts OpenXR 1.0 apps only). Confirmed in the headset.
+as_is: true
+pcvr:
+- pcvr.xr_timefix
+pcvr_remove:
+- pcvr.revive
+verified:
+  date: '2026-09-29'
+  target: frame
+  frame_os: SteamOS 0.4.2 (build 20260928.6175029)
+  proton: proton_11-arm64
+  exe: Rick and Morty - Virtual Rick-ality/RickAndMortyVR.exe
+  exe_sha256: 01678ebd02edec86258c482fbb5d00f3f0474e1a6515a905531f81df1a80ec50

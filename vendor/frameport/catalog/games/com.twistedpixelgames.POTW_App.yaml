@@ -1,0 +1,17 @@
+package: com.twistedpixelgames.POTW_App
+title: Path of the Warrior
+tested_version: 21.11.10.358057
+source_hint: Path of the Warrior
+engine: Other
+xr: VrApi
+status: works
+notes: 'Direct VrApi GLES engine: VrApi bridge (GLES) + GL shim.'
+details: Calls libvrapi directly (no OVRPlugin) with a GLAD-based GLES engine; its shaders need the GL shim on Mesa.
+frame:
+- frame.gl_shim
+- frame.vrapi_bridge
+verified:
+  date: '2026-09-28'
+  overport_cli: 1.2.3
+  overport_runtime: 3.4.3-23204ea
+  known_good_sha256: 7ca7b21c33769fdef6a8a6236c8d52c6d758df65cb618d5c6e896d9278d7d5b7

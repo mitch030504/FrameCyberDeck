@@ -1,0 +1,20 @@
+package: org.outrun.quest.vr
+title: OutRun Quest VR
+status: unknown
+notes: Needs colour-space support and FrameBridge's space warp (it quits at start without them). Not yet checked on
+  the Frame with both (GitHub #336).
+details: Own engine with OpenGL ES and its own OpenXR loader. It requires XR_FB_color_space (Rec.709; quit with "Rec.709
+  color space unavailable") and Meta's Application SpaceWarp (quit with "AppSW recommended buffers unavailable"); the
+  Frame's runtime offers neither in a usable form. fb_color_space offers the colour-space extension; space_warp_emul
+  offers XR_FB_space_warp with a motion-vector size, serves the motion-vector and depth images as GL textures and
+  removes the space warp info from every frame. Turning space warp off can't help, the game refuses to start without it.
+tested_version: 0.4.25-music-indicators
+engine: Other
+xr: OpenXR
+adapter:
+  fb_color_space: 1
+  space_warp_emul: 1
+verified:
+  issue: 336
+updated: '2026-10-24'
+source_hint: OutRunQuest-VR-v0.4.25-music-indicators-arm64

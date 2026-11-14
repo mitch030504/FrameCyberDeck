@@ -1,0 +1,20 @@
+package: com.Appnori.AllInOneSports
+title: AllInOneSports
+status: works
+tested_version: 1.9.0
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+- frame.oculusos
+device:
+- device.text_input_window
+verified:
+  date: '2026-10-04'
+  known_good_sha256: a1f9535ac569068bba25f137f131db9d4c3e997c072f3e790beac8ffef701fe3
+  app: 0.6.3
+  overport_cli: 1.2.5
+  frame_build: '20260930.6234839'
+  agent: 35
+  issue: 13
+source_hint: All In One Sports

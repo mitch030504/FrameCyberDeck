@@ -1,0 +1,25 @@
+package: com.playful.LuckysTale
+title: Lucky's Tale
+status: works
+notes: Plays normally; touching a save slot no longer freezes the Frame (haptic_fix).
+details: Touching a save slot vibrates the controller through XR_FB_haptic_amplitude_envelope; OVRPort's OpenXR
+  loader converts that envelope with the duration in nanoseconds read as seconds and allocates an enormous buffer, so
+  the Frame ran out of memory and froze (found by the GitHub issue 9 reporter). FrameBridge's extension shim turns the
+  envelope into a plain vibration before OVRPort's loader sees it (haptic_fix). Brief pauses came from the headset's
+  wear sensor flickering, now hidden by focus_hold (on by default).
+tested_version: 1.0.55
+engine: Unity
+xr: VrApi
+frame:
+- frame.unity_text_input
+- frame.unity_runtime_msaa_off
+device:
+- device.text_input_window
+adapter:
+  haptic_fix: 1
+verified:
+  date: '2026-10-05'
+  issue: 9
+updated: '2026-10-05'
+min_app: 0.11.0
+source_hint: Luckys Tale

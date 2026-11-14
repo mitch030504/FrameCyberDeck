@@ -1,0 +1,25 @@
+package: com.GexagonVR.HardBullet
+title: HardBullet
+status: issues
+notes: Loading screens (a cube overlay) are missing or corrupted up to FramePort 1.2.1; cube_quads (next release)
+  shows them as six panels, not confirmed in the headset yet. Level loads stall frame submission for up to ~1 s, so
+  the view freezes during loads.
+tested_version: 1.0.9.704Q
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+- frame.hw_video_decode
+device:
+- device.text_input_window
+adapter:
+  haptic_fix: 1
+verified:
+  date: '2026-10-17'
+  known_good_sha256: ecbb758d98083a590f100d5ac6efe9490ef74ad39b59217e0b4a11db920ecd51
+  app: 1.2.1
+  overport_cli: 1.2.5
+  frame_build: '20261015.6141207'
+  agent: 96
+  issue: 385
+source_hint: HARD BULLET

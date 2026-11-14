@@ -1,0 +1,29 @@
+package: com.BaggyG.JKXR_Companion_App
+title: JKXR_Companion_App
+status: unknown
+notes: 'JKXR''s companion app: it manages JKXR''s mods and start options in /sdcard/JKXR. On the Frame each game
+  has its own /sdcard, so this recipe shares JKXR''s folder with it (device.shared_folder). Install JKXR first.
+  Starting JKXR from the companion app can''t work (each game runs in its own container): start JKXR from Steam.
+  Shared folder not yet confirmed by a player (GitHub 440).'
+tested_version: '1.0'
+engine: Unity
+xr: VrApi
+frame:
+- frame.unity_text_input
+device:
+- device.text_input_window
+adapter:
+  haptic_fix: 1
+verified:
+  date: '2026-10-20'
+  known_good_sha256: 75ee0487ed6253a682b388df7ff06c6f7f35b2ce1b5a71341aed815bf6d60b34
+  app: 1.3.0
+  overport_cli: 1.2.5
+  frame_build: '20261007.6125817'
+  agent: 109
+  issue: 440
+source_hint: jkxrcompanion_115meta
+shared_folder:
+  game: com.drbeef.jkxr
+  folder: JKXR
+min_app: 1.3.1

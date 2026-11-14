@@ -1,0 +1,23 @@
+package: com.beatgames.beatsaber
+title: Beat Saber
+status: works
+notes: Purchased DLC isn't detected (ownership comes from Meta's servers).
+tested_version: 1.45.2_28848
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+device:
+- device.text_input_window
+adapter:
+  haptic_fix: 1
+  pose_time_fix: 1
+verified:
+  date: '2026-10-11'
+  known_good_sha256: b7976f36d39b22eb0fd9c8eb6cce204125430cd2a3e2bfab8ba5d1f7c86f0ac6
+  app: 1.0.4
+  overport_cli: 1.2.5
+  frame_build: '20261007.6125817'
+  agent: 79
+  issue: 210
+source_hint: beat-saber

@@ -1,0 +1,21 @@
+package: com.NewFolderGames.IAmMonkey
+title: I Am Monkey
+status: works
+notes: Its intro video plays through FrameBridge's video panels.
+details: The game plays its intro on a panel that an Android media player (ExoPlayer) draws into
+  (XR_KHR_android_surface_swapchain). The Frame's runtime lists that extension but refuses the call, so the panel had
+  no image and the game stayed black waiting for the video (GitHub issue 25). The adapter's surface_emul (on by
+  default) hands the player a real Android Surface and copies each video frame into an ordinary swapchain the panel
+  shows.
+tested_version: 1.0.5
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+device:
+- device.text_input_window
+verified:
+  date: '2026-10-04'
+  issue: 25
+updated: '2026-10-04'
+source_hint: I Am Monkey

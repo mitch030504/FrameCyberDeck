@@ -4,6 +4,7 @@ import { promises as fs } from 'fs'
 import { join } from 'path'
 import { execa } from 'execa'
 import settingsService from '../settingsService'
+import framePortEngineService from './framePortEngineService'
 
 type ProgressReporter = (step: string, percent?: number) => void
 
@@ -87,10 +88,6 @@ class FrameConversionService {
     title: string,
     onProgress?: ProgressReporter
   ): Promise<{ directory: string; cleanup: () => Promise<void>; result: FrameConversionResult }> {
-    const python = await this.resolvePython()
-    const helper = this.getHelperPath()
-    if (!existsSync(helper)) throw new Error(`Frame conversion helper is missing: ${helper}`)
-
     // Stage on the real disk, not the OS temp dir: /tmp is a small tmpfs on
     // many Linux distros, and a large game's OBBs overflow it mid-copy.
     const base = join(app.getPath('userData'), 'frame-cyberdeck-converted')
@@ -108,11 +105,6 @@ class FrameConversionService {
     }
 
     try {
-      onProgress?.('Converting Quest APK for Steam Frame…', 10)
-
-      let stdout = ''
-      let stderr = ''
-
       const stored = settingsService.getFrameConversionSettings()
       const envRefresh = process.env.FRAME_CYBERDECK_REFRESH_RATE
       const requestedRefresh = envRefresh === undefined ? stored.refreshRate : Number(envRefresh)
@@ -124,6 +116,55 @@ class FrameConversionService {
           `[Frame Convert] Ignoring unsupported FRAME_CYBERDECK_REFRESH_RATE=${envRefresh}; using runtime default.`
         )
       }
+
+      const engineStatus =
+        stored.engine === 'builtin'
+          ? null
+          : await framePortEngineService.getStatus().catch((error) => {
+              console.warn('[Frame Convert] FramePort engine status failed:', error)
+              return null
+            })
+      const engineReady = Boolean(
+        engineStatus?.filesReady && engineStatus.venvReady && engineStatus.toolsReady
+      )
+
+      if (stored.engine === 'frameport' && !engineReady) {
+        throw new Error(
+          'The FramePort conversion engine is not prepared. Prepare it in Settings, or choose the built-in converter.'
+        )
+      }
+
+      if (stored.engine === 'frameport' || (stored.engine === 'auto' && engineReady)) {
+        try {
+          console.log('[Frame Convert] Using the FramePort engine')
+          const result = await framePortEngineService.convert(
+            sourcePath,
+            undefined,
+            output,
+            refreshRate,
+            onProgress
+          )
+          return { directory: result.directory, cleanup, result }
+        } catch (error) {
+          if (stored.engine === 'frameport') throw error
+          console.warn(
+            '[Frame Convert] FramePort engine failed; falling back to the built-in converter:',
+            error
+          )
+          await fs.rm(output, { recursive: true, force: true }).catch(() => {})
+          await fs.mkdir(output, { recursive: true })
+          onProgress?.('FramePort build failed; using the built-in converter…', 10)
+        }
+      }
+
+      const python = await this.resolvePython()
+      const helper = this.getHelperPath()
+      if (!existsSync(helper)) throw new Error(`Frame conversion helper is missing: ${helper}`)
+
+      onProgress?.('Converting Quest APK for Steam Frame…', 10)
+
+      let stdout = ''
+      let stderr = ''
 
       const convertArgs = [
         helper,

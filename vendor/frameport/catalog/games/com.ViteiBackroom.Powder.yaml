@@ -1,0 +1,15 @@
+package: com.ViteiBackroom.Powder
+title: Carve Snowboarding
+tested_version: '1.09'
+source_hint: Carve Snowboarding
+engine: Unreal
+xr: VrApi
+status: works
+notes: Legacy VrApi via OVRPlugin.
+alt_overport:
+- patch_remove_unreal_force_quit
+verified:
+  date: '2026-09-28'
+  overport_cli: 1.2.3
+  overport_runtime: 3.4.3-23204ea
+  known_good_sha256: e5466f7909524f151d5bd58473a6d25651fffbcb041246e1d9d9bca7f008e5d2

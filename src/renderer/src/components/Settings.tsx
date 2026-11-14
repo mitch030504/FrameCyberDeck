@@ -49,6 +49,8 @@ import { useSoundEffects, SOUND_NAMES } from '../hooks/useSoundEffects'
 import type {
   DownloadProxySettings,
   FrameConversionSettings,
+  FrameConversionEngine,
+  FramePortEngineStatus,
   FrameRefreshRate
 } from '@shared/types'
 
@@ -1809,13 +1811,44 @@ const FRAME_REFRESH_OPTIONS: Array<{ label: string; value: FrameRefreshRate }> =
   { label: '144 Hz', value: 144 }
 ]
 
+const FRAME_ENGINE_OPTIONS: Array<{ label: string; value: FrameConversionEngine }> = [
+  { label: 'Automatic (FramePort when ready)', value: 'auto' },
+  { label: 'Built-in converter', value: 'builtin' },
+  { label: 'FramePort engine', value: 'frameport' }
+]
+
 const FrameConversionSettingsPanel: React.FC = () => {
   const styles = useStyles()
   const [settings, setSettings] = useState<FrameConversionSettings>({
-    refreshRate: 0
+    refreshRate: 0,
+    engine: 'auto'
   })
   const [loaded, setLoaded] = useState(false)
   const [saved, setSaved] = useState(false)
+  const [engineStatus, setEngineStatus] = useState<FramePortEngineStatus | null>(null)
+  const [enginePreparing, setEnginePreparing] = useState(false)
+  const [engineError, setEngineError] = useState<string | null>(null)
+
+  const refreshEngineStatus = async (): Promise<void> => {
+    try {
+      setEngineStatus(await window.api.frame.engineStatus())
+      setEngineError(null)
+    } catch (error) {
+      setEngineError(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  const prepareEngine = async (): Promise<void> => {
+    setEnginePreparing(true)
+    setEngineError(null)
+    try {
+      setEngineStatus(await window.api.frame.enginePrepare())
+    } catch (error) {
+      setEngineError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setEnginePreparing(false)
+    }
+  }
 
   useEffect(() => {
     let active = true
@@ -1834,6 +1867,10 @@ const FrameConversionSettingsPanel: React.FC = () => {
     return () => {
       active = false
     }
+  }, [])
+
+  useEffect(() => {
+    void refreshEngineStatus()
   }, [])
 
   const save = async (): Promise<void> => {
@@ -1866,8 +1903,8 @@ const FrameConversionSettingsPanel: React.FC = () => {
             <Text>Requested display refresh rate</Text>
             <Dropdown
               value={
-                FRAME_REFRESH_OPTIONS.find((entry) => entry.value === settings.refreshRate)?.label ??
-                'Runtime default'
+                FRAME_REFRESH_OPTIONS.find((entry) => entry.value === settings.refreshRate)
+                  ?.label ?? 'Runtime default'
               }
               selectedOptions={[String(settings.refreshRate)]}
               onOptionSelect={(_, data) => {
@@ -1884,9 +1921,80 @@ const FrameConversionSettingsPanel: React.FC = () => {
             </Dropdown>
             <Text className={styles.hint}>
               <InfoRegular />
-              Runtime default is safest. A requested rate is only used when the Frame runtime reports
-              that mode as supported.
+              Runtime default is safest. A requested rate is only used when the Frame runtime
+              reports that mode as supported.
             </Text>
+          </div>
+        </div>
+
+        <div className={styles.speedFormRow}>
+          <div className={styles.speedControl}>
+            <Text>Conversion engine</Text>
+            <Dropdown
+              value={
+                FRAME_ENGINE_OPTIONS.find((entry) => entry.value === settings.engine)?.label ??
+                FRAME_ENGINE_OPTIONS[0].label
+              }
+              selectedOptions={[settings.engine]}
+              onOptionSelect={(_, data) => {
+                const value = (data.optionValue ?? 'auto') as FrameConversionEngine
+                setSettings((current) => ({ ...current, engine: value }))
+              }}
+              mountNode={document.getElementById('portal')}
+            >
+              {FRAME_ENGINE_OPTIONS.map((entry) => (
+                <Option key={entry.value} value={entry.value} text={entry.label}>
+                  {entry.label}
+                </Option>
+              ))}
+            </Dropdown>
+            <Text className={styles.hint}>
+              <InfoRegular />
+              The FramePort engine uses the full upstream patch pipeline (IL2CPP fixes, dex patches,
+              expanded recipes). It needs Python 3.11+ and downloads its own toolchain once.
+            </Text>
+
+            {engineStatus && (
+              <Text className={styles.hint}>
+                {engineStatus.toolsReady
+                  ? `FramePort ${engineStatus.engineVersion ?? ''} ready — tools installed.`
+                  : engineStatus.filesReady
+                    ? 'FramePort engine files present; dependencies or tools are not installed yet.'
+                    : 'Vendored FramePort engine files are missing.'}
+              </Text>
+            )}
+            {engineStatus?.tools?.length ? (
+              <Text className={styles.hint}>
+                {engineStatus.tools
+                  .filter((tool) => !tool.optional)
+                  .map(
+                    (tool) =>
+                      `${tool.name}: ${tool.installed ? (tool.version ?? 'installed') : 'missing'}`
+                  )
+                  .join(' · ')}
+              </Text>
+            ) : null}
+            {engineError && <Text className={styles.hint}>{engineError}</Text>}
+
+            <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+              <button
+                onClick={() => void refreshEngineStatus()}
+                style={neonBtn}
+                disabled={enginePreparing}
+              >
+                Refresh engine status
+              </button>
+              {!engineStatus?.toolsReady && (
+                <button
+                  onClick={() => void prepareEngine()}
+                  style={neonBtn}
+                  disabled={enginePreparing}
+                >
+                  {enginePreparing ? 'Preparing FramePort engine…' : 'Prepare FramePort engine'}
+                </button>
+              )}
+            </div>
+            {enginePreparing && <Spinner size="small" label="Installing the FramePort engine..." />}
           </div>
         </div>
 

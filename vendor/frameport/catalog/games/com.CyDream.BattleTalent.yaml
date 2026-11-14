@@ -1,0 +1,30 @@
+package: com.CyDream.BattleTalent
+title: BattleTalent
+status: issues
+notes: "Plays normally. The mixed-reality mode doesn't appear in the start menu (also with an APK from a Quest 3); MR
+  progress in #355. LAN multiplayer works; online rooms need Meta's account check (user proof), so online
+  multiplayer can't work (#408)."
+tested_version: '4.7'
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+- frame.hw_video_decode
+- frame.luajit_pointers
+- frame.unity_runtime_msaa_off
+- frame.meta_permissions
+- frame.unity_multipass
+device:
+- device.text_input_window
+adapter:
+  haptic_fix: 1
+  scene_emul: 1
+verified:
+  date: '2026-10-17'
+  known_good_sha256: 17bbf8d7fc0f24d61986a0c5e1e9175cfe1239de6f8bcb2f588a57f80d83a1d3
+  app: 1.2.1
+  overport_cli: 1.2.5
+  frame_build: '20261007.6125817'
+  agent: 96
+  issue: 381
+source_hint: com.CyDream.BattleTalent

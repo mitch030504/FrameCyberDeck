@@ -1,0 +1,20 @@
+package: com.ORIGAMEDIGITAL.UmurangiGenerationVR
+title: Umurangi Generation VR
+status: issues
+notes: The game freezes after taking a photo, while it saves it, which makes it hard to play.
+tested_version: '1.163'
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+device:
+- device.text_input_window
+adapter:
+  haptic_fix: 1
+verified:
+  date: '2026-10-22'
+  known_good_sha256: c4dfe227c3e33e611f9a4b8ee542912c0891fe600a7d32e56cbe84b0524ec8d9
+  app: 1.3.0
+  overport_cli: 1.2.5
+  issue: 472
+source_hint: com.ORIGAMEDIGITAL.UmurangiGenerationVR.output

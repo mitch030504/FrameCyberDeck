@@ -1,0 +1,17 @@
+package: org.primedgun.v2
+title: PrimedGun v2
+status: issues
+notes: 'Vulkan via a statically linked Khronos OpenXR loader, which bypasses FrameBridge (the picture jumps).
+  The embedded-loader patch is off for now: with it, the game''s loader and the one FramePort adds call each other
+  until the game crashes at Play (GitHub #254). Keep the Vulkan library rename disabled: this game assembles its
+  library name from two pieces, so renaming it prevented Vulkan from loading and VR could not start.'
+tested_version: 2.0.0-alpha.4
+engine: Other
+xr: OpenXR
+frame:
+- frame.sdl_clipboard
+frame_remove:
+- frame.vk_sanitize
+- frame.static_openxr_loader
+updated: '2026-10-23'
+source_hint: PrimedGun v2 Quest APK (github.com/iChris4/MetroidPrimePortVR)

@@ -1,0 +1,24 @@
+package: com.parkline.wander
+title: Wander
+status: works
+notes: 0.3570 (Unity 6.5) runs out of thread keys at start without the thread-key pool (fix found by Klownicle,
+  GitHub #198).
+tested_version: '0.3570'
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+- frame.unity_runtime_msaa_off
+- frame.unity_tls_key_pool
+device:
+- device.text_input_window
+verified:
+  date: '2026-10-04'
+  known_good_sha256: c0c9de22b3646f35009a53796757d26f8d4e95259713f26a18fae2be995b23aa
+  app: 0.6.3
+  overport_cli: 1.2.5
+  frame_build: '20260930.6234839'
+  agent: 35
+  issue: 17
+updated: '2026-10-12'
+source_hint: Wander

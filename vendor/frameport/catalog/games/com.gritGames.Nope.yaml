@@ -1,0 +1,21 @@
+package: com.gritGames.Nope
+title: NOPE CHALLENGE
+tested_version: 1.0.964.7166
+source_hint: NOPE CHALLENGE
+engine: Unreal
+xr: OpenXR
+status: works
+notes: "Meta XR Audio telemetry patch + nodebug. MR mode: needs a scanned room."
+details: The MR 'Reality Breach' mode needs passthrough and a room; standard VR mode was verified.
+adapter:
+  scene_emul: 1
+alt_overport:
+- patch_remove_unreal_force_quit
+frame:
+- frame.nodebug
+- frame.oculusos
+verified:
+  date: '2026-09-28'
+  overport_cli: 1.2.3
+  overport_runtime: 3.4.3-23204ea
+  known_good_sha256: 3da930b5d08bfce89ff3390857372696e1bb1b4be8bb58e830d6f35d6be6caf7

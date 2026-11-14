@@ -1,0 +1,15 @@
+package: com.DigitalLode.Espire2
+title: Espire 2
+tested_version: 1.7.13
+source_hint: 'Espire 2- Stealth Operatives'
+engine: Unreal
+xr: OpenXR
+status: works
+notes: Launcher repairs unwritable save folders (fixes the setup loop).
+alt_overport:
+- patch_remove_unreal_force_quit
+verified:
+  date: '2026-09-28'
+  overport_cli: 1.2.3
+  overport_runtime: 3.4.3-23204ea
+  known_good_sha256: 51c315c9f31f991ebc33975975be9ef70964cd7fc90e56b175ab4be677745555

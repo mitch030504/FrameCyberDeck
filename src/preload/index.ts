@@ -122,7 +122,9 @@ const api = {
     runPackage: (packageName: string): Promise<boolean> =>
       typedIpcRenderer.invoke('frame:run-package', packageName),
     recordedSourcePackages: (): Promise<string[]> =>
-      typedIpcRenderer.invoke('frame:recorded-source-packages')
+      typedIpcRenderer.invoke('frame:recorded-source-packages'),
+    engineStatus: () => typedIpcRenderer.invoke('frame:engine-status'),
+    enginePrepare: () => typedIpcRenderer.invoke('frame:engine-prepare')
   } satisfies FrameAPIRenderer,
   games: {
     getGames: (): Promise<GameInfo[]> => typedIpcRenderer.invoke('games:get-games'),
@@ -262,8 +264,7 @@ const api = {
   metaSync: {
     getAccountStatus: (): Promise<MetaAccountStatus> =>
       typedIpcRenderer.invoke('meta-account:get-status'),
-    loginWithSso: (): Promise<MetaLoginResult> =>
-      typedIpcRenderer.invoke('meta-account:login-sso'),
+    loginWithSso: (): Promise<MetaLoginResult> => typedIpcRenderer.invoke('meta-account:login-sso'),
     loginWithToken: (token: string): Promise<MetaLoginResult> =>
       typedIpcRenderer.invoke('meta-account:login-token', token),
     logout: (): Promise<void> => typedIpcRenderer.invoke('meta-account:logout'),

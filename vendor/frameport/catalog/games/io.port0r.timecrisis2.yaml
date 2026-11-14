@@ -1,0 +1,18 @@
+package: io.port0r.timecrisis2
+title: 'Port0r: Time Crisis II VR'
+status: issues
+notes: Gameplay runs well; cut scenes and the title and game-selection screens after inserting coins
+  don't display properly.
+tested_version: 0.1.0
+engine: Other
+xr: OpenXR
+as_is: true
+verified:
+  date: '2026-10-25'
+  known_good_sha256: 3277d77f81fc6ec7e686d2bd74050234dbfb4c90bf3009a1feb027147372aecb
+  app: 1.3.0
+  overport_cli: 1.2.5
+  frame_build: '20261020.6124238'
+  agent: 109
+  issue: 495
+source_hint: Port0r-TimeCrisisIIVR-v0.1.0-quest3

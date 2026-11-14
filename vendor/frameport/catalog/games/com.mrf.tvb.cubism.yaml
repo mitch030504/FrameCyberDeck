@@ -1,0 +1,23 @@
+package: com.mrf.tvb.cubism
+title: cubism
+status: works
+notes: works and passthrough play works also
+tested_version: 1.8.0
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+device:
+- device.text_input_window
+adapter:
+  haptic_fix: 1
+  scene_emul: 1
+verified:
+  date: '2026-10-17'
+  known_good_sha256: fd1ba8eae19efe0f2a17fc146847de677263125f9ec5437cea5c632f0cd88dcf
+  app: 1.2.0
+  overport_cli: 1.2.5
+  frame_build: '20261007.6125817'
+  agent: 91
+  issue: 403
+source_hint: Cubism

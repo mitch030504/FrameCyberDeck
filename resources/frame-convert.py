@@ -14,32 +14,32 @@ import tempfile
 import urllib.request
 import zipfile
 
-OVRPORT_APP_VERSION = "1.2.3"
-OVRPORT_RUNTIME_VERSION = "3.4.3-23204ea"
-OVRPORT_ZIP_URL = "https://github.com/ovrport/app/releases/download/1.2.3/cli-jar.zip"
-OVRPORT_ZIP_SHA256 = "3239408ff1e97ad016916825c216dc3016c0ffa7db7c317221ed3f1244441594"
+OVRPORT_APP_VERSION = "1.2.5"
+OVRPORT_RUNTIME_VERSION = "3.4.3-aa54c3f"
+OVRPORT_JAR_URL = "https://github.com/Android-XR-Bridge/OVRPort/releases/download/v1.2.5/OVRPort-1.2.5-stable-cli.jar"
+OVRPORT_JAR_SHA256 = "d6a83bb11aea8568c3867c299dbf53568e75acb8519270755521d7d08fad2e81"
 
 # FramePort ships the FrameBridge adapter prebuilt; SHA-256 is from the
 # SHA256SUMS manifest at the pinned commit.
-FRAMEPORT_COMMIT = "5424e429e46e53fe51497babac124dd91dbb73bf"
+FRAMEPORT_COMMIT = "72c71fbbd303886992ab62cbc1aea6287100f935"
 FRAMEPORT_ADAPTER_URL = (
     "https://raw.githubusercontent.com/spoopyghosty0/frameport/"
     + FRAMEPORT_COMMIT
     + "/artifacts/arm64-v8a/libopenxr_loader_generic.so"
 )
-FRAMEPORT_ADAPTER_SHA256 = "449e13bbe58de6718d4e530177924e09552a95d748a082739899144e2cb3ccf3"
+FRAMEPORT_ADAPTER_SHA256 = "efeed4be5258da7e2943fefd669d7caca21962114ef4988c456a16cde934f031"
 
 # FramePort's per-game shim libraries and recipes: FramePort by spoopyghosty0
 # (https://github.com/spoopyghosty0/frameport), GPLv3 like this project.
 FRAMEPORT_ARTIFACTS = {
     # name: sha256 from artifacts/SHA256SUMS at FRAMEPORT_COMMIT
-    "libframe_xrshim.so": "8a8f6b1da8952cb3933a5b53558424a5fc56043b2527a16bb6dd62a00d2de01a",
-    "libfp_vk.so": "e8c0965c188665a4e565e4a3af983ef1866d1cf9225665cc90d8df286bc96ef3",
-    "libVkLayer_fp_shaderfix.so": "5becb96ee86fbda0ce98c0e0fd064f8ba092314aceaa400e3dcc785705dc3c23",
+    "libframe_xrshim.so": "36400eae4ba3807bcfcd54463daa217347032b07218792faa448d8cbbd086a0e",
+    "libfp_vk.so": "0055308856070aa7e09d80bcf66ea52dc0a495829b9da64383e38f4350706226",
+    "libVkLayer_fp_shaderfix.so": "86974202436e9209e260a690ae3eb0082d7d0f88e17c621dd77c0788ea66bc6d",
     "libfpg.so": "383054f8b3b41dde76d062c71856cd3163655e50009c08454bc1793f393ead65",
     "libglshim.so": "19ba5ed3c4b780f5ae46251f6958f552acfc5f13c8bb39f995579593fa8990c6",
     "libovrplatformcompat.so": "1feaeafad467c4cafdf2b018a4d84b0bee200c3f711697b4ce97e66a3ba256ca",
-    "libvrapi.so": "1d83eb94ec1df44f29a5f525dce4d5b608dbbb13a9c7a5efeb80a4b1dc54a721",
+    "libvrapi.so": "0faea8956cf9007244091e313cf935999f5ee617cd70a98c102565e9b0d30e5a",
 }
 
 
@@ -190,23 +190,12 @@ def find_java() -> pathlib.Path:
 
 def ensure_ovrport(root: pathlib.Path) -> pathlib.Path:
     folder = root / "ovrport-cli"
-    jar = folder / "overportcli-1.2.3-all.jar"
-    if jar.is_file():
+    jar = folder / "OVRPort-1.2.5-stable-cli.jar"
+    if jar.is_file() and sha256(jar) == OVRPORT_JAR_SHA256:
         return jar
 
-    archive = root / "downloads" / "ovrport-cli-1.2.3.zip"
-    if not archive.is_file() or sha256(archive) != OVRPORT_ZIP_SHA256:
-        download(OVRPORT_ZIP_URL, archive, OVRPORT_ZIP_SHA256)
-
     folder.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(archive) as zf:
-        zf.extractall(folder)
-
-    matches = list(folder.rglob("overportcli-1.2.3-all.jar"))
-    if not matches:
-        raise RuntimeError("Official OVR Port CLI archive did not contain overportcli-1.2.3-all.jar")
-    if matches[0] != jar:
-        shutil.copy2(matches[0], jar)
+    download(OVRPORT_JAR_URL, jar, OVRPORT_JAR_SHA256)
     return jar
 
 
@@ -248,7 +237,14 @@ def ensure_frameport_artifact(root: pathlib.Path, name: str) -> pathlib.Path:
 # Settings our UI owns; a recipe never overrides the user's explicit choice.
 RECIPE_USER_OWNED_SETTINGS = ("scale", "controller_fix", "foveation_fix", "refresh_rate")
 # Recipe settings that only take effect with a FramePort shim library in the APK.
-XRSHIM_SETTINGS = ("controller_models", "haptic_fix", "surface_native")
+XRSHIM_SETTINGS = (
+    "controller_models",
+    "haptic_fix",
+    "surface_native",
+    "fixed_resolution",
+    "hide_fb_foveation",
+    "scene_emul"
+)
 VK_SHIM_SETTINGS = (
     "vk_shader_fix",
     "vk_spec_fixes",
@@ -258,7 +254,13 @@ VK_SHIM_SETTINGS = (
     "vk_shader_dump",
 )
 ZINK_LAYER_SETTINGS = ("zink_shader_fix", "zink_shader_dump")
-GL_SHIM_SETTINGS = ("gl_int_attribs", "gl_highp_markers", "gl_hide_multiview", "gl_hide_msrtt")
+GL_SHIM_SETTINGS = (
+    "gl_int_attribs",
+    "gl_highp_markers",
+    "gl_hide_multiview",
+    "gl_hide_msrtt",
+    "gl_error_clear",
+)
 
 # OVRPort's recommended set (mirrors its own sources); recipes append extras.
 DEFAULT_OVRPORT_PATCHES = (
@@ -1778,7 +1780,7 @@ def doctor() -> dict:
         result["javaError"] = str(exc)
     result["toolsRoot"] = str(tools_root())
     result["ovrportCached"] = (
-        tools_root() / "ovrport-cli" / "overportcli-1.2.3-all.jar"
+        tools_root() / "ovrport-cli" / "OVRPort-1.2.5-stable-cli.jar"
     ).is_file()
     adapter_path = tools_root() / "frame-adapter" / "libopenxr_loader_generic.so"
     result["adapterCached"] = adapter_path.is_file()

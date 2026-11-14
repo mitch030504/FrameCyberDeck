@@ -1,0 +1,11 @@
+{
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "XR_APILAYER_FRAMEPORT_timefix",
+        "library_path": "./libxr_frameport_timefix.so",
+        "api_version": "1.0",
+        "implementation_version": "1",
+        "description": "FramePort: XR_KHR_convert_timespec_time emulation for Proton games on the Steam Frame",
+        "instance_extensions": [{"name": "XR_KHR_convert_timespec_time", "extension_version": "1"}]
+    }
+}

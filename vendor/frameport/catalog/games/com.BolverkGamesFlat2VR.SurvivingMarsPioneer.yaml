@@ -1,0 +1,23 @@
+package: com.BolverkGamesFlat2VR.SurvivingMarsPioneer
+title: 'Surviving Mars: Pioneer'
+status: works
+tested_version: 1.0.14
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+- frame.hw_video_decode
+device:
+- device.text_input_window
+adapter:
+  haptic_fix: 1
+  scale: 2.0
+verified:
+  date: '2026-10-18'
+  known_good_sha256: 3a9ff281417c219736ee10969e6ce4f7d8395472cb60718db8839d65edac4777
+  app: 1.2.1
+  overport_cli: 1.2.5
+  frame_build: '20261007.6125817'
+  agent: 96
+  issue: 399
+source_hint: Surviving Mars Pioneer

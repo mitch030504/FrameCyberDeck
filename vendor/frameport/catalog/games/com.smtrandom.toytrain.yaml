@@ -1,0 +1,22 @@
+package: com.smtrandom.toytrain
+title: ToyTrains
+status: works
+tested_version: 01.008.009
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+- frame.hw_video_decode
+device:
+- device.text_input_window
+adapter:
+  haptic_fix: 1
+verified:
+  date: '2026-10-17'
+  known_good_sha256: f8665ccd5ce9907164e0700c6924e78821918df550154f3b869cb9907aa50ede
+  app: 1.2.1
+  overport_cli: 1.2.5
+  frame_build: '20261015.6141207'
+  agent: 96
+  issue: 384
+source_hint: Toy Trains

@@ -1,0 +1,20 @@
+package: com.Meta4.TFBeyondReality
+title: 'Transformers Beyond Reality: Redux'
+status: unknown
+notes: Starts and runs at 72 fps in headless launch tests (2026-10-17); not yet checked in the headset. Steam's shader
+  cache layer is left out and a few shaders the Frame's driver refuses are skipped, so some objects may be missing.
+details: Unreal Engine game (Binned3 allocator, GitHub issue 349). Crash 1 - the allocator's 76 GiB up-front
+  reservation is refused by the Frame's kernel (frame.unreal_noreserve, suggested by analysis). Crash 2 - Unreal's
+  "Shader compilation failures are Fatal." With Lepton's Fossilize layer loaded every graphics pipeline failed with
+  VK_ERROR_OUT_OF_HOST_MEMORY, even a constant-colour one (not the pipeline cache, not the CPU allocator, not Valve's
+  FDM/RPO layers); vk_no_fossilize takes the layer out of the game's instance. A few pipelines with the game's
+  multiview vertex shaders then still fail in Turnip; vk_pipeline_fallback creates them with blank shaders.
+tested_version: 1.495.34291
+engine: Unreal
+xr: OpenXR
+adapter:
+  vk_no_fossilize: 1
+  vk_pipeline_fallback: 1
+verified:
+  date: '2026-10-17'
+  issue: 349

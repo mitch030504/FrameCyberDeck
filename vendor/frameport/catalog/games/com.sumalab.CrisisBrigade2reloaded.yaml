@@ -1,0 +1,26 @@
+package: com.sumalab.CrisisBrigade2reloaded
+title: Crisis Brigade 2 reloaded
+status: works
+notes: 'Its office.*.obb expansion files are installed under the game''s own package spelling from FramePort
+  1.4.0 on (GitHub #415); older versions left the levels unloaded.'
+tested_version: '2.22'
+engine: Unity
+xr: OpenXR
+frame:
+- frame.bhaptics_permission
+- frame.photon_voice_audio_route
+- frame.unity_text_input
+device:
+- device.text_input_window
+adapter:
+  haptic_fix: 1
+verified:
+  date: '2026-10-25'
+  known_good_sha256: 51ab71cc96cd10548275897c581054db12aa91bb1579c1798f6971a484f1f525
+  app: 1.3.1.dev703
+  overport_cli: 1.2.5
+  frame_build: '20261020.6124238'
+  agent: 125
+  issue: 499
+source_hint: crisis brigade
+min_app: 1.4.0

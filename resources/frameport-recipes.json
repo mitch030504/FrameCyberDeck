@@ -1,14 +1,44 @@
 {
-  "_source": "Game recipes from FramePort by spoopyghosty0 (https://github.com/spoopyghosty0/frameport), catalog commit 5424e429e46e53fe51497babac124dd91dbb73bf. GPLv3, like this project.",
+  "_source": "Game recipes from FramePort by spoopyghosty0 (https://github.com/spoopyghosty0/frameport), catalog commit 72c71fbbd303886992ab62cbc1aea6287100f935. GPLv3, like this project.",
   "recipes": {
+    "aei.AndreElijahImmersive.AmidEvilVR": {
+      "title": "Amid Evil",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
     "cn.vr4p.oculus4xvrplayerov": {
       "title": "4XVR Video Player",
       "status": "works",
       "adapter": {
+        "swapchain_pool": 1,
         "equirect_emul": 1,
         "stable_local": 1,
         "focus_hold": 1,
         "scale": 0.75
+      }
+    },
+    "com.Aldin.WotW": {
+      "title": "Waltz of the Wizard: Extended Edition",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.And7Limited.Hitstream": {
+      "title": "Hitstream",
+      "status": "works",
+      "adapter": {
+        "controller_models": 1,
+        "haptic_fix": 1
+      }
+    },
+    "com.Appnori.SummerSports": {
+      "title": "Summer Sports",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
       }
     },
     "com.Armature.VR4": {
@@ -21,6 +51,46 @@
         "patch_remove_unreal_force_quit"
       ]
     },
+    "com.BaggyG.JKXR_Companion_App": {
+      "title": "JKXR_Companion_App",
+      "status": "unknown",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.BanzaiStudios.GAZZLERS": {
+      "title": "GAZZLERS",
+      "status": "unknown",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.BigBraneStudios.SushiBen": {
+      "title": "Sushi Ben",
+      "status": "issues",
+      "adapter": {
+        "equirect_emul": 1,
+        "haptic_fix": 1
+      },
+      "alt_overport": [
+        "patch_remove_unreal_force_quit"
+      ]
+    },
+    "com.BolverkGamesFlat2VR.SurvivingMarsPioneer": {
+      "title": "Surviving Mars: Pioneer",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "scale": 2.0
+      }
+    },
+    "com.BurntTomato.RillaShotgun": {
+      "title": "Rilla Shotgun",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
     "com.CMGames.IntoTheRadius2": {
       "title": "Into The Radius 2",
       "status": "works",
@@ -30,6 +100,25 @@
         "focus_hold": 1,
         "focus_hold_ms": 2500,
         "vk_spec_fixes": 1
+      }
+    },
+    "com.CarbonStudio.TheWizards": {
+      "title": "The Wizards",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "pose_time_fix": 1,
+        "scale": 2.0
+      },
+      "alt_overport": [
+        "patch_remove_unreal_force_quit"
+      ]
+    },
+    "com.CatCommandosLtd.SpaceDockerVR": {
+      "title": "Space Docker VR",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
       }
     },
     "com.CortopiaStudios.DTRH": {
@@ -44,6 +133,31 @@
       "status": "works",
       "adapter": {
         "haptic_fix": 1
+      }
+    },
+    "com.CortopiaStudios.Spectre": {
+      "title": "Spectre",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "scale": 2.0
+      }
+    },
+    "com.Curve.LawnMowingSimulatorVR": {
+      "title": "Lawn Mowing Simulator VR",
+      "status": "issues",
+      "adapter": {
+        "haptic_fix": 1,
+        "pose_consistency": 1,
+        "hide_space_warp": 1
+      }
+    },
+    "com.CyDream.BattleTalent": {
+      "title": "BattleTalent",
+      "status": "issues",
+      "adapter": {
+        "haptic_fix": 1,
+        "scene_emul": 1
       }
     },
     "com.CyanWorlds.Myst": {
@@ -68,6 +182,44 @@
         "refresh_rate": 90.0
       }
     },
+    "com.DIVR.AimAssault": {
+      "title": "AimAssault",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.DefaultCompany.ArcaneHorizon": {
+      "title": "Arcane Horizon",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "scene_emul": 1
+      }
+    },
+    "com.DeoVR.Hyper": {
+      "title": "DeoVR Hyper",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.EgerterSoftware.MovieDeckforPlex": {
+      "title": "Movie Deck for Plex",
+      "status": "works",
+      "adapter": {
+        "controller_models": 1,
+        "haptic_fix": 1,
+        "scene_emul": 1
+      }
+    },
+    "com.FireproofStudios.GhostTown": {
+      "title": "Ghost Town",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
     "com.FourPlayersStudio.Retronika": {
       "title": "Retronika",
       "status": "works",
@@ -82,6 +234,20 @@
         "haptic_fix": 1
       }
     },
+    "com.GenderGames.Ladder": {
+      "title": "Ladder",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.GexagonVR.HardBullet": {
+      "title": "HardBullet",
+      "status": "issues",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
     "com.GhostlyBirdGames.BattleGlide": {
       "title": "BattleGlide",
       "status": "works",
@@ -89,11 +255,42 @@
         "focus_hold": 1
       }
     },
+    "com.HOOPOStudios.Alex": {
+      "title": "Alex",
+      "status": "issues",
+      "adapter": {
+        "haptic_fix": 1,
+        "scene_emul": 1
+      }
+    },
+    "com.HarmonixMusic.DCVRQuest": {
+      "title": "Dance Central",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "pose_time_fix": 1
+      }
+    },
+    "com.HorizonForge.AquaGlide": {
+      "title": "Aqua Glide",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.HypetrainDigitalLtd.Breathedge": {
+      "title": "Breathedge VR",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
     "com.ILMxLAB.VaderImmortal.ep1": {
       "title": "Vader Immortal: Episode I",
       "status": "works",
       "adapter": {
         "pose_time_fix": 1,
+        "gl_error_clear": 1,
         "zink_shader_fix": "12016:b2919629761ad268e0b21c72ac8520f81b76e72c3adc26897f97eae9a3e70a66:3092:0x0003003e,166,82,0x0003003e,177,82,0x0003003e,183,82,0x0003003e,189,82,0x0003003e,256,82,0x0003003e,266,82,0x0003003e,272,82,0x0003003e,278,82,0x0003003e,318,82,0x0003003e,328,82,0x0003003e,334,82,0x0003003e,340,82;11436:6f18be49f2aaa2452f962eb16f7af744c5c22a7b25f37ce681e0d6399e35a869:2932:0x0003003e,164,80,0x0003003e,175,80,0x0003003e,181,80,0x0003003e,187,80,0x0003003e,254,80,0x0003003e,264,80,0x0003003e,270,80,0x0003003e,276,80,0x0003003e,316,80,0x0003003e,326,80,0x0003003e,332,80,0x0003003e,338,80"
       }
     },
@@ -101,14 +298,32 @@
       "title": "Vader Immortal: Episode II",
       "status": "works",
       "adapter": {
-        "pose_time_fix": 1
+        "pose_time_fix": 1,
+        "gl_error_clear": 1
       }
     },
     "com.ILMxLAB.VaderImmortal.ep3": {
       "title": "Vader Immortal: Episode III",
       "status": "works",
       "adapter": {
-        "pose_time_fix": 1
+        "pose_time_fix": 1,
+        "gl_error_clear": 1
+      }
+    },
+    "com.ImpactReality.TromboneChamp": {
+      "title": "Trombone Champ: Unflattened!",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "scene_emul": 1
+      }
+    },
+    "com.JoyWay.Stride": {
+      "title": "STRIDE",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "refresh_rate": 72.0
       }
     },
     "com.JustAddWater.SniperEliteVR": {
@@ -120,6 +335,42 @@
         "ovrp_hold_physics": 1
       }
     },
+    "com.KMonkey.AmongGiants": {
+      "title": "Among Giants",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.LAIGames.ArcadeLegend": {
+      "title": "ArcadeLegend",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.LocoMotionDevs.Superfly": {
+      "title": "Superfly",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.MeatSpace.Nakatomi": {
+      "title": "Vendetta Forever",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.Meta4.TFBeyondReality": {
+      "title": "Transformers Beyond Reality: Redux",
+      "status": "unknown",
+      "adapter": {
+        "vk_no_fossilize": 1,
+        "vk_pipeline_fallback": 1
+      }
+    },
     "com.MightyCoconut.WalkaboutMiniGolf": {
       "title": "Walkabout Mini Golf",
       "status": "works",
@@ -129,6 +380,22 @@
         "scale": 1.5
       }
     },
+    "com.Miragesoft.RealVrFishingQ": {
+      "title": "Real VR Fishing",
+      "status": "issues",
+      "adapter": {
+        "haptic_fix": 1,
+        "scene_emul": 1,
+        "controller_models": 1
+      }
+    },
+    "com.MyronSoftware.Deisim": {
+      "title": "Deisim",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
     "com.NewFolderGames.IAmCat": {
       "title": "I Am Cat",
       "status": "works",
@@ -136,11 +403,33 @@
         "pose_consistency": 1
       }
     },
+    "com.NiVision.RacketPinball": {
+      "title": "RacketPinball",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.Norainu.MetacityPatrol": {
+      "title": "Metacity Patrol",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
     "com.Novelab.Demeter": {
       "title": "Demeter",
       "status": "works",
       "adapter": {
-        "scene_emul": 1
+        "scene_emul": 1,
+        "scene_hide_bounds": 1
+      }
+    },
+    "com.ORIGAMEDIGITAL.UmurangiGenerationVR": {
+      "title": "Umurangi Generation VR",
+      "status": "issues",
+      "adapter": {
+        "haptic_fix": 1
       }
     },
     "com.PeanutButton.Retropolis": {
@@ -158,6 +447,50 @@
         "pose_time_fix": 1
       }
     },
+    "com.PotamWorks.SmashDrums": {
+      "title": "Smash Drums",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "scene_emul": 1
+      }
+    },
+    "com.RealitiesIO.puzzlingPlaces": {
+      "title": "Puzzling Places",
+      "status": "issues",
+      "adapter": {
+        "equirect_emul": 1,
+        "haptic_fix": 1
+      }
+    },
+    "com.RuneSkovboJohansen.EyeOfTheTemple": {
+      "title": "Eye of the Temple",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.SDI.TWD": {
+      "title": "The Walking Dead: Saints & Sinners",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.SchellGames.DieScreaming": {
+      "title": "SilentSlayer",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.SchellGames.LostRecipes": {
+      "title": "Lost Recipes",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
     "com.ScytheDevTeam.ContainmentProtocol": {
       "title": "Deep Cuts",
       "status": "works",
@@ -165,11 +498,49 @@
         "haptic_fix": 1
       }
     },
+    "com.SquanchGames.Trover": {
+      "title": "Trover",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "pose_time_fix": 1
+      }
+    },
+    "com.StatusPro.NFLProEra2": {
+      "title": "NFL PRO ERA II",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.TacticalNounours.QuantumVoid": {
+      "title": "Quantum Void",
+      "status": "issues",
+      "adapter": {
+        "haptic_fix": 1,
+        "pose_time_fix": 1
+      }
+    },
     "com.TeamPanoptes.SilhouetteVR": {
       "title": "Silhouette",
       "status": "issues",
       "adapter": {
         "controller_fix": 0
+      }
+    },
+    "com.TeravisionGames.OrcsMustDie": {
+      "title": "Orcs Must Die: By The Blade",
+      "status": "works",
+      "adapter": {
+        "equirect_emul": 1,
+        "haptic_fix": 1
+      }
+    },
+    "com.TinyBuild.killitwithfirevr": {
+      "title": "Kill It With Fire VR",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
       }
     },
     "com.ToastVR.Matilda": {
@@ -187,10 +558,17 @@
       }
     },
     "com.UNIVRS.Freedom": {
-      "title": "Freedom",
-      "status": "issues",
+      "title": "Attack on Titan VR: Unbreakable",
+      "status": "works",
       "adapter": {
         "haptic_fix": 1
+      }
+    },
+    "com.Ubisoft.ACNexusVR": {
+      "title": "Assassin's Creed Nexus",
+      "status": "works",
+      "adapter": {
+        "swapchain_pool": 1
       }
     },
     "com.VR_HOT.VR_HOT_Quest": {
@@ -198,6 +576,21 @@
       "status": "works",
       "adapter": {
         "controller_models": 1,
+        "haptic_fix": 1
+      }
+    },
+    "com.VertigoGames.The7thGuestVR": {
+      "title": "The 7th Guest VR",
+      "status": "issues",
+      "adapter": {
+        "haptic_fix": 1,
+        "scale": 2.0
+      }
+    },
+    "com.Virtuallyz.OperationWolf": {
+      "title": "Operation Wolf Returns: First Mission VR",
+      "status": "works",
+      "adapter": {
         "haptic_fix": 1
       }
     },
@@ -209,6 +602,27 @@
         "focus_hold_ms": 2500
       }
     },
+    "com.WenklyStudio.SurvivalNation": {
+      "title": "Survival Nation",
+      "status": "works",
+      "adapter": {
+        "scale": 1.8
+      }
+    },
+    "com.WfelisCorp.MunkrFunkrTheLegacyDays": {
+      "title": "Munkr Funkr (The Legacy Days)",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.WhiteDoorGames.Cosmodread": {
+      "title": "Cosmodread",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
     "com.XRGames.ZombielandVR": {
       "title": "ZombielandVR",
       "status": "works",
@@ -216,11 +630,20 @@
         "haptic_fix": 1
       }
     },
+    "com.XrealGames.Zc15": {
+      "title": "Zero Caliber 2",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "fixed_resolution": 1
+      }
+    },
     "com.YourCompany.RoboRecall": {
       "title": "Robo Recall",
       "status": "works",
       "adapter": {
-        "pose_time_fix": 1
+        "pose_time_fix": 1,
+        "sync_guard": 1
       }
     },
     "com.YourCompany.SWP_VR": {
@@ -230,19 +653,72 @@
         "haptic_fix": 1
       }
     },
-    "com.asg.clockworkdev": {
-      "title": "Clockwork",
+    "com.ZynkSoftware.SecondsMatter": {
+      "title": "10 Seconds",
       "status": "works",
       "adapter": {
         "haptic_fix": 1
+      }
+    },
+    "com.arkio.arkio": {
+      "title": "Arkio",
+      "status": "works",
+      "adapter": {
+        "scene_emul": 1
+      }
+    },
+    "com.asg.clockworkdev": {
+      "title": "The Last Clockwinder",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.astrobotquest.vrhost": {
+      "title": "Astro VR Host",
+      "status": "works",
+      "adapter": {
+        "refresh_rate": 80.0
+      }
+    },
+    "com.baobab.invasion": {
+      "title": "Invasion",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "refresh_rate": 72.0
+      }
+    },
+    "com.baywilly.crazytaxivr": {
+      "title": "CrazyTaxiVR",
+      "status": "works",
+      "adapter": {
+        "scale": 0.85
+      }
+    },
+    "com.beatgames.beatsaber": {
+      "title": "Beat Saber",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "pose_time_fix": 1
       }
     },
     "com.camouflaj.manta": {
       "title": "Batman: Arkham Shadow",
       "status": "works",
       "adapter": {
+        "fixed_resolution": 1,
         "sync_guard": 1,
-        "surface_native": 1
+        "surface_native": 1,
+        "fade_quad": 1
+      }
+    },
+    "com.camouflaj.salmon": {
+      "title": "Marvel's Iron Man VR",
+      "status": "works",
+      "adapter": {
+        "fade_quad": 1
       }
     },
     "com.characterBank.ruinsmagus": {
@@ -259,6 +735,14 @@
         "haptic_fix": 1
       }
     },
+    "com.cmgames.unloop": {
+      "title": "UnLoop",
+      "status": "works",
+      "adapter": {
+        "equirect_emul": 1,
+        "haptic_fix": 1
+      }
+    },
     "com.coatsink.alone": {
       "title": "Jurassic World Aftermath Collection",
       "status": "works",
@@ -266,8 +750,75 @@
         "haptic_fix": 1
       }
     },
+    "com.coatsink.augmentedempireremastered": {
+      "title": "AugmentedEmpire",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "scene_emul": 1
+      }
+    },
+    "com.com2usroca.Darksword": {
+      "title": "Darksword",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "scale": 1.5
+      }
+    },
+    "com.cosmorama.tabletroopers": {
+      "title": "Table Troopers",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "scale": 2.0
+      }
+    },
     "com.curif.AgeOfJoy": {
       "title": "AgeOfJoy",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.drawandcode.TaskmasterVR": {
+      "title": "Taskmaster",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.drbeef.jkxr": {
+      "title": "JKXR",
+      "status": "works",
+      "adapter": {
+        "gl_error_clear": 1
+      }
+    },
+    "com.drbeef.lambda1vr": {
+      "title": "Lambda1VR",
+      "status": "works",
+      "adapter": {
+        "eye_pose_fix": 1
+      }
+    },
+    "com.drbeef.questzdoom": {
+      "title": "QuestZDoom",
+      "status": "works",
+      "adapter": {
+        "gl_error_clear": 1
+      }
+    },
+    "com.easyAction.ajax.se": {
+      "title": "AJAX ALL POWERFUL",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "pose_time_fix": 1
+      }
+    },
+    "com.el.blackholepooldemo": {
+      "title": "Black Hole Pool",
       "status": "works",
       "adapter": {
         "haptic_fix": 1
@@ -278,6 +829,43 @@
       "status": "issues",
       "adapter": {
         "haptic_fix": 1
+      }
+    },
+    "com.farbridge.vastreaches": {
+      "title": "Homeworld: Vast Reaches",
+      "status": "issues",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.fasttravelgames.lollipop": {
+      "title": "Vampire: The Masquerade - Justice",
+      "status": "issues",
+      "adapter": {
+        "haptic_fix": 1,
+        "scale": 2.0
+      }
+    },
+    "com.fasttravelgames.mascot": {
+      "title": "Cities: VR",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.fasttravelgames.solero": {
+      "title": "Solero",
+      "status": "works",
+      "adapter": {
+        "equirect_emul": 1,
+        "haptic_fix": 1
+      }
+    },
+    "com.fgovr.quest": {
+      "title": "FGO VR",
+      "status": "issues",
+      "adapter": {
+        "scale": 1.2
       }
     },
     "com.forcefieldxr.explorevr": {
@@ -294,9 +882,54 @@
         "pose_time_fix": 1
       }
     },
+    "com.forwardxp.PDTAMR": {
+      "title": "Please, Don't Touch Anything: House Broken",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "scene_emul": 1,
+        "sync_guard": 1
+      }
+    },
+    "com.fulldivegames.majorasmaskvr": {
+      "title": "Majora's Mask VR",
+      "status": "issues",
+      "adapter": {
+        "refresh_rate": 144.0
+      }
+    },
     "com.fyian.TheThrillOfTheFight": {
       "title": "The Thrill Of The Fight",
       "status": "issues",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.garage.drumsrock": {
+      "title": "Drums Rock",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "scale": 2.0
+      }
+    },
+    "com.greensky.swarm2": {
+      "title": "Swarm 2",
+      "status": "issues",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.gritGames.Nope": {
+      "title": "NOPE CHALLENGE",
+      "status": "works",
+      "adapter": {
+        "scene_emul": 1
+      }
+    },
+    "com.halfbrick.fruitninjavr": {
+      "title": "Fruit Ninja",
+      "status": "works",
       "adapter": {
         "haptic_fix": 1
       }
@@ -310,9 +943,17 @@
     },
     "com.ilmxlab.tales": {
       "title": "Star Wars: Tales from the Galaxy's Edge",
-      "status": "unknown",
+      "status": "works",
       "adapter": {
-        "pose_time_fix": 1
+        "pose_time_fix": 1,
+        "zink_shader_fix": "16800:8dbab031be7975e23452e333fe63afe44d5c8f4fd2b096aa21ed300426747757:4008:0x0003003e,219,102,0x0003003e,229,102,0x0003003e,235,102,0x0003003e,241,102,0x0003003e,302,102,0x0003003e,312,102,0x0003003e,318,102,0x0003003e,324,102,0x0003003e,369,102,0x0003003e,379,102,0x0003003e,385,102,0x0003003e,391,102"
+      }
+    },
+    "com.innerspacevr.afishermanstale": {
+      "title": "Fisherman",
+      "status": "issues",
+      "adapter": {
+        "haptic_fix": 1
       }
     },
     "com.kluge.SynthRiders": {
@@ -337,6 +978,50 @@
         "haptic_fix": 1
       }
     },
+    "com.mrf.kluge.SynthRiders": {
+      "title": "SynthRiders",
+      "status": "works",
+      "adapter": {
+        "controller_models": 1,
+        "haptic_fix": 1,
+        "scene_emul": 1
+      }
+    },
+    "com.mrf.tvb.cubism": {
+      "title": "cubism",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "scene_emul": 1
+      }
+    },
+    "com.mrf.tvb.laser_dance": {
+      "title": "Laser Dance",
+      "status": "works",
+      "adapter": {
+        "controller_fix": 1,
+        "haptic_fix": 1,
+        "scene_emul": 1,
+        "passthrough_emul": 1
+      }
+    },
+    "com.mrf.zenstudios.PFXVRQuest": {
+      "title": "Pinball FX VR",
+      "status": "issues",
+      "adapter": {
+        "equirect_emul": 1,
+        "haptic_fix": 1,
+        "scene_emul": 1
+      }
+    },
+    "com.nDreams.Ghostbusters": {
+      "title": "Ghostbusters: Rise of the Ghost Lord",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "scene_emul": 1
+      }
+    },
     "com.nDreams.PhantomQuest": {
       "title": "Phantom: Covert Ops",
       "status": "issues",
@@ -354,6 +1039,36 @@
         "haptic_fix": 1
       }
     },
+    "com.nextgenreality.mmrx": {
+      "title": "Mini Motor Racing X",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "pose_time_fix": 1
+      }
+    },
+    "com.nosebleed.ArcadeParadiseVR": {
+      "title": "Arcade Paradise VR",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "scene_emul": 1
+      }
+    },
+    "com.notdead.COMPOUNDQUEST": {
+      "title": "COMPOUND",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.oculus.herobounddemo": {
+      "title": "HeroBound: First Steps",
+      "status": "works",
+      "adapter": {
+        "scale": 0.85
+      }
+    },
     "com.onehamsa.RNXQ": {
       "title": "Racket: Nx",
       "status": "works",
@@ -361,16 +1076,70 @@
         "haptic_fix": 1
       }
     },
+    "com.onehamsa.underdogs": {
+      "title": "UNDERDOGS",
+      "status": "works",
+      "adapter": {
+        "controller_models": 1,
+        "haptic_fix": 1
+      }
+    },
+    "com.orbusvr.OrbusVRCommunity": {
+      "title": "OrbusVR",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "pose_time_fix": 1
+      }
+    },
+    "com.othergate.doe": {
+      "title": "Dungeons of Eternity",
+      "status": "issues",
+      "adapter": {
+        "haptic_fix": 1,
+        "pose_time_fix": 1
+      }
+    },
     "com.owlchemylabs.vacationsimulator": {
       "title": "Vacation Simulator",
-      "status": "issues",
+      "status": "works",
       "adapter": {
         "haptic_fix": 1,
         "refresh_rate": 90.0
       }
     },
+    "com.picselica.OceanRiftFullQuest": {
+      "title": "Ocean Rift",
+      "status": "works",
+      "adapter": {
+        "controller_models": 1,
+        "haptic_fix": 1,
+        "scene_emul": 1
+      }
+    },
     "com.playful.LuckysTale": {
       "title": "Lucky's Tale",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.polyarc.Moss2": {
+      "title": "Moss: Book II",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.polyarc.MossGame": {
+      "title": "Moss",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.poncle.vampiresurvivorsvr": {
+      "title": "Vampire Survivors",
       "status": "works",
       "adapter": {
         "haptic_fix": 1
@@ -383,6 +1152,23 @@
         "haptic_fix": 1
       }
     },
+    "com.resolutiongames.demeo": {
+      "title": "Demeo",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "scene_emul": 1
+      }
+    },
+    "com.resolutiongames.jade": {
+      "title": "Battlemarked",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "pose_time_fix": 1,
+        "scene_emul": 1
+      }
+    },
     "com.rrrgames.CaveCrave": {
       "title": "Caves",
       "status": "works",
@@ -390,8 +1176,104 @@
         "haptic_fix": 1
       }
     },
+    "com.s3d.ExplodingKittensVR.TestRelease": {
+      "title": "Exploding Kittens VR",
+      "status": "issues",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.schellgames.ieytd2": {
+      "title": "I Expect You To Die 2",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "scale": 2.0
+      }
+    },
+    "com.schellgames.ieytd3": {
+      "title": "IEYTD3",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.simpsonsHitAndRun.vr": {
+      "title": "Simpsons Hit and Run VR",
+      "status": "works",
+      "adapter": {
+        "refresh_rate": 120.0
+      }
+    },
+    "com.sketchar.sketcharmeta": {
+      "title": "Sketchar Meta",
+      "status": "works",
+      "adapter": {
+        "controller_models": 1,
+        "haptic_fix": 1,
+        "scene_emul": 1
+      }
+    },
+    "com.smtrandom.toytrain": {
+      "title": "ToyTrains",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
     "com.square_enix.android_meta.trianglexr": {
       "title": "TRIANGLE STRATEGY",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.stalwart.barbaria": {
+      "title": "Barbaria",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "scale": 2.0
+      }
+    },
+    "com.sumalab.CrisisBrigade2reloaded": {
+      "title": "Crisis Brigade 2 reloaded",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.sumalab.CrisisVRigade": {
+      "title": "Crisis VRigade",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.sumalab.CrisisVRigade2": {
+      "title": "Crisis Brigade 2 reloaded (App Lab)",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.team17.killerfrequency": {
+      "title": "KillerFrequency",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "scale": 1.4000000000000001
+      }
+    },
+    "com.themunky.drunknbarfightQuest": {
+      "title": "Drunkn Bar Fight",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.truantpixel.Runner": {
+      "title": "<RUNNER>",
       "status": "works",
       "adapter": {
         "haptic_fix": 1
@@ -417,10 +1299,46 @@
         "patch_remove_unreal_force_quit"
       ]
     },
+    "com.viewerready.totallybaseball": {
+      "title": "Totally Baseball",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.voidroom.TeaForGodEmperor": {
+      "title": "Tea For God",
+      "status": "works",
+      "adapter": {
+        "equirect_emul": 1
+      }
+    },
+    "com.vrmonkey.skyclimb": {
+      "title": "MacacoVR",
+      "status": "issues",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.wanadev.ragnarockquest": {
+      "title": "Ragnarock",
+      "status": "issues",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "com.wnas.eternalstarlight": {
+      "title": "Eternal Starlight",
+      "status": "issues",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
     "com.zenstudios.PFXVRQuest": {
       "title": "Pinball FX VR",
       "status": "issues",
       "adapter": {
+        "scene_emul": 1,
         "equirect_emul": 1,
         "hide_space_warp": 1
       }
@@ -428,6 +1346,20 @@
     "de.erthu.ancientdungeonfull": {
       "title": "Ancient_Dungeon",
       "status": "issues",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "dev.melee.game": {
+      "title": "Xelee",
+      "status": "unknown",
+      "adapter": {
+        "scene_emul": 1
+      }
+    },
+    "games.b4t.epicrollercoasters.oculus": {
+      "title": "Epic Roller Coasters",
+      "status": "works",
       "adapter": {
         "haptic_fix": 1
       }
@@ -440,8 +1372,84 @@
         "hide_space_warp": 1
       }
     },
+    "io.doublejack.maestro": {
+      "title": "Maestro",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "io.github.spoopyghosty0.testquestmr": {
+      "title": "Test Quest MR",
+      "status": "works",
+      "adapter": {
+        "scene_emul": 1
+      }
+    },
+    "io.port0r.timecrisis": {
+      "title": "Port0r: Time Crisis VR",
+      "status": "issues",
+      "adapter": {
+        "refresh_rate": 90.0
+      }
+    },
     "jp.co.amata.nvr": {
       "title": "The Tale of Onogoro",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "jp.co.hit_point.vneko": {
+      "title": "Neko Atsume Purrfect",
+      "status": "works",
+      "adapter": {
+        "controller_models": 1,
+        "haptic_fix": 1,
+        "scene_emul": 1
+      }
+    },
+    "jp.strippers.punchfit": {
+      "title": "Punch Fit",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "pose_time_fix": 1,
+        "scene_emul": 1,
+        "passthrough_emul": 1
+      }
+    },
+    "net.triband.wtb": {
+      "title": "WHAT THE BAT?",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "org.godotengine.endoparasitic_vr": {
+      "title": "EndoparasiticVR",
+      "status": "works",
+      "adapter": {
+        "equirect_emul": 1
+      }
+    },
+    "org.outrun.quest.vr": {
+      "title": "OutRun Quest VR",
+      "status": "unknown",
+      "adapter": {
+        "fb_color_space": 1,
+        "space_warp_emul": 1
+      }
+    },
+    "pl.idreams.zombirds": {
+      "title": "Shoot The Zombirds VR",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1
+      }
+    },
+    "quest.eleven.forfunlabs": {
+      "title": "Eleven Table Tennis",
       "status": "works",
       "adapter": {
         "haptic_fix": 1
@@ -464,6 +1472,14 @@
       "alt_overport": [
         "patch_remove_unreal_force_quit"
       ]
+    },
+    "xyz.TheAviary.Vermillion": {
+      "title": "Vermillion",
+      "status": "works",
+      "adapter": {
+        "haptic_fix": 1,
+        "scene_emul": 1
+      }
     }
   }
 }

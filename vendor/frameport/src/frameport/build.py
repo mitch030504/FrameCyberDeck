@@ -1,0 +1,151 @@
+"""Build stage: OVRPort → Frame fixes (apk-stage patches) → sign → static validation."""
+from __future__ import annotations
+
+import hashlib
+import shutil
+from pathlib import Path
+
+from .apk import sign
+from .apk.workspace import ApkWorkspace
+from .core.events import Reporter
+from .core.models import Analysis, BuildResult, Recipe, SourceGame
+from .core.paths import work_dir
+from .patches import base, upstream
+from .patches.frame import zink_shader_fix
+from .patches.overport import OVERPORT_PATCHES
+from .tools import overport as overport_tool
+from .validate.static import check_apk
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 22), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def native_checksums(names: list[str]) -> dict[str, str | None] | None:
+    """Current bundled checksums for selected APK artifacts; None means the manifest is unavailable."""
+    from .core.paths import artifacts_dir
+
+    try:
+        lines = (artifacts_dir() / "SHA256SUMS").read_text().splitlines()
+    except OSError:
+        return None
+    checksums = {parts[1].strip().removeprefix("./"): parts[0]
+                 for line in lines if len(parts := line.split(maxsplit=1)) == 2}
+    return {name: checksums.get(name) for name in names}
+
+
+def overport_ids(recipe: Recipe, alt: bool = False) -> list[str]:
+    """OVRPort defaults (OVRPort's order) first, then extras in recipe order, then the alt-build extras."""
+    chosen = [pid for pid in recipe.patches if base.get(pid).category == "overport"]
+    order = [pid for pid, *_ in OVERPORT_PATCHES]
+    defaults = [pid for pid in order if pid in chosen and base.get(pid).default_on]
+    extras = [pid for pid in chosen if pid not in defaults]
+    ids = defaults + extras
+    if alt:
+        ids += [pid for pid in recipe.alt_patches if pid not in ids]
+    return ids
+
+
+def apk_patches(selection: dict) -> list[base.Patch]:
+    patches = [base.get(pid) for pid in selection if base.get(pid).stage == "apk"]
+    if "frame.adapter" in selection and "device.foveation" not in selection:
+        # Prepare verified game-specific support independently of the player's runtime preference.
+        patches.append(base.get("device.foveation"))
+    if zink_shader_fix.configured(selection) and "frame.zink_shader_fix" not in selection:
+        # the shader dump / fix settings only work through this layer (GitHub #382: the switch alone did nothing)
+        patches.append(base.get("frame.zink_shader_fix"))
+    return sorted(patches, key=lambda p: p.order)
+
+
+def apply_frame_fixes(apk_in: Path, apk_out_unsigned: Path, analysis: Analysis, recipe: Recipe,
+                      reporter: Reporter) -> tuple[list[str], list[dict], dict[str, str]]:
+    """Apply the recipe's apk-stage patches; returns (applied ids, checks, workarounds left out because OVRPort's
+    output already has the upstream fix (patches/upstream.py))."""
+    applied, checks = [], []
+    with ApkWorkspace(apk_in) as ws:
+        selection = upstream.resolve(ws, recipe.patches, reporter)
+        for patch in apk_patches(selection.patches):
+            reporter.check_cancel()
+            ctx = base.ApkContext(ws, analysis, selection.patches.get(patch.id) or {}, reporter, selection.patches)
+            if patch.apply(ctx):
+                applied.append(patch.id)
+                reporter.log(f"applied {patch.id}" + (f" ({'; '.join(ctx.notes)})" if ctx.notes else ""))
+            for name, ok, detail in [*ctx.checks, *patch.validate(ctx)]:
+                checks.append({"name": name, "ok": ok, "detail": detail})
+        ws.write(apk_out_unsigned)
+    return applied, checks, selection.superseded
+
+
+def check_a32(analysis: Analysis, recipe: Recipe) -> None:
+    """A 32-bit-only game builds only through the 32-bit bridge, and without what the bridge replaces: OVRPort and
+    the 64-bit fixes would fail deep inside a tool or give an APK the Frame refuses (INSTALL_FAILED_NO_MATCHING_ABIS).
+    pipeline.set_recipe / build_game normally fix the recipe first (engine.a32_recipe); this catches every other
+    path with a plain message."""
+    if not analysis.only_32bit:
+        return
+    if "frame.a32_bridge" not in recipe.patches:
+        raise ValueError("This game has only 32-bit ARM code, which the Steam Frame can't run: turn on "
+                         f"\"{base.get('frame.a32_bridge').title}\" to build it.")
+    wrong = [base.get(pid).title for pid in recipe.patches if not base.works_on_a32(base.get(pid))]
+    if recipe.overport or wrong:
+        raise ValueError("The 32-bit bridge can't be combined with " + ", ".join(
+            (["OVRPort"] if recipe.overport else []) + wrong) + ": reset the recipe or turn those off.")
+
+
+def build(source: SourceGame, analysis: Analysis, recipe: Recipe, outdir: Path, reporter: Reporter,
+          keep_work: bool = False) -> BuildResult:
+    pkg = analysis.package
+    check_a32(analysis, recipe)
+    work = work_dir() / pkg
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    outdir.mkdir(parents=True, exist_ok=True)
+    # an APK that is already an OVRPort/FramePort build (e.g. a copy from an earlier FramePort) isn't converted again
+    # for the normal build: a second conversion replaces OVRPort's platform loader and drops what the first build
+    # linked to it (Wallace & Gromit / Espire 2 then crashed with "cannot locate symbol ovr_..."). Only the Steam
+    # Frame patches are applied on top. Its alternate build is the copy saved next to it, or (no copy) one more
+    # OVRPort run for the alternate patches; the stand-ins patch relinks what that drops.
+    converted = recipe.overport and analysis.is_overport_output
+    variants = [("primary", False)] + ([("alt", True)] if recipe.alt_patches and recipe.overport else [])
+    alt_copy = Path(source.apk).with_name(f"{pkg}.alt-noforcequit.apk")
+    results = {}
+    all_checks, applied, superseded = [], [], {}
+    try:
+        for variant, alt in variants:
+            input_apk = alt_copy if converted and alt and alt_copy.exists() else Path(source.apk)
+            if recipe.overport and (not converted or alt and input_apk == Path(source.apk)):
+                reporter.stage(f"OVRPort ({variant})")
+                ids = overport_ids(recipe, alt)
+                patched = overport_tool.patch(source.apk, work, f"{pkg}.{variant}.overport.apk", ids, reporter)
+            else:  # an ordinary Android app, or an already converted build: only the Frame patches it needs
+                if recipe.overport:
+                    reporter.log(f"{input_apk.name} is already converted: applying only the Steam Frame patches")
+                patched = work / f"{pkg}.{variant}.original.apk"
+                shutil.copyfile(input_apk, patched)
+            reporter.stage(f"Frame fixes ({variant})")
+            unsigned = work / f"{pkg}.{variant}.unsigned.apk"
+            applied, checks, left_out = apply_frame_fixes(patched, unsigned, analysis, recipe, reporter)
+            if variant == "primary":
+                superseded = left_out
+            patched.unlink(missing_ok=True)
+            reporter.stage(f"sign ({variant})")
+            final = outdir / (f"{pkg}.apk" if not alt else f"{pkg}.alt-noforcequit.apk")
+            sign.sign(unsigned, final, pkg)
+            unsigned.unlink(missing_ok=True)
+            reporter.stage(f"validate ({variant})")
+            checks += check_apk(final, pkg, expect_adapter=recipe.overport)
+            for c in checks:
+                reporter.check(c["name"], c["ok"], c["detail"])
+            results[variant] = final
+            all_checks += [{**c, "variant": variant} for c in checks]
+    finally:
+        if not keep_work:
+            shutil.rmtree(work, ignore_errors=True)
+    primary, alt_apk = results["primary"], results.get("alt")
+    return BuildResult(pkg, primary, alt_apk, sha256(primary), sha256(alt_apk) if alt_apk else None, applied,
+                       all_checks, {"overport": overport_ids(recipe), "alt_overport": overport_ids(recipe, True)
+                                    if alt_apk else None, "superseded": superseded})

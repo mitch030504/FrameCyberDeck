@@ -1,0 +1,455 @@
+"""Turn an Analysis into a suggested Recipe: catalog recipe when known, patch heuristics otherwise.
+
+Every enabled patch carries a human-readable reason (shown next to its toggle in the UI).
+"""
+from __future__ import annotations
+
+from ..core.models import Analysis, Recipe
+from ..patches import base
+from ..patches.applicability import uses_scene
+from . import catalog
+from .catalog import TOGGLED_DEVICE
+
+# what a flat (non-VR) Windows game keeps of the PC VR patches
+FLAT_WINDOWS_PATCHES = ("pcvr.proton_tool", "pcvr.proton_env", "pcvr.proton_log", "pcvr.no_crash_reporter")
+
+
+def suggest(analysis: Analysis, use_catalog: bool = True, pick: str = "") -> Recipe:
+    """`pick` = the package of another game's catalog entry the user chose for this game (recipe picker, GitHub
+    #508): that entry's recipe is used as if it were this game's, without the patches that can't apply to this build.
+    A pick that is no longer in the catalog (or is this game's own entry) falls back to the normal suggestion."""
+    picked = catalog.lookup(pick) if use_catalog and pick and pick != analysis.package else None
+    if picked is not None and (picked.kind or "quest") != ((analysis.extra or {}).get("kind") or "quest"):
+        picked = None  # a PC VR recipe can't run a Quest game (and the other way round)
+    entry = picked or (catalog.lookup(analysis.package) if use_catalog else None)
+    recipe = Recipe(analysis.package, title=analysis.label, catalog_rev=entry.rev() if entry else "")
+    # 1. heuristics / defaults from every patch module
+    rift = (analysis.extra or {}).get("kind") == "rift"
+    for patch in base.all_patches():
+        if not base.for_game(patch, analysis):
+            continue  # Quest patches for Quest games, PC VR (Revive) options for Rift games
+        if not patch.default_on and not patch.applies(analysis):
+            continue  # irrelevant for this game (engine, XR API, graphics API, ...)
+        s = patch.detect(analysis)
+        if s and s.recommended:
+            recipe.patches[patch.id] = dict(s.params)
+            recipe.reasons[patch.id] = s.reason
+    # 2. known-good catalog recipe overrides heuristics
+    if rift:
+        _rift_recipe(analysis, recipe, entry)
+        if (analysis.extra or {}).get("flat"):  # a Windows game without VR: Proton only, no VR parts
+            for pid in [p for p in recipe.patches if p not in FLAT_WINDOWS_PATCHES]:
+                recipe.patches.pop(pid)
+                recipe.reasons.pop(pid, None)
+    elif entry:
+        recipe.source = f"catalog ({entry.origin})"
+        recipe.status, recipe.notes, recipe.title = entry.status, entry.notes, entry.title or recipe.title
+        recipe.as_is = entry.as_is
+        if picked is not None:
+            _picked_header(recipe, analysis, picked)
+        why = f"Known-good recipe for {entry.title} (tested {entry.verified.get('date', '?')})."
+        for pid in entry.overport_remove:
+            recipe.patches.pop(pid, None)
+        for pid in entry.overport_extra + entry.frame + entry.device:
+            if getattr(base.get(pid), "strict", False) and not base.get(pid).applies(analysis):
+                continue  # e.g. a patch for one exact game build: another build of the game would fail to patch
+            recipe.patches.setdefault(pid, {})
+            recipe.reasons[pid] = why
+        # heuristic-only suggestions the catalog didn't choose are dropped for exact reproducibility
+        chosen = set(entry.overport_extra) | set(entry.frame) | set(entry.device)
+        if _a32_predates_bridge(analysis, entry):
+            chosen.add("frame.a32_bridge")  # the entry's verdict ("no AArch32") is from before the bridge
+        for pid in list(recipe.patches):
+            p = base.get(pid)
+            if pid not in chosen and not p.default_on and (p.category in ("overport", "frame")
+                                                           or pid in TOGGLED_DEVICE):
+                recipe.patches.pop(pid)
+                recipe.reasons.pop(pid, None)
+        for pid in entry.frame_remove:
+            recipe.patches.pop(pid, None)
+        for key, value in entry.adapter.items():
+            recipe.patches[f"adapter.{key}"] = {"value": value}
+            recipe.reasons[f"adapter.{key}"] = why
+        if ((recipe.patches.get("adapter.scene_emul") or {}).get("value") and uses_scene(analysis)
+                and "frame.meta_permissions" not in entry.frame_remove):
+            # the room needs Meta's scene/anchor permissions granted, or the game never asks for it (NOPE)
+            recipe.patches.setdefault("frame.meta_permissions", {})
+            recipe.reasons.setdefault("frame.meta_permissions",
+                                      "Meta's room and anchor permissions for the saved room.")
+        if entry.device_files:
+            recipe.patches["device.files"] = {"files": dict(entry.device_files)}
+            recipe.reasons["device.files"] = why
+        if entry.lepton_env:
+            recipe.patches["device.lepton_env"] = {"env": dict(entry.lepton_env)}
+        if entry.shared_folder:
+            recipe.patches["device.shared_folder"] = dict(entry.shared_folder)
+            recipe.reasons["device.shared_folder"] = why
+        if entry.config_sync:
+            recipe.patches["device.config_sync"] = {"files": {k: dict(v) for k, v in entry.config_sync.items()}}
+            recipe.reasons["device.config_sync"] = why
+        if entry.foveation:
+            recipe.patches["device.foveation"] = {"mode": entry.foveation}
+            if entry.foveation_radius:
+                recipe.patches["device.foveation"]["radius"] = entry.foveation_radius
+            if entry.foveation_test:
+                recipe.patches["device.foveation"]["test"] = True
+            recipe.reasons["device.foveation"] = why
+        recipe.alt_patches = list(entry.alt_overport)
+        recipe.use_alt = entry.use_alt
+        if _a32_predates_bridge(analysis, entry) and "frame.a32_bridge" in recipe.patches:
+            recipe.reasons["frame.a32_bridge"] = base.get("frame.a32_bridge").detect(analysis).reason
+            if recipe.status == "unsupported":
+                recipe.status = "unknown"
+            recipe.notes = A32_NOTE + " Not yet tested with the bridge (the catalog's earlier verdict: " + \
+                f"{entry.notes or entry.status})"
+    else:
+        recipe.source = "heuristics"
+        if analysis.engine == "Unreal":
+            recipe.alt_patches = ["patch_remove_unreal_force_quit"]  # build a fallback in case it quits itself
+        if analysis.only_32bit:
+            recipe.notes = A32_NOTE
+        elif analysis.no_arm64:
+            recipe.status = "unsupported"
+            recipe.notes = f"No 64-bit ARM code ({', '.join(analysis.abis)}): the Steam Frame can't run it."
+        if not rift:
+            _static_blockers(analysis, recipe)
+    if picked is not None:
+        drop_inapplicable(analysis, recipe)
+    if not rift and (not entry or analysis.vr_kind == "none"):
+        # Saved recipes still need the flat-app build rules: no OVRPort, and APK fixes only when needed (#271).
+        _non_quest(analysis, recipe)
+    if not rift:
+        a32_recipe(analysis, recipe)
+    if not rift and not entry and (analysis.extra or {}).get("frame_patched"):
+        # already has FramePort's adapter (e.g. a PATCHED/ build): installing it unchanged is the safe default
+        recipe.as_is = True
+        recipe.notes = (recipe.notes + " " if recipe.notes else "") + \
+            "This APK is already patched for the Frame, so FramePort installs it as it is."
+    # requirements
+    for pid in list(recipe.patches):
+        for req in base.get(pid).requires:
+            if req not in recipe.patches:
+                recipe.patches[req] = {}
+                recipe.reasons[req] = f"Needed by '{base.get(pid).title}'."
+    return recipe
+
+
+def _picked_header(recipe: Recipe, analysis: Analysis, entry) -> None:
+    """A recipe picked from another game's catalog entry: it keeps this game's name, and its status says it hasn't
+    been tried with this build (a verdict that it can't run stays)."""
+    recipe.recipe_source = entry.package
+    recipe.source = f"catalog pick ({entry.origin})"
+    recipe.title = analysis.label
+    tested = {"works": "works", "issues": "works with issues", "unsupported": "doesn't run"}.get(entry.status)
+    head = (f"Recipe of {entry.title} ({entry.package}) from the catalog, chosen by hand"
+            + (f": with that build it {tested}." if tested else "."))
+    recipe.notes = f"{head} {entry.notes}".strip() if entry.notes else head
+    if entry.status != "unsupported":
+        recipe.status = "unknown"
+
+
+def drop_inapplicable(analysis: Analysis, recipe: Recipe) -> list[str]:
+    """Patches of a recipe chosen for another game that can't matter for this one (patch.applies(): another engine,
+    XR or graphics API, a library this build doesn't have): removed. Returns their ids."""
+    dropped = []
+    for pid in list(recipe.patches):
+        p = base.REGISTRY.get(pid)
+        if p is None or (not p.default_on and not p.applies(analysis)):
+            recipe.patches.pop(pid)
+            recipe.reasons.pop(pid, None)
+            dropped.append(pid)
+    return dropped
+
+
+def pick_warnings(analysis: Analysis, entry) -> list[str]:
+    """What differs between this game and the catalog entry the user is about to take a recipe from: shown before the
+    recipe is applied (a Unity recipe on an Unreal game rarely makes sense)."""
+    out = []
+    kind = (analysis.extra or {}).get("kind") or "quest"
+    if (entry.kind or "quest") != kind:
+        return [f"{entry.title} is a {'PC VR' if entry.kind == 'rift' else 'Quest'} game: its recipe can't be used "
+                "for this one."]
+    mine, theirs = (analysis.engine or "").strip(), (entry.engine or "").strip()
+    if mine and theirs and "?" not in (mine, theirs) and mine.split()[0].lower() != theirs.split()[0].lower():
+        out.append(f"Different engine: this game is made with {mine}, {entry.title} with {theirs}.")
+    if kind == "quest" and _xr_set(analysis.xr) and _xr_set(entry.xr) and _xr_set(analysis.xr) != _xr_set(entry.xr):
+        out.append(f"Different VR interface: this game uses {analysis.xr}, {entry.title} uses {entry.xr}.")
+    if kind == "quest" and entry.headset in ("gearvr", "go") and not analysis.only_32bit:
+        out.append(f"{entry.title} is a 32-bit game; this one isn't.")
+    elif kind == "quest" and analysis.only_32bit and entry.headset not in ("gearvr", "go") \
+            and "frame.a32_bridge" not in entry.frame:
+        out.append(f"This game is 32-bit; {entry.title}'s recipe is for a 64-bit game.")
+    if entry.status == "unsupported":
+        out.append(f"The catalog says {entry.title} doesn't run on the Frame.")
+    return out
+
+
+LAUNCH_PATCHES = ("pcvr.repack_launcher", "pcvr.launch_args")  # how a Rift game starts (from its files)
+
+
+def _xr_set(xr: str) -> set[str]:
+    return {x.strip().lower() for x in (xr or "").split("+") if x.strip() and x.strip() != "?"}
+
+
+def _other_build(entry, analysis: Analysis) -> bool:
+    """The catalog recipe was verified with a different build of the game (another VR API set), e.g. SUPERHOT VR's
+    OpenXR build vs its older Oculus + SteamVR build (GitHub #105): the build's own launch arguments then stay."""
+    mine, theirs = _xr_set(analysis.xr), _xr_set(entry.xr)
+    return bool(mine and theirs and mine != theirs)
+
+
+def _rift_recipe(analysis: Analysis, recipe: Recipe, entry) -> None:
+    extra = analysis.extra
+    if entry:
+        recipe.source = f"catalog ({entry.origin})"
+        recipe.status, recipe.notes, recipe.title = entry.status, entry.notes, entry.title or recipe.title
+        if entry.package != analysis.package:  # picked by hand
+            _picked_header(recipe, analysis, entry)
+        why = f"Known-good recipe for {entry.title} (tested {entry.verified.get('date', '?')})."
+        other_build = _other_build(entry, analysis)
+        for pid in entry.pcvr:
+            if pid == "pcvr.launch_args" and pid not in recipe.patches:
+                continue  # the arguments come from the game files: none found (e.g. an OpenXR build) = none to add
+            recipe.patches.setdefault(pid, {})
+            recipe.reasons[pid] = why
+        for pid in entry.pcvr_remove:
+            recipe.patches.pop(pid, None)
+        for pid in LAUNCH_PATCHES:  # a verified recipe decides how the game starts ...
+            if pid not in entry.pcvr and not other_build:  # ... unless it was verified with another build
+                recipe.patches.pop(pid, None)
+                recipe.reasons.pop(pid, None)
+        if entry.proton_env:
+            recipe.patches["pcvr.proton_env"] = {"env": "\n".join(f"{k}={v}" for k, v in entry.proton_env.items())}
+            recipe.reasons["pcvr.proton_env"] = why
+        if entry.proton_tool:
+            recipe.patches["pcvr.proton_tool"] = {"tool": entry.proton_tool}
+            recipe.reasons["pcvr.proton_tool"] = why
+        recipe.as_is = entry.as_is
+        if other_build:
+            args = recipe.params("pcvr.launch_args").get("args")
+            recipe.notes = (recipe.notes + " " if recipe.notes else "") + \
+                (f"The recipe was verified with another build of the game ({entry.xr}); this one uses "
+                 f"{analysis.xr}" + (f" and starts with {args}." if args else "."))
+        # drop patches whose requirement the catalog removed (e.g. revive_openvr once revive is gone), so the
+        # requirement pass in suggest() doesn't re-add it
+        for pid in list(recipe.patches):
+            if any(req not in recipe.patches for req in base.get(pid).requires):
+                recipe.patches.pop(pid, None)
+                recipe.reasons.pop(pid, None)
+        return
+    recipe.source = "heuristics"
+    recipe.as_is = True  # the dump is installed unchanged; Revive (when on) is a launch-time wrapper, not a file edit
+    notes = []
+    mode = extra.get("launch") or ("native" if extra.get("frame_native") else "revive" if extra.get("needs_revive")
+                                   else "")
+    if mode == "repack":
+        notes.append("The game folder is already set up for SteamVR (its own Revive, started by a loader DLL): "
+                     "FramePort runs the game directly. On the Frame this is experimental (Wine is told to load the "
+                     "loader DLL; the bundled Revive needs SteamVR's OpenVR under Proton).")
+    elif mode == "native":
+        args = extra.get("launch_args")
+        notes.append("Supports SteamVR/OpenXR itself: runs directly, without Revive"
+                     + (f" (arguments {args})." if args else "."))
+    elif mode == "revive":
+        notes.append("Oculus/LibOVR game: needs Revive, which works in PC mode with SteamVR running. Not supported on "
+                     "the Steam Frame (Revive can't run there).")
+    if extra.get("platform_sdk"):
+        notes.append("Uses the Oculus Platform SDK (entitlement check): it needs the Oculus app (Meta Horizon) on the "
+                     "PC with a license you own, so on the Frame it may not start.")
+    if analysis.abis and analysis.abis[0] not in ("x86", "x86_64"):
+        recipe.status = "unsupported"
+        notes.append(f"Unexpected executable type {analysis.abis[0]}.")
+    recipe.notes = " ".join(notes)
+
+
+def warnings(recipe: Recipe, analysis: Analysis | None = None) -> list[str]:
+    out = []
+    if analysis is not None and analysis.only_32bit and not recipe.as_is:
+        if "frame.a32_bridge" not in recipe.patches:
+            return [f"This game has only 32-bit ARM code, which the Steam Frame can't run: without "
+                    f"'{base.get('frame.a32_bridge').title}' it can't be built."]
+        return [f"{base.get(pid).title} doesn't work with the 32-bit bridge." for pid in recipe.patches
+                if not base.works_on_a32(base.get(pid))]
+    if recipe.package.startswith("rift."):
+        for pid in recipe.patches:
+            for r in base.get(pid).requires:
+                if r not in recipe.patches:
+                    out.append(f"{base.get(pid).title} needs {base.get(r).title}.")
+            for c in base.get(pid).conflicts:
+                if c in recipe.patches and pid < c:
+                    out.append(f"{base.get(pid).title} conflicts with {base.get(c).title}.")
+        return out
+    params = recipe.patches.get("device.extra_folder") if isinstance(recipe.patches, dict) else None
+    folder = str(params.get("folder") or "") if isinstance(params, dict) else ""
+    if folder.strip():
+        from ..patches.settings import extra_folder_value
+
+        try:
+            extra_folder_value(folder)
+        except ValueError as exc:
+            out.append(str(exc))
+    for pid in recipe.patches:
+        p = base.get(pid)
+        for c in p.conflicts:
+            if c in recipe.patches:
+                out.append(f"{p.title} conflicts with {base.get(c).title}.")
+        for r in p.requires:
+            if r not in recipe.patches:
+                out.append(f"{p.title} needs {base.get(r).title}.")
+    if recipe.as_is or not recipe.overport:
+        return out  # installed unchanged / an ordinary Android app: no VR translation expected
+    if "patch_copy_libraries" not in recipe.patches:
+        out.append("Without 'Copy OVRPort libraries' nothing is translated to OpenXR.")
+    if "frame.adapter" not in recipe.patches:
+        out.append("Without the FrameBridge adapter most games fail on the Frame runtime.")
+    return out
+
+
+def android_version_note(analysis: Analysis) -> str | None:
+    """'Its manifest asks for Android 14 (API 34)…' when the APK's minimum Android is newer than the Frame's."""
+    from ..analysis.detect import FRAME_API, android_version, too_new_android
+
+    min_sdk = (analysis.extra or {}).get("min_sdk")
+    if not too_new_android(min_sdk):
+        return None
+    return (f"Its manifest asks for Android {android_version(min_sdk)} (API {min_sdk}); the Frame's Android is "
+            f"{android_version(FRAME_API)} (API {FRAME_API}). Apps like this often crash at start on newer Android "
+            "parts, but not always: a launch test tells.")
+
+
+def web_wrapper_note(analysis: Analysis) -> str | None:
+    """A Trusted Web Activity: the APK only opens a website in Meta's browser (analysis.detect.web_wrapper)."""
+    ww = (analysis.extra or {}).get("web_wrapper")
+    if not ww:
+        return None
+    where = f"open {ww['url']} in a browser instead" if ww.get("url") else "open the website in a browser instead"
+    return (f"This app looks like a website in an Android wrapper (Trusted Web Activity): it opens the site in "
+            f"Meta's browser, which the Frame doesn't have. If nothing opens, {where}.")
+
+
+def google_vr_note(analysis: Analysis) -> str | None:
+    """A Google Daydream / Cardboard build (analysis.detect.google_vr) that isn't also a Meta build: its VR can't
+    reach the Frame's headset (GitHub #335)."""
+    kind = (analysis.extra or {}).get("google_vr")
+    if not kind or analysis.vr_kind == "quest":  # a build with Oculus support too goes the normal way
+        return None
+    name = "Google Daydream" if kind == "daydream" else "Google Cardboard"
+    return (f"This is a {name} VR build (Google VR SDK). Its VR can't reach the Steam Frame's headset: Daydream "
+            "needs Google's VR services and Cardboard draws for a phone in a viewer, and FramePort has no "
+            "translation for either, so it runs as a flat window at best, usually without working controls. An "
+            "Oculus build of the same game (Meta Quest, Oculus Go or Gear VR) goes through FramePort's normal path.")
+
+
+def blocker_notes(analysis: Analysis) -> list[str]:
+    """Warnings read from the APK's manifest that it may not run on the Frame (whatever the recipe says). Only
+    warnings: the manifest alone never marks a game unsupported (owner's rule); a launch test's triage decides."""
+    return [n for n in (android_version_note(analysis), web_wrapper_note(analysis), google_vr_note(analysis)) if n]
+
+
+def _static_blockers(analysis: Analysis, recipe: Recipe) -> None:
+    for note in blocker_notes(analysis):
+        recipe.notes = _add(recipe.notes, note)
+
+
+def _non_quest(analysis: Analysis, recipe: Recipe) -> None:
+    """Android apps that aren't Meta Quest apps (analysis.detect.vr_kind)."""
+    kind = analysis.vr_kind
+    if (analysis.extra or {}).get("split_apk"):
+        recipe.notes = _add(recipe.notes, "Split APK: only the base APK was found; the game's code may live in the "
+                                          "other parts of the set. Add the whole app bundle (.xapk/.apks/.apkm) or "
+                                          "the folder with all its split APKs instead: FramePort merges them.")
+    if kind == "none":
+        # an ordinary (2D) Android app: no OpenXR to translate. Install it unchanged, or with only the launcher fix
+        recipe.overport = False
+        # fixes that aren't about VR stay (navigation bar, SDL's clipboard, Unity text fields...), and the launcher
+        # entry when the app only has an INFO activity
+        needed = {pid for pid in recipe.patches if not base.get(pid).needs_vr and pid != "frame.launcher"}
+        needed |= {"frame.launcher"} if analysis.has_info_category else set()
+        recipe.patches = {pid: v for pid, v in recipe.patches.items() if pid in needed}
+        recipe.reasons = {pid: v for pid, v in recipe.reasons.items() if pid in recipe.patches}
+        recipe.alt_patches = []
+        recipe.as_is = not any(base.get(pid).stage == "apk" for pid in recipe.patches)  # the APK stays unchanged
+        if not (analysis.extra or {}).get("google_vr"):  # a Google VR build says so in its own note (blocker_notes)
+            recipe.notes = _add(recipe.notes, "Android app without VR: installed without FramePort's VR translation.")
+    elif kind in ("pico_sdk", "wave"):
+        recipe.status = "unsupported"
+        recipe.notes = _add(recipe.notes, f"Uses {'Pico' if kind == 'pico_sdk' else 'HTC Vive Wave'}'s own VR SDK "
+                                          "instead of OpenXR: there is no way to run it on the Steam Frame.")
+    elif kind == "android_xr":
+        recipe.status = "unsupported"
+        recipe.notes = _add(recipe.notes, "Android XR app: it needs Android XR system services that the Steam "
+                                          "Frame's Android runtime doesn't have.")
+    elif kind == "openxr":
+        recipe.notes = _add(recipe.notes, "OpenXR app for another headset: translated like Quest games; that "
+                                          "headset's own extensions and store/platform services aren't available.")
+
+
+def flat_as_is(analysis: Analysis, recipe: Recipe) -> None:
+    """A 2D app (vr_kind none) has no "install unchanged" switch: it is installed unchanged exactly when none of its
+    patches that can matter edits the APK. Saving a recipe with such a patch turned on by hand builds the APK
+    (it used to stay as_is, so e.g. frame.browser_handoff turned on for Plex would never have been applied)."""
+    if analysis.vr_kind != "none":
+        return
+    base.load_all()
+    recipe.as_is = not any(pid in base.REGISTRY and base.get(pid).stage == "apk" and base.get(pid).applies(analysis)
+                           for pid in recipe.patches)
+
+
+A32_NOTE = ("32-bit only (e.g. a Gear VR or Oculus Go game): the Steam Frame has no 32-bit ARM support, so the game "
+            "runs through FramePort's 32-bit bridge (experimental).")
+
+
+def _a32_predates_bridge(analysis: Analysis, entry) -> bool:
+    """A catalog entry for a 32-bit game that neither uses nor removes the bridge was written before it existed
+    (e.g. "unsupported: the Frame has no AArch32"): the bridge is suggested anyway."""
+    return analysis.only_32bit and "frame.a32_bridge" not in (*entry.frame, *entry.frame_remove)
+
+
+def a32_recipe(analysis: Analysis, recipe: Recipe, newly: bool = True) -> bool:
+    """A 32-bit-only game through the 32-bit bridge (frame.a32_bridge): OVRPort (64-bit apps only) doesn't run; the
+    bridge ships OVRPort's loaders itself. Unity needs its Android window focused (Lepton runs VR apps headless,
+    without a focused window, and Unity's built-in VR then never starts rendering). Also applied to recipes edited
+    by hand (pipeline.set_recipe, builds): turning the bridge on switches off what it replaces. `newly` = the bridge
+    was just turned on: also add what it needs and lift an "unsupported" from before the bridge (a later save mustn't
+    bring back a patch the user turned off). True = changed."""
+    if not analysis.only_32bit or "frame.a32_bridge" not in recipe.patches:
+        return False
+    before = (recipe.overport, list(recipe.alt_patches), set(recipe.patches), recipe.status)
+    recipe.overport = False
+    recipe.alt_patches = []
+    # the 64-bit library fixes don't apply to translated code (the bridge does its own: Unity's Oculus check,
+    # Meta's platform loader); adapter settings that need OVRPlugin's own arm64 lookups (xrshim) neither
+    for pid in [p for p in recipe.patches if not base.works_on_a32(base.get(p))]:
+        recipe.patches.pop(pid)
+        recipe.reasons.pop(pid, None)
+    if newly and analysis.engine == "Unity" and "device.text_input_window" not in recipe.patches:
+        recipe.patches["device.text_input_window"] = {}
+        recipe.reasons["device.text_input_window"] = ("Unity on the 32-bit bridge starts rendering only with its "
+                                                      "Android window focused.")
+    if newly and recipe.status == "unsupported":
+        entry = catalog.lookup(analysis.package)
+        if not entry or _a32_predates_bridge(analysis, entry):  # "no AArch32", not a verdict on the bridge
+            recipe.status = "unknown"
+            recipe.notes = A32_NOTE
+    return before != (recipe.overport, list(recipe.alt_patches), set(recipe.patches), recipe.status)
+
+
+def _add(notes: str, text: str) -> str:
+    return f"{notes} {text}".strip() if text not in (notes or "") else notes
+
+
+def visible_patches(analysis: Analysis, recipe: Recipe | None = None) -> tuple[list, list]:
+    """(relevant, hidden) patches for this game. Enabled patches are always shown, so a recipe never hides a choice."""
+    shown, hidden = [], []
+    for p in base.all_patches():
+        if not base.for_game(p, analysis):
+            continue  # other kind of game entirely (Quest vs Rift): not even offered under "show all"
+        on = recipe is not None and p.id in recipe.patches
+        if p.needs_vr and analysis.vr_kind == "none" and not on:
+            hidden.append(p)  # an Android app without VR: VR patches can't take effect
+            continue
+        if analysis.only_32bit and not on and not base.works_on_a32(p):
+            hidden.append(p)  # a 32-bit game through the bridge: no OVRPort run, the 64-bit library fixes can't apply
+            continue
+        (shown if on and not p.default_on or p.applies(analysis) else hidden).append(p)
+    return shown, hidden

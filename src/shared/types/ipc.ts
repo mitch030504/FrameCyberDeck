@@ -32,7 +32,8 @@ import {
   GameDescriptionRequest,
   GameDescriptionResult,
   GameDescriptionSnapshot,
-  FrameConversionSettings
+  FrameConversionSettings,
+  FramePortEngineStatus
 } from './index'
 
 // Define types for all IPC channels between renderer and main
@@ -79,6 +80,8 @@ export interface IPCChannels {
   // Steam Frame related channels
   'frame:run-package': DefineChannel<[packageName: string], boolean>
   'frame:recorded-source-packages': DefineChannel<[], string[]>
+  'frame:engine-status': DefineChannel<[], FramePortEngineStatus>
+  'frame:engine-prepare': DefineChannel<[], FramePortEngineStatus>
 
   // Game related channels
   'games:get-games': DefineChannel<[], GameInfo[]>

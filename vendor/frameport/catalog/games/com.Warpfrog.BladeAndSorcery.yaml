@@ -1,0 +1,22 @@
+package: com.Warpfrog.BladeAndSorcery
+title: 'Blade & Sorcery: Nomad'
+status: works
+notes: The headset's brief focus losses are hidden (focus_hold, up to 2.5 s).
+details: The Frame's runtime drops focus now and then (mostly 1.5-7 s, some only milliseconds); the game pauses
+  ("System menu opened", the world freezes) and re-aligns the player when focus returns (Player.OnVRPresence ->
+  Teleport, the sideways jump). They match the headset's wear sensor flickering off while worn (SteamVR "HMD off" 0.5-2
+  s), which only this game reacts to; focus_hold hides dips up to 2.5 s here. Rendering keeps 72 fps throughout.
+tested_version: 1.3.1
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+device:
+- device.text_input_window
+adapter:
+  focus_hold: 1
+  focus_hold_ms: 2500
+verified:
+  date: '2026-10-04'
+updated: '2026-10-04'
+source_hint: Blade & Sorcery Nomad

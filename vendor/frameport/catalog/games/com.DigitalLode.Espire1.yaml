@@ -1,0 +1,17 @@
+package: com.DigitalLode.Espire1
+title: 'Espire 1: VR Operative (Quest Edition)'
+tested_version: 1.13.36
+source_hint: 'Espire 1- VR Operative'
+engine: Unreal
+xr: VrApi
+status: unsupported
+notes: Mesa GL driver crash during texture upload.
+details: Legacy VrApi via OVRPlugin.
+alt_overport:
+- patch_remove_unreal_force_quit
+pcvr_alternative: 'Espire 1 on Steam (app 669290): native SteamVR, nearly identical content.'
+verified:
+  date: '2026-09-28'
+  overport_cli: 1.2.3
+  overport_runtime: 3.4.3-23204ea
+  known_good_sha256: 1c894402cf55576bb566a83b1bf0c59340f5352e8b2e40a8951239135de4d4b5

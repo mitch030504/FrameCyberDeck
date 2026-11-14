@@ -1,0 +1,16 @@
+package: io.github.spoopyghosty0.testquestcontrollers
+title: Test Quest Controllers
+status: works
+notes: A controller tester for the Controller buttons settings. Picking a controller type on the Frame closes the
+  app; start it again to use that type (SteamVR's runtime can't switch within one app start).
+tested_version: 0.2.2
+engine: Other
+xr: OpenXR
+verified:
+  date: '2026-10-18'
+  known_good_sha256: 7db99515fb1a9c9796ee4613f716c0b76caa72c68003db8fc6c14bf20a8eecce
+  app: 1.2.1
+  overport_cli: 1.2.5
+  frame_build: '20261015.6141207'
+  agent: 102
+source_hint: Test Quest Controllers

@@ -1,0 +1,19 @@
+package: com.steelcrategames.keeptalkingandnobodyexplodes
+title: Keep Talking and Nobody Explodes
+status: works
+tested_version: 1.10.15
+engine: Unity
+xr: OpenXR
+frame:
+- frame.unity_text_input
+device:
+- device.text_input_window
+verified:
+  date: '2026-10-04'
+  known_good_sha256: 1a6f18e6d7b077e2662c7e633d473018067f4c871f5c45c4632c58233feaeac5
+  app: 0.6.3
+  overport_cli: 1.2.5
+  frame_build: '20260930.6234839'
+  agent: 35
+  issue: 15
+source_hint: Keep Talking and Nobody Explodes
