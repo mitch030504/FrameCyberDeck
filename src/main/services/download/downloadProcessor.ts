@@ -142,7 +142,8 @@ export class DownloadProcessor {
   }
 
   public async startDownload(
-    item: DownloadItem
+    item: DownloadItem,
+    catalogRetried = false
   ): Promise<{ success: boolean; startExtraction: boolean; finalState?: DownloadItem }> {
     console.log(`[DownProc] Starting download for ${item.releaseName}...`)
     const routing = captureGameArchiveRouting(settingsService.getDownloadProxy())
@@ -228,7 +229,11 @@ export class DownloadProcessor {
         if (mirrorConfig) {
           try {
             console.log(`[DownProc] Using rclone copy with mirror: ${activeMirror.name}`)
-            return await this.startRcloneCopyDownload(item, routing, mirrorConfig, false)
+            return await this.finishCatalogDownload(
+              item,
+              await this.startRcloneCopyDownload(item, routing, mirrorConfig, false),
+              catalogRetried
+            )
           } catch (mirrorError: unknown) {
             console.error(
               `[DownProc] Mirror download failed for ${item.releaseName}, falling back to public endpoint:`,
@@ -256,7 +261,32 @@ export class DownloadProcessor {
     }
 
     console.log(`[DownProc] Using authenticated public endpoint: ${item.releaseName}`)
-    return await this.startRcloneCopyDownload(item, routing, undefined, false)
+    return await this.finishCatalogDownload(
+      item,
+      await this.startRcloneCopyDownload(item, routing, undefined, false),
+      catalogRetried
+    )
+  }
+
+  /**
+   * A mirror key can be retired between the mint and the transfer. Retry once
+   * with a fresh key when the failed run reported a 403; other failures fall
+   * through unchanged.
+   */
+  private async finishCatalogDownload(
+    item: DownloadItem,
+    result: { success: boolean; startExtraction: boolean; finalState?: DownloadItem },
+    catalogRetried: boolean
+  ): Promise<{ success: boolean; startExtraction: boolean; finalState?: DownloadItem }> {
+    if (result.success || catalogRetried) return result
+    const message = this.queueManager.findItem(item.releaseName)?.error ?? ''
+    if (!/\b403\b|Forbidden/i.test(message)) return result
+    console.log(
+      `[DownProc] Catalog key rejected during ${item.releaseName}; minting a fresh one and retrying once`
+    )
+    invalidateApiKey()
+    await ensureApiKey(true)
+    return await this.startDownload(item, true)
   }
 
   // rclone copy based download (no macFUSE required)
