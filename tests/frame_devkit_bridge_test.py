@@ -39,6 +39,37 @@ class SecurityTest(unittest.TestCase):
 
 
 
+
+class AgentCommandTest(unittest.TestCase):
+    def test_rejects_unknown_command_characters(self):
+        with mock.patch.object(bridge, 'status', return_value={'address': '1.2.3.4', 'login': 'steamos'}):
+            with mock.patch.object(bridge, 'emit'):
+                with self.assertRaises(SystemExit):
+                    bridge.agent_run('frame.local', 32000, 'room_status; rm -rf /', '{}')
+
+    def test_parses_agent_json_and_keeps_ok(self):
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout='{"ok":true,"rooms":[]}\n', stderr='')
+        with mock.patch.object(bridge, 'status', return_value={'address': '1.2.3.4', 'login': 'steamos'}):
+            with mock.patch.object(bridge, 'ssh_command', return_value=completed):
+                with mock.patch.object(bridge, 'emit') as emit:
+                    bridge.agent_run('frame.local', 32000, 'room_status', '{}')
+        payload = emit.call_args.args[0]
+        self.assertTrue(payload['ok'])
+        self.assertEqual(payload['rooms'], [])
+
+    def test_sync_uploads_the_agent_bytes(self):
+        with mock.patch.object(bridge, 'status', return_value={'address': '1.2.3.4', 'login': 'steamos'}):
+            with mock.patch.object(bridge, 'ssh_command') as ssh:
+                with mock.patch.object(bridge, 'emit'):
+                    import tempfile
+                    with tempfile.TemporaryDirectory() as tmp:
+                        source = pathlib.Path(tmp) / 'agent.py'
+                        source.write_bytes(b'# agent\n')
+                        bridge.agent_sync('frame.local', 32000, str(source))
+        self.assertEqual(ssh.call_args.kwargs['stdin'], 'IyBhZ2VudAo=')
+
+
+
 class RsyncPercentTest(unittest.TestCase):
     def test_progress2_line(self):
         # Overall progress line produced by rsync --info=progress2.

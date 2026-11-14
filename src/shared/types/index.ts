@@ -378,6 +378,12 @@ export interface FrameAPIRenderer {
   recordedSourcePackages: () => Promise<string[]>
   engineStatus: () => Promise<FramePortEngineStatus>
   enginePrepare: () => Promise<FramePortEngineStatus>
+  agentRun: (
+    command: string,
+    args?: Record<string, unknown>,
+    host?: string
+  ) => Promise<Record<string, unknown>>
+  agentInfo: (host?: string) => Promise<Record<string, unknown>>
 }
 
 export interface AdbAPIRenderer extends AdbAPI {

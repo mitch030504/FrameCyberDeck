@@ -56,6 +56,8 @@ The normal path keeps the runtime default refresh rate unless explicitly request
 
 Frame CyberDeck also applies FramePort's per-game recipes (catalog by spoopyghosty0): for a game the catalog has tested, the conversion merges the recipe's FrameBridge adapter settings (engine-bug fixes such as pose timing, controller vibration, shader fixes) into the APK's settings library, selects the recipe's alternate OVRPort patch set when it asks for one, and injects the matching FramePort shim libraries (the XR shim, the Vulkan shim, and the OpenGL ES shader-fix layer) into the build. The recipe's own suggestions for scale/refresh rate never override your settings.
 
+It also deploys FramePort's on-Frame agent for mixed-reality room capture and device-side features. The app talks to the agent over the existing SteamOS Devkit SSH connection and exposes only a whitelisted set of commands; launching and Steam shortcut management stay with Frame CyberDeck.
+
 All credits for the recipes, the FrameBridge adapter, the shim libraries, and the ELF surgery techniques belong to **spoopyghosty0** and the [FramePort](https://github.com/spoopyghosty0/frameport) project (GPLv3, like this project).
 
 The Meta native SSO sign-in and the resumable, size-verified download logic are adapted from **[AXRB](https://github.com/Android-XR-Bridge/AXRB)** (GPLv3), whose native SSO protocol in turn comes from RiftLift's `meta_auth.py` (GPL-3.0-or-later).

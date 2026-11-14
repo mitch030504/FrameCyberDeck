@@ -124,7 +124,10 @@ const api = {
     recordedSourcePackages: (): Promise<string[]> =>
       typedIpcRenderer.invoke('frame:recorded-source-packages'),
     engineStatus: () => typedIpcRenderer.invoke('frame:engine-status'),
-    enginePrepare: () => typedIpcRenderer.invoke('frame:engine-prepare')
+    enginePrepare: () => typedIpcRenderer.invoke('frame:engine-prepare'),
+    agentRun: (command: string, args: Record<string, unknown> = {}, host?: string) =>
+      typedIpcRenderer.invoke('frame:agent-run', command, args, host),
+    agentInfo: (host?: string) => typedIpcRenderer.invoke('frame:agent-info', host)
   } satisfies FrameAPIRenderer,
   games: {
     getGames: (): Promise<GameInfo[]> => typedIpcRenderer.invoke('games:get-games'),

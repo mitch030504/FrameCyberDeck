@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import pathlib
+import posixpath
 import re
 import shlex
 import shutil
@@ -838,6 +840,133 @@ def run_game(host: str, port: int, name: str, ssh_port: int = 22) -> None:
     emit({"ok": True, "name": name})
 
 
+
+REMOTE_AGENT_DIR = "~/.local/share/frame-cyberdeck/agent"
+REMOTE_AGENT = REMOTE_AGENT_DIR + "/frameport_agent.py"
+
+
+def _agent_version(text: str) -> int:
+    match = re.search(r"^AGENT_VERSION\s*=\s*(\d+)", text, re.MULTILINE)
+    return int(match.group(1)) if match else 0
+
+
+def _upload_text(
+    current: dict, ssh_port: int, remote: str, data: bytes, mode: int = 0o600
+) -> None:
+    payload = base64.b64encode(data).decode("ascii")
+    parent = posixpath.dirname(remote)
+    script = (
+        f"mkdir -p {shlex.quote(parent)} && "
+        f"base64 -d > {shlex.quote(remote)} && chmod {mode:o} {shlex.quote(remote)}"
+    )
+    ssh_command(
+        str(current["address"]), str(current["login"]), script, port=ssh_port, stdin=payload
+    )
+
+
+def agent_sync(host: str, port: int, source: str, ssh_port: int = 22) -> None:
+    """Upload the vendored FramePort agent, its room scanner and scan prompts."""
+    current = status(host, port, ssh_port)
+    path = pathlib.Path(source)
+    if not path.is_file():
+        fail(f"Agent source not found: {source}")
+    text = path.read_text(encoding="utf-8", errors="replace")
+    local_version = _agent_version(text)
+
+    # Never replace a newer agent another FramePort install put on the Frame.
+    remote_version = 0
+    try:
+        probe = ssh_command(
+            str(current["address"]),
+            str(current["login"]),
+            f"grep -m1 '^AGENT_VERSION' {shlex.quote(REMOTE_AGENT)} 2>/dev/null",
+            port=ssh_port,
+            check=False,
+        )
+        remote_version = _agent_version(probe.stdout or "")
+    except Exception:
+        remote_version = 0
+
+    uploaded = False
+    if remote_version <= local_version:
+        try:
+            _upload_text(current, ssh_port, REMOTE_AGENT, path.read_bytes(), mode=0o700)
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or str(exc)).strip()
+            fail(f"Uploading the FramePort agent failed: {detail}")
+        uploaded = True
+
+    root = path.parent.parent
+    scanner = root / "artifacts" / "linux-arm64-bin" / "fp_roomscan"
+    prompts = root / "artifacts" / "roomscan"
+    bin_dir = posixpath.join("/home", str(current["login"]), ".local/share/frameport/bin")
+    if scanner.is_file():
+        try:
+            _upload_text(
+                current,
+                ssh_port,
+                posixpath.join(bin_dir, "fp_roomscan"),
+                scanner.read_bytes(),
+                mode=0o700,
+            )
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or str(exc)).strip()
+            fail(f"Uploading the room scanner failed: {detail}")
+    if prompts.is_dir():
+        for image in sorted(prompts.glob("*.png")):
+            try:
+                _upload_text(
+                    current, ssh_port, posixpath.join(bin_dir, "roomscan-prompts", image.name), image.read_bytes()
+                )
+            except subprocess.CalledProcessError as exc:
+                detail = (exc.stderr or exc.stdout or str(exc)).strip()
+                fail(f"Uploading scan prompts failed: {detail}")
+
+    emit(
+        {
+            "ok": True,
+            "path": REMOTE_AGENT.replace("~", "/home/" + str(current["login"])),
+            "agentVersion": local_version,
+            "uploaded": uploaded,
+            "keptNewerRemote": remote_version > local_version,
+        }
+    )
+
+
+def agent_run(host: str, port: int, command: str, args_json: str, ssh_port: int = 22) -> None:
+    """Run one FramePort agent command over the devkit SSH connection."""
+    current = status(host, port, ssh_port)
+    if not re.fullmatch(r"[a-z0-9_]+", command):
+        fail(f"Invalid agent command: {command}")
+    try:
+        json.loads(args_json) if args_json else {}
+    except ValueError:
+        fail("Agent arguments must be JSON")
+    script = f"python3 {REMOTE_AGENT} {command} {shlex.quote(args_json or '{}')}"
+    try:
+        result = ssh_command(
+            str(current["address"]), str(current["login"]), script, port=ssh_port, check=False
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or str(exc)).strip()
+        fail(f"FramePort agent command failed: {detail}")
+    lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    payload = None
+    for line in reversed(lines):
+        try:
+            payload = json.loads(line)
+            break
+        except ValueError:
+            continue
+    if payload is None:
+        detail = (result.stderr or result.stdout or "").strip()
+        fail(f"FramePort agent returned no JSON: {detail}")
+    if not isinstance(payload, dict):
+        payload = {"result": payload}
+    payload.setdefault("ok", result.returncode == 0)
+    emit(payload)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Frame CyberDeck SteamOS Devkit bridge")
     p.add_argument("--host", default="frame")
@@ -855,6 +984,11 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--directory", required=True)
     d.add_argument("--start-command", default="game.apk")
     d.add_argument("--start", action="store_true")
+    sync = sub.add_parser("agent-sync")
+    sync.add_argument("--source", required=True)
+    run_agent = sub.add_parser("agent-run")
+    run_agent.add_argument("--command", required=True)
+    run_agent.add_argument("--args", default="{}")
     return p
 
 
@@ -878,6 +1012,10 @@ def main() -> None:
             args.start,
             args.ssh_port,
         )
+    elif args.command == "agent-sync":
+        agent_sync(args.host, args.port, args.source, args.ssh_port)
+    elif args.command == "agent-run":
+        agent_run(args.host, args.port, args.command, args.args, args.ssh_port)
     else:
         fail(f"Unknown command: {args.command}")
 

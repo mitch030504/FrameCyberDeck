@@ -82,6 +82,11 @@ export interface IPCChannels {
   'frame:recorded-source-packages': DefineChannel<[], string[]>
   'frame:engine-status': DefineChannel<[], FramePortEngineStatus>
   'frame:engine-prepare': DefineChannel<[], FramePortEngineStatus>
+  'frame:agent-run': DefineChannel<
+    [command: string, args: Record<string, unknown>, host?: string],
+    Record<string, unknown>
+  >
+  'frame:agent-info': DefineChannel<[host?: string], Record<string, unknown>>
 
   // Game related channels
   'games:get-games': DefineChannel<[], GameInfo[]>

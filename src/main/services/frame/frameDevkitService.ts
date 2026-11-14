@@ -619,6 +619,31 @@ class FrameDevkitService {
     return await this.runGame(game.gameid, host)
   }
 
+  /** Upload the vendored FramePort agent to the Frame (replaces an older copy). */
+  async syncFramePortAgent(
+    sourcePath: string,
+    host?: string
+  ): Promise<{ ok: boolean; path?: string }> {
+    return await this.bridge<{ ok: boolean; path?: string }>(
+      'agent-sync',
+      ['--source', sourcePath],
+      host
+    )
+  }
+
+  /** Run one whitelisted FramePort agent command over the devkit SSH connection. */
+  async runFramePortAgent(
+    command: string,
+    args: Record<string, unknown> = {},
+    host?: string
+  ): Promise<Record<string, unknown> & { ok: boolean }> {
+    return await this.bridge<Record<string, unknown> & { ok: boolean }>(
+      'agent-run',
+      ['--command', command, '--args', JSON.stringify(args)],
+      host
+    )
+  }
+
   deploy(
     sourcePath: string,
     title: string,

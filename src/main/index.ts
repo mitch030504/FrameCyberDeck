@@ -17,6 +17,7 @@ import { createGameDescriptionService } from './services/gameDescription/gameDes
 import downloadService from './services/downloadService'
 import frameDevkitService from './services/frame/frameDevkitService'
 import framePortEngineService from './services/frame/framePortEngineService'
+import frameAgentService from './services/frame/frameAgentService'
 import uploadService from './services/uploadService'
 import metaAccountService from './services/metaAccountService'
 import metaSyncService from './services/metaSyncService'
@@ -583,6 +584,10 @@ app.whenReady().then(async () => {
   )
   typedIpcMain.handle('frame:engine-status', () => framePortEngineService.getStatus())
   typedIpcMain.handle('frame:engine-prepare', () => framePortEngineService.prepare())
+  typedIpcMain.handle('frame:agent-run', (_event, command, args, host) =>
+    frameAgentService.run(command, args ?? {}, host)
+  )
+  typedIpcMain.handle('frame:agent-info', (_event, host) => frameAgentService.info(host))
 
   // --- Game Handlers ---
   typedIpcMain.handle('games:get-games', async () => gameService.getGames())
