@@ -794,9 +794,7 @@ class DownloadService extends EventEmitter implements DownloadAPI {
         if (tracked) {
           this.updateItemStatus(item.releaseName, 'Completed', 100)
         }
-        console.log(
-          `[Service] Venture imported ${imported.join(', ')} from ${item.downloadPath}`
-        )
+        console.log(`[Service] Venture imported ${imported.join(', ')} from ${item.downloadPath}`)
         return imported.length > 0
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)

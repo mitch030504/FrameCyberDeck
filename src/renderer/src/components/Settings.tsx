@@ -2018,6 +2018,107 @@ const FrameConversionSettingsPanel: React.FC = () => {
   )
 }
 
+const RoomScanPanel: React.FC = () => {
+  const styles = useStyles()
+  const { selectedDeviceDetails } = useAdb()
+  const [status, setStatus] = useState<Record<string, unknown> | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const isFrame = Boolean(selectedDeviceDetails?.isSteamFrame)
+
+  const refresh = async (): Promise<void> => {
+    if (!isFrame) return
+    try {
+      setStatus(await window.api.frame.agentRun('room_capture_status'))
+      setError(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  useEffect(() => {
+    if (!isFrame) return
+    let active = true
+    let timer = 0
+    const poll = async (): Promise<void> => {
+      if (!active) return
+      await refresh()
+      if (active) timer = window.setTimeout(() => void poll(), 3000)
+    }
+    timer = window.setTimeout(() => void poll(), 0)
+    return () => {
+      active = false
+      window.clearTimeout(timer)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isFrame])
+
+  const start = async (): Promise<void> => {
+    setBusy(true)
+    setError(null)
+    try {
+      await window.api.frame.agentRun('room_capture', { seconds: 90, wait: 180 })
+      await refresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const cancel = async (): Promise<void> => {
+    setBusy(true)
+    try {
+      await window.api.frame.agentRun('room_capture_stop')
+      await refresh()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const state = typeof status?.state === 'string' ? status.state : 'none'
+
+  return (
+    <Card className={styles.card}>
+      <CardHeader description={<Subtitle1>Mixed Reality Room</Subtitle1>} />
+      <div className={styles.cardContent}>
+        <Text className={styles.hint}>
+          <InfoRegular />
+          Scans the room in the headset for mixed-reality titles. The scan runs on the Steam Frame
+          through FramePort&apos;s agent; Frame CyberDeck only starts and reports it.
+        </Text>
+        {!isFrame ? (
+          <Text className={styles.hint}>Connect to a Steam Frame to scan a room.</Text>
+        ) : (
+          <>
+            <Text className={styles.hint}>Scan state: {state}</Text>
+            {typeof status?.error === 'string' && (
+              <Text className={styles.hint}>Error: {status.error}</Text>
+            )}
+            {error && <Text className={styles.hint}>{error}</Text>}
+            <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+              <button
+                onClick={() => void start()}
+                style={neonBtn}
+                disabled={
+                  busy || state === 'waiting' || state === 'recording' || state === 'building'
+                }
+              >
+                {busy ? 'Starting…' : 'Scan room on Frame'}
+              </button>
+              <button onClick={() => void cancel()} style={neonBtn} disabled={busy}>
+                Cancel scan
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </Card>
+  )
+}
+
 const Settings: React.FC = () => {
   const styles = useStyles()
   const {
@@ -2660,6 +2761,7 @@ const Settings: React.FC = () => {
             onToggle={toggleSection}
           />
           {openSections.frameConversion && <FrameConversionSettingsPanel />}
+          {openSections.frameConversion && <RoomScanPanel />}
         </div>
 
         <div>
