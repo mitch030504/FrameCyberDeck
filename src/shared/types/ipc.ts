@@ -148,6 +148,8 @@ export interface IPCChannels {
   // Settings related channels
   'settings:get-download-path': DefineChannel<[], string>
   'settings:set-download-path': DefineChannel<[path: string], void>
+  'settings:get-extraction-path': DefineChannel<[], string>
+  'settings:set-extraction-path': DefineChannel<[path: string], void>
   'settings:get-download-speed-limit': DefineChannel<[], number>
   'settings:set-download-speed-limit': DefineChannel<[limit: number], void>
   'settings:get-upload-speed-limit': DefineChannel<[], number>

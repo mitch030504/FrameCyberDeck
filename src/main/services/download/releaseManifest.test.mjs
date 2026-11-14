@@ -4,7 +4,8 @@ import {
   parseReleaseManifest,
   RELEASE_MANIFEST_FILENAME,
   RELEASE_METADATA_SIDECARS,
-  isReleaseMetadataSidecar
+  isReleaseMetadataSidecar,
+  isRootLevelArchive
 } from './releaseManifest.ts'
 
 // Real-world example (Arizona Sunshine Remake), trimmed but structurally intact.
@@ -166,4 +167,12 @@ test('verifyReleaseTree rejects missing files, wrong sizes and absent manifests'
   } finally {
     await rm(base, { recursive: true, force: true })
   }
+})
+
+test('isRootLevelArchive matches only root-level .7z entries', () => {
+  assert.equal(isRootLevelArchive('_data.7z'), true)
+  assert.equal(isRootLevelArchive('Data.7Z'), true)
+  assert.equal(isRootLevelArchive('com.example.game/data.7z'), false)
+  assert.equal(isRootLevelArchive('com.example.game.apk'), false)
+  assert.equal(isRootLevelArchive('_data.7z.001'), false)
 })

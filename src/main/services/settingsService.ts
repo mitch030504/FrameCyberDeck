@@ -31,6 +31,7 @@ class SettingsService extends EventEmitter implements SettingsAPI {
     // Default settings
     this.settings = {
       downloadPath: join(app.getPath('userData'), 'downloads'),
+      extractionPath: '',
       downloadSpeedLimit: 0,
       uploadSpeedLimit: 0,
       hideAdultContent: true,
@@ -56,6 +57,15 @@ class SettingsService extends EventEmitter implements SettingsAPI {
     this.settings.downloadPath = path
     this.saveSettings()
     this.emit('download-path-changed', path)
+  }
+
+  getExtractionPath(): string {
+    return this.settings.extractionPath ?? ''
+  }
+
+  setExtractionPath(path: string): void {
+    this.settings.extractionPath = path
+    this.saveSettings()
   }
 
   getDownloadSpeedLimit(): number {

@@ -1638,7 +1638,9 @@ const DownloadProxySettingsPanel: React.FC = () => {
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
 
-  const updateSettings = (next: (current: DownloadProxySettings) => DownloadProxySettings): void => {
+  const updateSettings = (
+    next: (current: DownloadProxySettings) => DownloadProxySettings
+  ): void => {
     setSaved(false)
     setSettings(next)
   }
@@ -1788,7 +1790,9 @@ const DownloadProxySettingsPanel: React.FC = () => {
       )}
       <Text className={styles.hint}>
         <InfoRegular />
-        {'This applies only to game archive downloads. Leave it disabled to use your system proxy settings.'}
+        {
+          'This applies only to game archive downloads. Leave it disabled to use your system proxy settings.'
+        }
       </Text>
     </div>
   )
@@ -1910,15 +1914,18 @@ const Settings: React.FC = () => {
   const styles = useStyles()
   const {
     downloadPath,
+    extractionPath,
     downloadSpeedLimit,
     uploadSpeedLimit,
     isLoading,
     error,
     setDownloadPath,
+    setExtractionPath,
     setDownloadSpeedLimit,
     setUploadSpeedLimit
   } = useSettings()
   const [editedDownloadPath, setEditedDownloadPath] = useState(downloadPath)
+  const [editedExtractionPath, setEditedExtractionPath] = useState(extractionPath)
   const [isCreditsOpen, setIsCreditsOpen] = useState(false)
   const [hideAdultContent, setHideAdultContentLocal] = useState<boolean>(() => {
     try {
@@ -1977,6 +1984,7 @@ const Settings: React.FC = () => {
   // Update local state when the context values change
   useEffect(() => {
     setEditedDownloadPath(downloadPath)
+    setEditedExtractionPath(extractionPath)
 
     // Handle new download/upload speed state
     if (downloadSpeedLimit === 0) {
@@ -1996,7 +2004,7 @@ const Settings: React.FC = () => {
       setUploadSpeedUnit('kbps') // Always reset to KB/s when loading from settings
       originalUploadKbps.current = uploadSpeedLimit
     }
-  }, [downloadPath, downloadSpeedLimit, uploadSpeedLimit])
+  }, [downloadPath, extractionPath, downloadSpeedLimit, uploadSpeedLimit])
 
   const handleSaveDownloadPath = async (): Promise<void> => {
     if (!editedDownloadPath) {
@@ -2019,6 +2027,34 @@ const Settings: React.FC = () => {
     } catch (err) {
       console.error('Error saving download path:', err)
       setLocalError('Failed to save download path')
+    }
+  }
+
+  // An empty extraction path means "extract next to the download" (the default).
+  const handleSaveExtractionPath = async (): Promise<void> => {
+    try {
+      setLocalError(null)
+      setSaveSuccess(false)
+      await setExtractionPath(editedExtractionPath.trim())
+      setSaveSuccess(true)
+      setTimeout(() => {
+        setSaveSuccess(false)
+      }, 3000)
+    } catch (err) {
+      console.error('Error saving extraction path:', err)
+      setLocalError('Failed to save extraction path')
+    }
+  }
+
+  const handleSelectExtractionFolder = async (): Promise<void> => {
+    try {
+      const selectedPath = await window.api.dialog.showDirectoryPicker()
+      if (selectedPath) {
+        setEditedExtractionPath(selectedPath)
+      }
+    } catch (err) {
+      console.error('Error selecting extraction folder:', err)
+      setLocalError('Failed to select folder')
     }
   }
 
@@ -2384,6 +2420,31 @@ const Settings: React.FC = () => {
                 />
                 <button onClick={handleSaveDownloadPath} style={neonBtn}>
                   {'Save Path'}
+                </button>
+              </div>
+
+              <Text>
+                {
+                  'Optional: extract games to a different folder or drive (e.g. when the download drive is nearly full). Leave empty to extract next to the download.'
+                }
+              </Text>
+              <div className={styles.formRow}>
+                <Input
+                  className={styles.input}
+                  value={editedExtractionPath}
+                  onChange={(_, data) => setEditedExtractionPath(data.value)}
+                  placeholder={'Extraction path (same as download path if empty)'}
+                  contentAfter={
+                    <Button
+                      icon={<FolderOpenRegular />}
+                      onClick={handleSelectExtractionFolder}
+                      aria-label={'Browse extraction folders'}
+                    />
+                  }
+                  size="large"
+                />
+                <button onClick={handleSaveExtractionPath} style={neonBtn}>
+                  {'Save Extraction Path'}
                 </button>
               </div>
 

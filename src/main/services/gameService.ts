@@ -13,6 +13,7 @@ import EventEmitter from 'events'
 import { typedWebContentsSend } from '@shared/ipc-utils'
 import SevenZip from 'node-7z'
 import { awaitSevenZipStream, describeSevenZipError } from './sevenZipUtils'
+import { preflightHostCheck, RCLONE_TIMEOUT_ARGS, friendlyRcloneError } from './networkDiagnostics'
 
 interface VrpConfig {
   baseUri: string
@@ -369,6 +370,9 @@ class GameService extends EventEmitter implements GamesAPI {
 
       console.log(`Downloading meta.7z from ${baseUri}...`)
 
+      // Fail fast with a clear message if DNS is dead or sinkholed
+      if (!activeMirror) await preflightHostCheck(baseUri)
+
       // Get the appropriate rclone path based on platform
       const rclonePath = dependencyService.getRclonePath()
 
@@ -401,6 +405,7 @@ class GameService extends EventEmitter implements GamesAPI {
               '1.0',
               '--tpslimit-burst',
               '3',
+              ...RCLONE_TIMEOUT_ARGS,
               '--progress'
             ]
 
@@ -500,6 +505,7 @@ class GameService extends EventEmitter implements GamesAPI {
         '1.0',
         '--tpslimit-burst',
         '3',
+        ...RCLONE_TIMEOUT_ARGS,
         '--progress'
       ]
 
@@ -543,10 +549,14 @@ class GameService extends EventEmitter implements GamesAPI {
       }
 
       // Wait for process to complete
-      const result = await rcloneProcess
+      // execa rejects on non-zero exit, so translate the failure here
+      const result = await rcloneProcess.catch((e: { exitCode?: number; stderr?: string }) => {
+        throw new Error(friendlyRcloneError(e?.exitCode, String(e?.stderr ?? e), !!publicApiKey))
+      })
 
       if (result.exitCode !== 0) {
-        throw new Error(`Rclone failed with exit code ${result.exitCode}: ${result.stderr}`)
+        console.error(`Rclone failed with exit code ${result.exitCode}: ${result.stderr}`)
+        throw new Error(friendlyRcloneError(result.exitCode, result.stderr, !!publicApiKey))
       }
 
       console.log('Download complete')

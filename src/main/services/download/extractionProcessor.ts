@@ -1,16 +1,18 @@
-import { join, basename } from 'path'
+import { join, basename, resolve } from 'path'
 import { promises as fs, existsSync } from 'fs'
 import { execa } from 'execa'
 import { QueueManager } from './queueManager'
 import dependencyService from '../dependencyService'
 import { DownloadItem, DownloadStatus } from '@shared/types'
 import mirrorService from '../mirrorService'
+import settingsService from '../settingsService'
 import { getAvailableDiskSpace, getDirectorySize, formatBytes } from './utils'
 import { verifyReleaseTree } from './releaseManifest'
 import {
   parseReleaseManifest,
   RELEASE_MANIFEST_FILENAME,
-  isReleaseMetadataSidecar
+  isReleaseMetadataSidecar,
+  isRootLevelArchive
 } from './releaseManifest'
 import { type DownloadedFile, validateDownloadCompletion } from './archiveDiscovery'
 
@@ -201,11 +203,29 @@ export class ExtractionProcessor {
     console.log(
       `[ExtractProc] Checking available disk space for extraction of ${item.releaseName}...`
     )
-    const availableSpace = await getAvailableDiskSpace(downloadPath)
+    // Optional separate extraction location (Settings > Extraction path). When set, the
+    // archive stays where it was downloaded and the files are extracted there instead,
+    // so the space check below runs against that drive.
+    const extractionRoot = settingsService.getExtractionPath()
+    const outDir = extractionRoot ? join(extractionRoot, item.releaseName) : downloadPath
+    const relocated = resolve(outDir) !== resolve(downloadPath)
+    if (relocated) {
+      try {
+        await fs.mkdir(outDir, { recursive: true })
+      } catch (mkdirError: unknown) {
+        const reason = mkdirError instanceof Error ? mkdirError.message : String(mkdirError)
+        const errorMsg = `Cannot create extraction folder ${outDir}: ${reason}`
+        console.error(`[ExtractProc] ${errorMsg}`)
+        this.updateItemStatus(item.releaseName, 'Error', 100, errorMsg.substring(0, 500))
+        return false
+      }
+    }
+    const availableSpace = await getAvailableDiskSpace(outDir)
     const downloadedSize = await getDirectorySize(downloadPath)
     // Extracted content is typically 2-5x larger than the compressed archive.
     // Use 3x as a conservative estimate to catch cases where space would run out mid-extraction
-    // (archive and extracted files coexist on disk until deletion after success).
+    // (archive and extracted files coexist on disk until deletion after success, unless
+    // extracting to a different drive).
     const requiredSpace = downloadedSize * 3
 
     if (availableSpace === null) {
@@ -253,7 +273,8 @@ export class ExtractionProcessor {
       // clear any stale warning on success); the pipeline skips auto-install for
       // a warned item so the user explicitly chooses whether to install anyway.
       this.queueManager.updateItem(item.releaseName, {
-        manifestWarning: manifestCheck.ok ? undefined : manifestCheck.error
+        manifestWarning: manifestCheck.ok ? undefined : manifestCheck.error,
+        manifestNote: manifestCheck.note
       })
       if (!manifestCheck.ok) {
         console.warn(
@@ -327,7 +348,7 @@ export class ExtractionProcessor {
     try {
       const proc = execa(
         sevenZipPath,
-        ['x', archivePath, '-y', `-o${downloadPath}`, `-p${decodedPassword}`, '-bsp1', '-mmt=on'],
+        ['x', archivePath, '-y', `-o${outDir}`, `-p${decodedPassword}`, '-bsp1', '-mmt=on'],
         { windowsHide: true, buffer: false }
       )
 
@@ -383,7 +404,7 @@ export class ExtractionProcessor {
         return false // Indicate failure/cancellation
       }
 
-      console.log(`[ExtractProc] Extraction complete: ${item.releaseName} in ${downloadPath}`)
+      console.log(`[ExtractProc] Extraction complete: ${item.releaseName} in ${outDir}`)
       this.activeExtractions.delete(item.releaseName)
 
       // --- Delete archive files --- START
@@ -417,7 +438,7 @@ export class ExtractionProcessor {
       // --- Delete archive files --- END
 
       // --- Flatten single root folder if it matches releaseName --- START
-      const rootFolderPath = join(downloadPath, item.releaseName)
+      const rootFolderPath = join(outDir, item.releaseName)
       try {
         if (existsSync(rootFolderPath)) {
           const stats = await fs.stat(rootFolderPath)
@@ -429,7 +450,7 @@ export class ExtractionProcessor {
             if (rootFolderContents.length > 0) {
               for (const contentName of rootFolderContents) {
                 const oldPath = join(rootFolderPath, contentName)
-                const newPath = join(downloadPath, contentName)
+                const newPath = join(outDir, contentName)
                 try {
                   // Check if newPath already exists and handle potential conflicts (simple overwrite or log)
                   // For now, we'll attempt to rename, which might fail if newPath exists.
@@ -477,20 +498,32 @@ export class ExtractionProcessor {
       }
       // --- Flatten single root folder if it matches releaseName --- END
 
-      await this.extractNestedArchives(downloadPath, item.releaseName)
+      await this.extractNestedArchives(outDir, item.releaseName)
 
-      const manifestCheck = await this.verifyAgainstReleaseManifest(downloadPath, item.releaseName)
+      const manifestCheck = await this.verifyAgainstReleaseManifest(outDir, item.releaseName)
       // A mismatch is a warning, not a hard failure: a release can ship a wrong
       // manifest, and the user may want to install regardless. Record it (and
       // clear any stale warning on success); the pipeline skips auto-install for
       // a warned item so the user explicitly chooses whether to install anyway.
       this.queueManager.updateItem(item.releaseName, {
-        manifestWarning: manifestCheck.ok ? undefined : manifestCheck.error
+        manifestWarning: manifestCheck.ok ? undefined : manifestCheck.error,
+        manifestNote: manifestCheck.note
       })
       if (!manifestCheck.ok) {
         console.warn(
           `[ExtractProc] ${manifestCheck.error} — completing ${item.releaseName} with a warning; auto-install skipped.`
         )
+      }
+
+      if (relocated) {
+        // Installation and deletion follow item.downloadPath, so point it at the extracted files
+        // and drop the now-empty download folder (only if nothing else is left in it).
+        this.queueManager.updateItem(item.releaseName, { downloadPath: outDir })
+        try {
+          await fs.rmdir(downloadPath)
+        } catch {
+          /* not empty or already gone - leave it */
+        }
       }
 
       // Update final status to Completed
@@ -621,7 +654,7 @@ export class ExtractionProcessor {
   private async verifyAgainstReleaseManifest(
     downloadPath: string,
     releaseName: string
-  ): Promise<{ ok: boolean; error?: string }> {
+  ): Promise<{ ok: boolean; error?: string; note?: string }> {
     const manifestPath = join(downloadPath, RELEASE_MANIFEST_FILENAME)
     if (!existsSync(manifestPath)) {
       console.log(
@@ -650,6 +683,9 @@ export class ExtractionProcessor {
     }
 
     const mismatches: string[] = []
+    // Root-level archives (e.g. _data.7z) that are listed but gone: we extract
+    // and delete these ourselves, so report them as a note, not a warning.
+    const extractedArchives: string[] = []
     for (const entry of files) {
       // Skip release-metadata sidecars (release.manifest, release.add): they're
       // listed by some releases but aren't game payload and are often absent
@@ -665,22 +701,32 @@ export class ExtractionProcessor {
           mismatches.push(`${entry.path} (expected ${entry.size} B, found ${stat.size} B)`)
         }
       } catch {
-        mismatches.push(`${entry.path} (missing)`)
+        if (isRootLevelArchive(entry.path)) {
+          extractedArchives.push(entry.path)
+        } else {
+          mismatches.push(`${entry.path} (missing)`)
+        }
       }
     }
+
+    const note =
+      extractedArchives.length > 0
+        ? `Not all files listed in ${RELEASE_MANIFEST_FILENAME} are present: ${extractedArchives.join(', ')}. ` +
+          'This is expected for releases that ship an inner archive: it is extracted and then deleted after extraction.'
+        : undefined
 
     if (mismatches.length > 0) {
       const detail = mismatches.slice(0, 8).join('; ')
       const more = mismatches.length > 8 ? ` (+${mismatches.length - 8} more)` : ''
       const error = `Extracted files do not match ${RELEASE_MANIFEST_FILENAME}: ${mismatches.length} problem(s): ${detail}${more}`
       console.error(`[ExtractProc] ${error} (${releaseName})`)
-      return { ok: false, error: error.substring(0, 500) }
+      return { ok: false, error: error.substring(0, 500), note }
     }
 
     console.log(
       `[ExtractProc] Verified ${files.length} extracted file(s) against ${RELEASE_MANIFEST_FILENAME} for ${releaseName}.`
     )
-    return { ok: true }
+    return { ok: true, note }
   }
 
   // Method to check if extraction is active
