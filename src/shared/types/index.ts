@@ -21,6 +21,8 @@ export interface DeviceInfo {
   isQuestDevice: boolean
   /** True when ADB is connected to Steam Frame's native SteamOS endpoint. */
   isSteamFrame?: boolean
+  /** True for the synthetic PC target backed by Venture's CLI. */
+  isVenture?: boolean
   batteryLevel: number | null
   storageTotal: string | null
   storageFree: string | null
@@ -589,6 +591,38 @@ export interface FramePortEngineStatus {
   python: string | null
   tools: FramePortEngineTool[]
   error: string | null
+}
+
+/** Synthetic device id for a PC running Venture. */
+export const VENTURE_DEVICE_ID = 'venture:pc'
+
+export interface VentureStatus {
+  available: boolean
+  cliPath: string | null
+  version: string | null
+  gamesFolder: string | null
+  launcherOpen: boolean
+  error: string | null
+}
+
+export interface VentureGame {
+  id: string
+  name: string
+  packageName: string | null
+  status: string
+  version: string | null
+  versionCode: number | null
+  directory: string | null
+  complete: boolean
+}
+
+export interface VentureAPIRenderer {
+  status: () => Promise<VentureStatus>
+  listGames: () => Promise<VentureGame[]>
+  listInstalled: () => Promise<PackageInfo[]>
+  importFolder: (folder: string) => Promise<string[]>
+  play: (gameId: string) => Promise<boolean>
+  uninstall: (gameId: string) => Promise<boolean>
 }
 
 export interface FrameConversionSettings {

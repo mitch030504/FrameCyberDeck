@@ -525,10 +525,18 @@ const TargetCard: React.FC<TargetCardProps> = ({
               <span style={{ ...S, fontSize: '10px', color: '#66d9ef' }}>STEAM FRAME</span>
             )}
 
-            {/* Non-Quest warning */}
-            {isConnectable && !device.isQuestDevice && !device.isSteamFrame && !isWifi && (
-              <span style={{ ...S, fontSize: '10px', color: '#f5a623' }}>⚠ UNKNOWN DEVICE</span>
+            {isConnectable && device.isVenture && !isWifi && (
+              <span style={{ ...S, fontSize: '10px', color: '#c792ea' }}>PC · VENTURE</span>
             )}
+
+            {/* Non-Quest warning */}
+            {isConnectable &&
+              !device.isQuestDevice &&
+              !device.isSteamFrame &&
+              !device.isVenture &&
+              !isWifi && (
+                <span style={{ ...S, fontSize: '10px', color: '#f5a623' }}>⚠ UNKNOWN DEVICE</span>
+              )}
           </div>
 
           {/* Connection error */}

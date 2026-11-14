@@ -5,7 +5,8 @@ import {
   ExtendedDeviceInfo,
   DeviceWithBookmark,
   hasBookmarkData,
-  isTcpDevice
+  isTcpDevice,
+  VENTURE_DEVICE_ID
 } from '@shared/types'
 import { AdbContext, AdbContextType } from './AdbContext'
 import { useDependency } from '@renderer/hooks/useDependency'
@@ -240,7 +241,10 @@ export const AdbProvider: React.FC<AdbProviderProps> = ({ children }) => {
     try {
       setLoadingPackages(true)
       setError(null)
-      const installedPackages = await window.api.adb.getInstalledPackages(selectedDevice)
+      const installedPackages =
+        selectedDevice === VENTURE_DEVICE_ID
+          ? await window.api.venture.listInstalled()
+          : await window.api.adb.getInstalledPackages(selectedDevice)
       setPackages(installedPackages)
     } catch (err) {
       setError('Failed to load packages')
@@ -294,13 +298,25 @@ export const AdbProvider: React.FC<AdbProviderProps> = ({ children }) => {
         loadPackages()
         return
       }
+      if (selectedDeviceDetails?.isVenture) {
+        setUserNameState('PC')
+        loadPackages()
+        return
+      }
       loadPackages()
       getUserName()
     } else {
       setPackages([])
       setUserNameState('')
     }
-  }, [isConnected, selectedDevice, selectedDeviceDetails?.isSteamFrame, loadPackages, getUserName])
+  }, [
+    isConnected,
+    selectedDevice,
+    selectedDeviceDetails?.isSteamFrame,
+    selectedDeviceDetails?.isVenture,
+    loadPackages,
+    getUserName
+  ])
 
   // Periodically refresh device info (battery + storage) while a device is connected,
   // so the storage indicator reflects installs/uninstalls without requiring a reconnect.
@@ -445,6 +461,26 @@ export const AdbProvider: React.FC<AdbProviderProps> = ({ children }) => {
         ...disconnectedBookmarkDevices
       ]
 
+      try {
+        const venture = await window.api.venture.status()
+        if (venture.available) {
+          allDevices.push({
+            id: VENTURE_DEVICE_ID,
+            type: 'device',
+            model: 'Venture',
+            isQuestDevice: false,
+            isVenture: true,
+            batteryLevel: null,
+            storageTotal: null,
+            storageFree: null,
+            friendlyModelName: venture.version ? `PC · Venture ${venture.version}` : 'PC · Venture',
+            ipAddress: null
+          })
+        }
+      } catch (error) {
+        console.warn('[AdbProvider] Venture status failed:', error)
+      }
+
       setDevices(allDevices)
 
       // Start pinging WiFi devices after setting the initial device list
@@ -461,6 +497,13 @@ export const AdbProvider: React.FC<AdbProviderProps> = ({ children }) => {
   const connectToDevice = async (serial: string): Promise<boolean> => {
     try {
       setError(null)
+
+      if (serial === VENTURE_DEVICE_ID) {
+        setSelectedDevice(serial)
+        setIsConnected(true)
+        window.api.downloads.setAppConnectionState(serial, true)
+        return true
+      }
 
       // Check if this is a TCP device that might need a ping check
       const device = devices.find((d) => d.id === serial)
@@ -513,7 +556,7 @@ export const AdbProvider: React.FC<AdbProviderProps> = ({ children }) => {
         console.log(
           `Disconnecting from current device ${selectedDevice} before connecting to ${serial}`
         )
-        if (selectedDevice.includes(':')) {
+        if (selectedDevice !== VENTURE_DEVICE_ID && selectedDevice.includes(':')) {
           // Current device is TCP, disconnect properly
           const [ip, port] = selectedDevice.split(':')
           await window.api.adb.disconnectTcpDevice(ip, parseInt(port) || 5555)
@@ -598,7 +641,7 @@ export const AdbProvider: React.FC<AdbProviderProps> = ({ children }) => {
         console.log(
           `Disconnecting from current device ${selectedDevice} before connecting to ${deviceId}`
         )
-        if (selectedDevice.includes(':')) {
+        if (selectedDevice !== VENTURE_DEVICE_ID && selectedDevice.includes(':')) {
           // Current device is TCP, disconnect properly
           const [currentIp, currentPort] = selectedDevice.split(':')
           await window.api.adb.disconnectTcpDevice(currentIp, parseInt(currentPort) || 5555)

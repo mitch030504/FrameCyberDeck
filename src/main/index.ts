@@ -18,6 +18,7 @@ import downloadService from './services/downloadService'
 import frameDevkitService from './services/frame/frameDevkitService'
 import framePortEngineService from './services/frame/framePortEngineService'
 import frameAgentService from './services/frame/frameAgentService'
+import ventureService from './services/ventureService'
 import uploadService from './services/uploadService'
 import metaAccountService from './services/metaAccountService'
 import metaSyncService from './services/metaSyncService'
@@ -532,6 +533,10 @@ app.whenReady().then(async () => {
   })
   typedIpcMain.handle('adb:uninstallPackage', async (_event, serial, packageName) => {
     console.log(`IPC adb:uninstallPackage called for ${packageName} on ${serial}`)
+    if (ventureService.isVentureTarget(serial)) {
+      console.log(`[IPC] Removing Venture title for ${packageName}`)
+      return await ventureService.uninstall(packageName)
+    }
     const device = (await adbService.listDevices()).find((entry) => entry.id === serial)
     if (device?.isSteamFrame) {
       console.log(`[IPC] Removing Steam Frame Devkit title for ${packageName}`)
@@ -588,6 +593,14 @@ app.whenReady().then(async () => {
     frameAgentService.run(command, args ?? {}, host)
   )
   typedIpcMain.handle('frame:agent-info', (_event, host) => frameAgentService.info(host))
+
+  // --- Venture (PC target) ---
+  typedIpcMain.handle('venture:status', () => ventureService.status())
+  typedIpcMain.handle('venture:list-games', () => ventureService.listGames())
+  typedIpcMain.handle('venture:list-installed', () => ventureService.listInstalled())
+  typedIpcMain.handle('venture:import', (_event, folder) => ventureService.importFolder(folder))
+  typedIpcMain.handle('venture:play', (_event, gameId) => ventureService.play(gameId))
+  typedIpcMain.handle('venture:uninstall', (_event, gameId) => ventureService.uninstall(gameId))
 
   // --- Game Handlers ---
   typedIpcMain.handle('games:get-games', async () => gameService.getGames())

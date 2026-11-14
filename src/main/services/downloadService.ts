@@ -1,11 +1,12 @@
 import { app, BrowserWindow } from 'electron'
 import { promises as fs, existsSync } from 'fs'
-import { join, basename, resolve } from 'path'
+import { join, basename, dirname, resolve } from 'path'
 import { childPath } from './fileSafety'
 import { execFile } from 'child_process'
 import SevenZip from 'node-7z'
 import { awaitSevenZipStream } from './sevenZipUtils'
 import adbService from './adbService'
+import ventureService from './ventureService'
 import frameDevkitService from './frame/frameDevkitService'
 import frameConversionService from './frame/frameConversionService'
 import dependencyService from './dependencyService'
@@ -782,6 +783,30 @@ class DownloadService extends EventEmitter implements DownloadAPI {
     onProgress?: (step: string, percent?: number) => void,
     frameOriginalSourcePath?: string
   ): Promise<boolean> {
+    if (ventureService.isVentureTarget(deviceId)) {
+      if (!item.downloadPath) {
+        throw new Error(`No extracted path is available for ${item.releaseName}`)
+      }
+      const tracked = Boolean(this.queueManager.findItem(item.releaseName))
+      onProgress?.('Importing into Venture…', 10)
+      try {
+        const imported = await ventureService.importFolder(item.downloadPath)
+        if (tracked) {
+          this.updateItemStatus(item.releaseName, 'Completed', 100)
+        }
+        console.log(
+          `[Service] Venture imported ${imported.join(', ')} from ${item.downloadPath}`
+        )
+        return imported.length > 0
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        if (tracked) {
+          this.updateItemStatus(item.releaseName, 'InstallError', 100, message.substring(0, 250))
+        }
+        throw error
+      }
+    }
+
     if (!(await this.isSteamFrameDevice(deviceId))) {
       return await this.installationProcessor.startInstallation(item, deviceId, onProgress)
     }
@@ -1418,6 +1443,29 @@ class DownloadService extends EventEmitter implements DownloadAPI {
       throw new Error(`Item ${releaseName} is not in 'Completed' state.`)
     }
 
+    if (ventureService.isVentureTarget(deviceId)) {
+      const folder = item.downloadPath || childPath(this.downloadsPath, item.releaseName)
+      this.queueManager.updateItem(releaseName, { status: 'Installing', progress: 0 })
+      this.emitUpdate()
+      try {
+        const imported = await ventureService.importFolder(folder)
+        console.log(
+          `[Service installFromCompleted] Venture imported ${imported.join(', ')} from ${folder}`
+        )
+        this.queueManager.updateItem(releaseName, { status: 'Completed', progress: 100 })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        console.error(`[Service installFromCompleted] Venture import failed: ${message}`)
+        this.queueManager.updateItem(releaseName, {
+          status: 'InstallError',
+          error: message,
+          progress: 100
+        })
+      }
+      this.emitUpdate()
+      return
+    }
+
     // Check if the app is connected to the target device
     const targetDeviceForInstall = this.getTargetDeviceForInstallation()
     if (!targetDeviceForInstall) {
@@ -1547,6 +1595,24 @@ class DownloadService extends EventEmitter implements DownloadAPI {
       this.emit('installation:progress', { step, percent })
     }
     onProgress('Starting…')
+
+    if (ventureService.isVentureTarget(deviceId)) {
+      if (!existsSync(filePath)) {
+        console.error(`[Service installManualFile] File/folder not found: ${filePath}`)
+        return false
+      }
+      try {
+        const stats = await fs.stat(filePath)
+        const folder = stats.isDirectory() ? filePath : dirname(filePath)
+        onProgress('Importing into Venture…')
+        const imported = await ventureService.importFolder(folder)
+        console.log(`[Service installManualFile] Venture imported ${imported.join(', ')}`)
+        return imported.length > 0
+      } catch (error) {
+        console.error('[Service installManualFile] Venture import failed:', error)
+        return false
+      }
+    }
 
     // Check if the app is connected to the target device
     const targetDeviceForInstall = this.getTargetDeviceForInstallation()

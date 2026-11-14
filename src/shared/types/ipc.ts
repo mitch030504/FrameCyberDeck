@@ -33,7 +33,9 @@ import {
   GameDescriptionResult,
   GameDescriptionSnapshot,
   FrameConversionSettings,
-  FramePortEngineStatus
+  FramePortEngineStatus,
+  VentureStatus,
+  VentureGame
 } from './index'
 
 // Define types for all IPC channels between renderer and main
@@ -87,6 +89,14 @@ export interface IPCChannels {
     Record<string, unknown>
   >
   'frame:agent-info': DefineChannel<[host?: string], Record<string, unknown>>
+
+  // PC target backed by Venture (a Meta Quest emulator for PC VR)
+  'venture:status': DefineChannel<[], VentureStatus>
+  'venture:list-games': DefineChannel<[], VentureGame[]>
+  'venture:list-installed': DefineChannel<[], PackageInfo[]>
+  'venture:import': DefineChannel<[folder: string], string[]>
+  'venture:play': DefineChannel<[gameId: string], boolean>
+  'venture:uninstall': DefineChannel<[gameId: string], boolean>
 
   // Game related channels
   'games:get-games': DefineChannel<[], GameInfo[]>

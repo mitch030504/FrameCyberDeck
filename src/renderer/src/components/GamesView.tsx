@@ -1272,6 +1272,17 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
     }
   }
 
+  const handleLaunchVenture = async (game: GameInfo): Promise<void> => {
+    if (!selectedDeviceDetails?.isVenture || !game?.packageName) return
+    try {
+      const launched = await window.api.venture.play(game.packageName)
+      if (!launched) window.alert(`Could not launch ${game.name} in Venture.`)
+    } catch (error) {
+      console.error(`Venture launch failed for ${game.name}:`, error)
+      window.alert(`Failed to launch ${game.name} in Venture: ${String(error)}`)
+    }
+  }
+
   const performUninstall = async (game: GameInfo, deleteFiles = false): Promise<void> => {
     if (!game || !game.packageName || !selectedDevice) {
       console.error(
@@ -3694,6 +3705,16 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
                 }}
               >
                 ▶ Launch on Frame
+              </ContextMenuItem>
+            )}
+            {selectedDeviceDetails?.isVenture && contextMenu.game.isInstalled && (
+              <ContextMenuItem
+                onClick={() => {
+                  void handleLaunchVenture(contextMenu.game)
+                  setContextMenu(null)
+                }}
+              >
+                ▶ Play on PC
               </ContextMenuItem>
             )}
             {!getSideloadingDisabled() && (

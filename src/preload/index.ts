@@ -31,6 +31,7 @@ import {
   LocalUploadError,
   BackupAPIRenderer,
   FrameAPIRenderer,
+  VentureAPIRenderer,
   FrameConversionSettings
 } from '@shared/types'
 import { typedIpcRenderer } from '@shared/ipc-utils'
@@ -129,6 +130,14 @@ const api = {
       typedIpcRenderer.invoke('frame:agent-run', command, args, host),
     agentInfo: (host?: string) => typedIpcRenderer.invoke('frame:agent-info', host)
   } satisfies FrameAPIRenderer,
+  venture: {
+    status: () => typedIpcRenderer.invoke('venture:status'),
+    listGames: () => typedIpcRenderer.invoke('venture:list-games'),
+    listInstalled: () => typedIpcRenderer.invoke('venture:list-installed'),
+    importFolder: (folder: string) => typedIpcRenderer.invoke('venture:import', folder),
+    play: (gameId: string) => typedIpcRenderer.invoke('venture:play', gameId),
+    uninstall: (gameId: string) => typedIpcRenderer.invoke('venture:uninstall', gameId)
+  } satisfies VentureAPIRenderer,
   games: {
     getGames: (): Promise<GameInfo[]> => typedIpcRenderer.invoke('games:get-games'),
     getBlacklistGames: () => typedIpcRenderer.invoke('games:get-blacklist-games'),
