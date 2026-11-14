@@ -1,11 +1,17 @@
 import { resolve } from 'path'
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 import react from '@vitejs/plugin-react'
+import { loadEnv } from 'vite'
 import { encodeApiKey } from './src/shared/keyObfuscation'
 
-export default defineConfig(() => {
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode ?? 'production', process.cwd(), '')
   const apiKey =
-    process.env.FRAME_CYBERDECK_API_KEY?.trim() || process.env.VRSRC_API_KEY?.trim() || ''
+    process.env.FRAME_CYBERDECK_API_KEY?.trim() ||
+    process.env.VRSRC_API_KEY?.trim() ||
+    env.FRAME_CYBERDECK_API_KEY?.trim() ||
+    env.VRSRC_API_KEY?.trim() ||
+    ''
 
   if (!apiKey) {
     console.log(
