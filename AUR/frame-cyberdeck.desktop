@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Frame CyberDeck
+Exec=/usr/bin/frame-cyberdeck %U
+Terminal=false
+Type=Application
+Icon=frame-cyberdeck
+StartupWMClass=Frame CyberDeck
+Comment=Steam Frame-focused fork of VR CyberDeck with Quest-to-Frame conversion and SteamOS Devkit deployment
+Categories=Utility;Game;

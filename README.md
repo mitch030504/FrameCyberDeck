@@ -6,194 +6,158 @@
 
 **Steam Frame-focused fork of VR CyberDeck**
 
-Frame CyberDeck is a desktop sideloader and library client built around Valve's Steam Frame. It extends the VR CyberDeck codebase with Steam Frame detection, Quest-to-Frame conversion, SteamOS Devkit deployment, installed-title management, and Frame-aware contribution support.
+Frame CyberDeck is an independent, GPL-3.0-only desktop client for Valve's Steam Frame. It converts compatible Quest APKs using a vendored FramePort engine or a built-in fallback, deploys them through SteamOS Devkit, launches and uninstalls managed titles, captures mixed-reality rooms with FramePort's on-Frame agent, and can target an optional Venture PC library.
 
-The project remains usable without a vrSrc API key: local APK sideloading, Quest-to-Frame conversion, Steam Frame deployment, launch, uninstall, and local device management all work independently of catalog access.
+It is not affiliated with or endorsed by Valve, Meta, FramePort, Venture, or the VR CyberDeck maintainer.
 
 > `> FRAME DETECTED. CONVERT. DEPLOY. LAUNCH.`
 
-```
+```text
 [ TARGET ] STEAM FRAME
-[ HOST   ] WINDOWS · LINUX · macOS
+[ HOST   ] LINUX · WINDOWS · macOS
 [ STACK  ] ELECTRON · REACT · TYPESCRIPT
-[ DEPLOY ] STEAMOS DEVKIT · FAUXDROID
+[ DEPLOY ] STEAMOS DEVKIT · LEPTON
 ```
 
----
+## Status
 
-## `// FORK_LINEAGE`
+| Item | Value |
+| --- | --- |
+| Release | **0.2.0**, first public release (2026-11-14) |
+| Upstream base | VR CyberDeck 1.9.0 |
+| Conversion engine | Vendored FramePort 1.4.1, pin `72c71fbbd303886992ab62cbc1aea6287100f935` |
+| Validated host | **Linux x64** |
+| Other packages | Windows x64 and macOS x64/arm64 are built but **experimental and unverified** |
+| License | GPL-3.0-only |
 
-Frame CyberDeck is a fork of **VR CyberDeck** by **DeliciousMeatPop**.
+0.1.0 was a development/AUR build and was never published on GitHub. See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
-VR CyberDeck itself was built on **ApprenticeVR** by **jimzrt**. Frame CyberDeck keeps that foundation while replacing and extending the device/deployment path for Steam Frame.
+## Quick start
 
-This fork is maintained independently for Steam Frame support. Upstream project names are retained here for attribution only.
+1. Download the Linux x64 AppImage or `.deb` from the release, verify it against `SHA256SUMS`, and install it. Windows and macOS packages are experimental; see [docs/INSTALL.md](docs/INSTALL.md).
+2. On the Frame, install Lepton and pair SteamOS Devkit access with Valve's SteamOS Devkit Client.
+3. Connect the Frame by USB or Wi-Fi and start Frame CyberDeck.
+4. Optional but recommended for the FramePort engine: open **Other Settings → Steam Frame Conversion → Prepare FramePort engine**. The app creates a managed Python environment and downloads its conversion tools once.
+5. Drop a compatible Quest APK, ZIP, or game folder onto the deck, choose the target, install, then launch.
 
----
+Local sideloading, conversion, deployment, launch, uninstall, and room capture do not require catalog credentials.
 
-## `// WHAT_THIS_FORK_ADDS`
+## Features and maturity
 
-### Steam Frame detection
+| Area | Status | Notes |
+| --- | --- | --- |
+| Steam Frame detection and Devkit deployment | **Validated on Linux x64** | Devkit deploy, launch, and uninstall on one Frame path; the app's single-click install button was not exercised. |
+| Quest-to-Frame conversion | **Validated with one engine-path title** | `auto` is the default. FramePort is used only after it is prepared; the built-in converter is the fallback. Compatibility is per title. |
+| FramePort recipes and shims | **Build-stage only** | 194 actionable recipes from 291 catalog entries. Recipes are configurations, not a guarantee. |
+| Mixed-reality room capture | **Validated** | Capture, status, and stop work. Captured rooms are not copied into MR titles. |
+| Venture PC target | **Experimental** | Requires an external `venture-cli`. |
+| Meta owned-title sync and contributions | **Optional** | Requires a configured server and `upload.config`; not required for local use. |
+| Original-source provenance | **Implemented** | Managed installs record the original source; contribution packaging is local-only. |
+| Catalog downloads | **Optional** | Release builds use a short-lived key. Local mode works without it. |
 
-- Detects a connected Steam Frame through its native SteamOS ADB interface
-- Distinguishes Steam Frame from Android/Quest devices
-- Reads Frame storage and network information without treating SteamOS as Android
-- Auto-selects the Frame when available
+No "download all" or bulk-download function is provided. Catalog downloads are capped at two concurrent titles.
 
-### Quest-to-Frame conversion
+## Requirements
 
-Frame CyberDeck can convert a compatible Quest APK before deployment:
+### Conversion engines
 
-1. Inspect the original APK and preserve package/version metadata
-2. Patch it with OVR Port
-3. Inject the Steam Frame OpenXR bridge/runtime components
-4. Align and sign the converted APK
-5. Verify the resulting APK
-6. Stage it for SteamOS Devkit deployment
+| Engine | Requirements |
+| --- | --- |
+| **FramePort** (recommended after preparation) | 64-bit Python 3.11+ with `venv` and pip; network access for the first prepare; free disk space for the managed environment and tools. No host JDK or Android SDK is required. |
+| **Built-in fallback** | Python 3, JDK 21+, and Android SDK build-tools containing `aapt`, `zipalign`, and `apksigner`. Set `ANDROID_SDK_ROOT` and `JAVA_HOME` if they are not in standard locations. |
 
-The converter can run on two engines. The default is the vendored FramePort engine, pinned to FramePort commit `72c71fbbd303886992ab62cbc1aea6287100f935` (v1.4.1 plus the C-Smash app-version fix) and kept in `vendor/frameport/`; it runs the full upstream patch pipeline, including IL2CPP, dex and catalog patches. The built-in converter remains as a fallback, using the prebuilt FrameBridge OpenXR adapter from [FramePort](https://github.com/spoopyghosty0/frameport), verified against its SHA256SUMS manifest.
-The normal path keeps the runtime default refresh rate unless explicitly requested.
+The `auto` setting uses FramePort when its files, virtual environment, and tools are ready. Otherwise it uses the built-in converter. Selecting `frameport` explicitly fails rather than silently falling back.
 
-Frame CyberDeck also applies FramePort's per-game recipes (catalog by spoopyghosty0): for a game the catalog has tested, the conversion merges the recipe's FrameBridge adapter settings (engine-bug fixes such as pose timing, controller vibration, shader fixes) into the APK's settings library, selects the recipe's alternate OVRPort patch set when it asks for one, and injects the matching FramePort shim libraries (the XR shim, the Vulkan shim, and the OpenGL ES shader-fix layer) into the build. The recipe's own suggestions for scale/refresh rate never override your settings.
+### Frame and host
 
-It also deploys FramePort's on-Frame agent for mixed-reality room capture and device-side commands. The app talks to the agent over the existing SteamOS Devkit SSH connection and exposes only a whitelisted set of commands; launching and Steam shortcut management stay with Frame CyberDeck. Room capture is wired end to end; copying the stored room into each MR game's install is still in progress.
+- SteamOS Devkit pairing and the Devkit SSH key at `~/.config/steamos-devkit/devkit_rsa`.
+- `ssh` on the host; `rsync` on Linux/macOS for Devkit transfers. Windows uses a tar stream over SSH.
+- Lepton installed on the Frame. Frame CyberDeck launches through Lepton and can start the Lepton Development session (`steam://rungameid/3056000`) when an install is refused.
+- OS key storage if you use Meta sign-in. On Linux this normally means a working Secret Service/keyring.
+- Windows `ia32` is not supported by the FramePort engine.
 
-All credits for the recipes, the FrameBridge adapter, the shim libraries, and the ELF surgery techniques belong to **spoopyghosty0** and the [FramePort](https://github.com/spoopyghosty0/frameport) project (GPLv3, like this project).
+### Host validation
 
-The Meta native SSO sign-in and the resumable, size-verified download logic are adapted from **[AXRB](https://github.com/Android-XR-Bridge/AXRB)** (GPLv3), whose native SSO protocol in turn comes from RiftLift's `meta_auth.py` (GPL-3.0-or-later).
+- **Linux x64:** validated; use the AppImage or `.deb`.
+- **Linux arm64:** built by CI, not validated in this release.
+- **Windows x64:** built by CI, experimental and unverified; unsigned.
+- **macOS x64/arm64:** built by CI, experimental and unverified; ad-hoc signed, not notarized; macOS 12 or newer.
 
-The original source APK is never overwritten.
+## Install, upgrade, and uninstall
 
-Frame conversion options are available under **Other Settings → Steam Frame Conversion**:
+Release assets are listed in [docs/INSTALL.md](docs/INSTALL.md). Verify downloads against the attached `SHA256SUMS`.
 
-- **Requested display refresh rate:** Runtime default, 72, 80, 90, 96, 108, 120 or 144 Hz.
+Upgrading from the 0.1.0 AUR build preserves settings and downloads, but existing converted titles are not rebuilt. Redeploy from the original source to pick up the new per-game launcher. Upstream VR CyberDeck 1.9.x is a separate application and version line; it installs side by side and does not migrate settings or library state.
 
-For development/testing, environment variables can override the saved UI settings:
+Default data lives in the Electron `userData` folder:
 
-```fish
-set -x FRAME_CYBERDECK_REFRESH_RATE 90
-```
+| Platform | Default `userData` |
+| --- | --- |
+| Linux | `~/.config/frame-cyberdeck` |
+| macOS | `~/Library/Application Support/frame-cyberdeck` |
+| Windows | `%APPDATA%\frame-cyberdeck` |
 
-### SteamOS Devkit deployment
+Downloads default to `<userData>/downloads`; uploads, save backups, logs, the FramePort environment, and the catalog installation id live under the same root. Removing `userData` removes settings, downloads, provenance, logs, and the managed engine. See [docs/INSTALL.md](docs/INSTALL.md) for the full list and uninstall steps.
 
-Frame CyberDeck deploys converted titles through Valve's SteamOS Devkit infrastructure rather than trying to install them directly through SteamOS ADB.
+## Steam Frame setup
 
-Supported operations include:
-
-- Install/deploy
-- Refresh installed titles
-- Launch from Frame CyberDeck
-- Uninstall
-- Preserve package/version/title metadata
-- Resolve duplicate managed titles by package
-
-The Devkit connection is paired externally using Valve's normal SteamOS Devkit flow. Frame CyberDeck then reuses the existing Devkit SSH key.
-
-SSH records a host key on the first connection and rejects changed keys on later connections. If a Frame is reset or another Frame uses the same USB forwarding address, verify its identity before removing the old entry from your SSH `known_hosts` file. HTTPS certificate validation is enabled for catalog and mirror transfers.
-
-### Original-source provenance
-
-For managed Steam Frame installs, Frame CyberDeck records which original Quest payload produced the installed Frame build.
-
-That provenance is used for contribution workflows so the application can contribute the **original APK/folder**, including its matching OBB files. Single APK installs made before OBB provenance was recorded must be reinstalled from the original source before contributing. Original local ZIP files are retained after upload.
-
-A local validation tool is included:
-
-```fish
-fish scripts/frame-contribution-dry-run.fish com.Icosa.OpenBrush
-```
-
-It validates package/version identity, provenance, HWID metadata, and archive creation without performing a network upload.
-
-### Meta owned-title sync
-
-Frame CyberDeck can sign in to your Meta account and contribute owned Quest titles that the server does not have yet.
-
-- **Sign-in:** Meta's native SSO flow opens Meta's own login page (including 2FA) in an embedded window; the password stays with Meta, and the app receives only an encrypted session blob it exchanges for a Quest account token. If sign-in is unavailable, paste a user token instead. The token is validated against Meta and stored encrypted through the OS keychain.
-- **Check:** a single entitlement query lists everything the account owns, with each title's latest Android binary (id, version code, package name). These are compared against the server catalog.
-- **What becomes a candidate:**
-  - Updates — any owned title the server already carries where Meta has a newer version.
-  - New titles — only entitlements that were **paid**: purchases, preorders, cross-buy grants, and subscription (Horizon+) claims. Free downloads, promo keys, and trial grants never contribute a title the server does not already have, and neither do demos — even the ones Meta grants through a paid-style offer.
-- **Download & contribute:** selected titles download their APK and data files from Meta's entitled CDN into the uploads cache — classic OBB files as well as data shipped under its own name (Unreal `.pak` chunks, named OBBs like `Sounds.obb`) — plus the files of store add-ons the account owns (e.g. music packs), and enter the normal contribution pipeline (HWID metadata, archive creation, `upload.config` upload) unchanged. Downloads are resumable (an interrupted multi-gigabyte OBB continues from where it stopped) and size-verified, disk space is checked before the transfer starts, downloaded versions are cached so re-checks never re-download, and every successfully contributed version is recorded so it is never uploaded twice; a newer version still gets offered.
-- Tokens are never written to logs, and download URLs carrying the token are not logged either.
-
----
-
-## `// LOCAL_SIDELOADING`
-
-Local sideloading does not require a vrSrc API key.
-
-With a Steam Frame connected, you can:
-
-- Install an APK
-- Install an extracted game folder
-- Install supported ZIP payloads
-- Convert compatible Quest APKs automatically
-- Deploy converted builds to the Frame
-- Launch managed titles
-- Uninstall managed titles
-
-The application also retains the original VR CyberDeck Android/Quest paths where they are still applicable.
-
----
-
-## `// CATALOG_AND_CONTRIBUTIONS`
-
-Catalog access is optional. Official builds carry a public client id and a build secret and exchange them for a short-lived mirror key at runtime; the key is refreshed in place and never becomes a long-lived download credential.
-
-When authorized catalog access is configured, Frame CyberDeck can:
-
-- Sync catalog metadata
-- Compare installed package/version metadata against the catalog
-- Detect packages that are missing or newer
-- Prepare eligible contributions using the provided `upload.config`
-- Use the recorded original source for Steam Frame contributions
-- Contribute owned Meta titles that are new or newer on the account than on the server (see Meta owned-title sync above)
-
-The public/catalog download path is intentionally conservative:
-
-- Maximum 2 concurrent downloads
-- Maximum 2 rclone transfers on the protected endpoint
-- Request TPS limit of 1 with burst 2
-
-There is no "download all" or bulk-download function.
-
----
-
-## `// STEAM_FRAME_SETUP`
-
-Conversion requires Python 3, a JDK (Java 21 or newer), and Android SDK build-tools containing `aapt`, `zipalign`, and `apksigner`. Set `ANDROID_SDK_ROOT` and `JAVA_HOME` when those installations are outside their usual locations. Windows SDK tools use their native `.exe`/`.bat` filenames; signing runs through the SDK's Java archive. Devkit deployment also requires `ssh` and `rsync` on the host's PATH.
-
-### 1. Pair SteamOS Devkit access
-
-Pair the Steam Frame once using Valve's SteamOS Devkit client.
-
-Frame CyberDeck expects the normal Devkit SSH key at:
-
-```
-~/.config/steamos-devkit/devkit_rsa
-```
-
-### 2. Connect the Frame
-
-For development, the Frame host can be supplied explicitly:
+1. Pair the Frame once with Valve's SteamOS Devkit Client. Frame CyberDeck reuses the normal Devkit SSH key.
+2. Connect by USB for the cable path, or use the normal Devkit network path. USB Devkit traffic (HTTP, SSH, rsync) is tunneled through ADB port forwards.
+3. If discovery does not find the Frame during development, set the host explicitly:
 
 ```fish
 set -x FRAME_CYBERDECK_HOST 192.168.x.x
 npm run dev
 ```
 
-### 3. Install a compatible Quest APK
+SSH records a host key on first connection and rejects changed keys. If a Frame is reset, or another Frame uses the same USB forwarding address, verify the device before removing the old `known_hosts` entry.
 
-Use **Manual Install → Install APK File** or drag a supported APK into the sideloader.
+## Conversion
 
-Frame CyberDeck will convert the APK, deploy it through SteamOS Devkit, refresh the installed-title list, and make the managed title available for launch/uninstall.
+Open **Other Settings → Steam Frame Conversion** to choose the engine and refresh rate, prepare or refresh the FramePort engine, and view tool status.
 
----
+- **Automatic (default):** FramePort when prepared, otherwise the built-in converter.
+- **FramePort engine:** build-stage recipes, shims, and patches. Requires preparation; does not fall back automatically.
+- **Built-in converter:** pinned FrameBridge adapter and OVRPort 1.2.5. It does not carry FramePort's IL2CPP patches.
+- **Refresh rate:** Runtime default (0), 72, 80, 90, 96, 108, 120, or 144 Hz. Runtime default also clears a previous recipe override. The runtime must report the requested mode as supported.
 
-## `// BUILD_FROM_SOURCE`
+The FramePort path applies build-stage changes only. FramePort's install-stage hardware video decode, device-side settings, and per-game room provisioning are **not** applied by Frame CyberDeck. See [docs/CONVERSION.md](docs/CONVERSION.md).
 
-Frame CyberDeck is designed to build without a vrSrc API key. Use Node.js 22.18 or newer and npm; `package-lock.json` is the authoritative dependency lockfile.
+The original source APK is never overwritten. Managed installs record which original Quest payload produced the Frame build so contribution workflows can use the original APK/folder and its OBB data.
+
+## Room scanning
+
+With a Frame connected, open **Other Settings → Steam Frame Conversion → Mixed Reality Room** and choose **Scan room on Frame**. The scan runs on the Frame through FramePort's agent (about 90 seconds); Frame CyberDeck only starts it and reports status. **Cancel scan** stops an active capture.
+
+Captured rooms stay on the Frame. They are not copied into individual MR games in this release. See [docs/ROOM_SCAN.md](docs/ROOM_SCAN.md).
+
+## Venture PC target
+
+When an external `venture-cli` is installed, Frame CyberDeck adds a synthetic **PC · Venture** target to the device list. The normal install flow can import a release folder into Venture; installed Venture titles can be listed, launched, and uninstalled from the deck.
+
+Venture support is **experimental**. Frame CyberDeck does not install Venture, sign in to Meta for it, or download Meta content for it. Close the Venture launcher before importing. Using Venture may carry Meta account/terms risk; see [docs/VENTURE.md](docs/VENTURE.md).
+
+## Catalog, privacy, and credentials
+
+Catalog access is optional. Local sideloading and Frame management work without it.
+
+Release builds carry a public client id and an obfuscated build credential. At runtime the app exchanges them for a short-lived key at `https://vrsrc.fyi/api/mirror/app-key`, sends a random installation id and the app version, caches the key in memory until `refreshAfter`, refreshes it after a 403, and waits 60 seconds once if the server answers 503 `key_pending`. The minted key is used only with the HTTPS `baseUri` returned in the grant.
+
+The build credential is obfuscated, not confidential: it can be recovered from a shipped build. Revocation is server-side. Release builds reject a static `VRSRC_API_KEY` and never fall back to one after a failed mint.
+
+The app also checks GitHub for updates. Support logs uploaded from Settings go to a **public** rentry.co paste; catalog keys, 7-Zip passwords, and authorization headers are redacted, but logs may still contain command output. Review the log before sharing.
+
+See [docs/CATALOG.md](docs/CATALOG.md) and [docs/security/catalog-credentials.md](docs/security/catalog-credentials.md).
+
+## Troubleshooting, limitations, and verification
+
+- [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md) — platform, engine, room, Venture, catalog, and packaging limits.
+- [docs/VERIFICATION.md](docs/VERIFICATION.md) — what was tested for 0.2.0, with dates and evidence.
+- Troubleshooting is covered in [docs/INSTALL.md](docs/INSTALL.md) and [docs/CONVERSION.md](docs/CONVERSION.md).
+
+## Build from source
+
+Use Node.js 22.18 or newer and npm. `package-lock.json` is authoritative.
 
 ```sh
 npm ci --legacy-peer-deps
@@ -201,78 +165,42 @@ npm run typecheck
 npm test
 npm run test:node
 npm run test:python
+npm run check:frameport
 npm run build
 ```
 
-To build an installable package:
+Build an installable package:
 
-| Platform    | Command                     |
-| ----------- | --------------------------- |
-| Windows x64 | `npm run build:win:x64`     |
-| macOS x64   | `npm run build:mac:x64`     |
-| Linux x64   | `npm run build:linux:x64`   |
+| Platform | Command |
+| --- | --- |
+| Linux x64 | `npm run build:linux:x64` |
 | Linux ARM64 | `npm run build:linux:arm64` |
+| Windows x64 | `npm run build:win:x64` |
+| macOS x64 | `npm run build:mac:x64` |
+| macOS ARM64 | `npm run build:mac:arm64` |
 
-Catalog credentials for development live in `.env` (or the environment):
+Source builds do not need catalog credentials. For catalog development, copy `.env.example` to `.env` and set `VRSRC_CLIENT_ID` and `VRSRC_BUILD_SECRET` (the build credential). Release builds require both and fail if a static catalog key is present. Never commit a real credential.
 
-```sh
-VRSRC_CLIENT_ID=<public client id>
-VRSRC_BUILD_SECRET=<build secret>
-```
+`python3 scripts/verify-catalog-key.py` mints a key and probes the mirror without printing either credential.
 
-The app asks `https://vrsrc.fyi/api/mirror/app-key` for a short-lived key and
-uses it for catalog downloads. Never commit the build secret, and never put it
-in a published fork; a fork needs its own developer application.
+## Credits and license
 
----
+Frame CyberDeck is **GPL-3.0-only**. It is an independent fork of **VR CyberDeck** by **DeliciousMeatPop**, which was built on **ApprenticeVR** by **jimzrt**. It is not an official VR CyberDeck release.
 
-## `// TESTED_FRAME_PATH`
+Vendored FramePort 1.4.1 is by **spoopyghosty0** and is GPL-3.0-only. OVRPort is GPL-3.0; AXRB is GPL-3.0; RiftLift is GPL-3.0-or-later; optional Venture is GPL-3.0-or-later. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), [vendor/frameport/THIRD_PARTY_NOTICES.md](vendor/frameport/THIRD_PARTY_NOTICES.md), and [LICENSE](LICENSE).
 
-The current Steam Frame path has been exercised end-to-end with Open Brush:
+## Documentation
 
-```
-original Quest APK
-        ↓
-metadata inspection
-        ↓
-OVR Port conversion
-        ↓
-Frame OpenXR bridge injection
-        ↓
-zipalign + signing + verification
-        ↓
-SteamOS Devkit deployment
-        ↓
-installed-title refresh
-        ↓
-launch
-        ↓
-uninstall / reinstall
-        ↓
-original-source provenance
-        ↓
-offline contribution packaging validation
-```
-
-This validates the complete local path. Live catalog comparison and final `upload.config` transmission require authorized server access.
-
----
-
-## `// PROJECT_STATUS`
-
-Frame CyberDeck is currently an early Steam Frame-focused fork.
-
-The Frame implementation is functional, but compatibility still depends on the individual Quest application and the capabilities of the conversion/runtime stack. Not every Quest title should be expected to work.
-
-Issues and Frame-specific test reports belong in this repository:
-
-- **[Open an issue](https://github.com/mitch030504/FrameCyberDeck/issues/new)**
-- **[FrameCyberDeck repository](https://github.com/mitch030504/FrameCyberDeck)**
-
----
-
-## `// LICENSE`
-
-GNU GPL v3.
-
-See the repository `LICENSE` file for the full license text.
+- [docs/INSTALL.md](docs/INSTALL.md)
+- [docs/CONVERSION.md](docs/CONVERSION.md)
+- [docs/ROOM_SCAN.md](docs/ROOM_SCAN.md)
+- [docs/VENTURE.md](docs/VENTURE.md)
+- [docs/CATALOG.md](docs/CATALOG.md)
+- [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md)
+- [docs/VERIFICATION.md](docs/VERIFICATION.md)
+- [docs/RELEASING.md](docs/RELEASING.md)
+- [docs/security/catalog-credentials.md](docs/security/catalog-credentials.md)
+- [FRAME_CYBERDECK.md](FRAME_CYBERDECK.md) — implementation notes
+- [AUDIT_FOLLOWUP.md](AUDIT_FOLLOWUP.md) — historical 2026-10-11 audit
+- [CHANGELOG.md](CHANGELOG.md)
+- [AUR/README.md](AUR/README.md)

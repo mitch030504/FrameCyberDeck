@@ -1,0 +1,85 @@
+# Maintainer: mitch030504 <https://github.com/mitch030504>
+
+pkgname=frame-cyberdeck-bin
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="Steam Frame-focused fork of VR CyberDeck with Quest-to-Frame conversion and SteamOS Devkit deployment"
+arch=('x86_64')
+url="https://github.com/mitch030504/FrameCyberDeck"
+license=('GPL-3.0-only')
+depends=(
+    'alsa-lib'
+    'at-spi2-core'
+    'cairo'
+    'dbus'
+    'expat'
+    'glib2'
+    'gtk3'
+    'libcups'
+    'libdrm'
+    'libx11'
+    'libxcb'
+    'libxcomposite'
+    'libxdamage'
+    'libxext'
+    'libxfixes'
+    'libxkbcommon'
+    'libxrandr'
+    'mesa'
+    'nspr'
+    'nss'
+    'pango'
+    'python'
+    'openssh'
+    'rsync'
+)
+provides=('frame-cyberdeck')
+conflicts=('frame-cyberdeck')
+options=('!strip')
+
+source=(
+    "frame-cyberdeck-${pkgver}-x86_64.AppImage::https://github.com/mitch030504/FrameCyberDeck/releases/download/v${pkgver}/frame-cyberdeck-${pkgver}-x86_64.AppImage"
+    "frame-cyberdeck.desktop"
+)
+sha256sums=(
+    '19a6316334344c311d2cae7427a97e310f3871402eadbeff800c05e39a8aaab3'
+    'e522cee4480be932f21dfd5a6b49dc4c10095bc07304fa5f4e2fe188a913c0ee'
+)
+
+prepare() {
+    chmod +x "frame-cyberdeck-${pkgver}-x86_64.AppImage"
+    ./"frame-cyberdeck-${pkgver}-x86_64.AppImage" --appimage-extract >/dev/null
+}
+
+package() {
+    install -d "${pkgdir}/opt/frame-cyberdeck"
+    install -d "${pkgdir}/usr/bin"
+    install -d "${pkgdir}/usr/share/applications"
+    install -d "${pkgdir}/usr/share/icons/hicolor/512x512/apps"
+    install -d "${pkgdir}/usr/share/licenses/${pkgname}"
+
+    cp -a squashfs-root/* "${pkgdir}/opt/frame-cyberdeck/"
+    rm -rf "${pkgdir}/opt/frame-cyberdeck/usr"
+    rm -f "${pkgdir}/opt/frame-cyberdeck/AppRun"
+    rm -f "${pkgdir}/opt/frame-cyberdeck/frame-cyberdeck.desktop"
+    rm -f "${pkgdir}/opt/frame-cyberdeck/frame-cyberdeck.png"
+    rm -f "${pkgdir}/opt/frame-cyberdeck/.DirIcon"
+
+    # The AppImage squashfs stores restrictive modes (e.g. resources/ at
+    # 0700); without this the installed app cannot read its own asar.
+    chmod -R u=rwX,go=rX "${pkgdir}/opt/frame-cyberdeck"
+    chmod 755 "${pkgdir}/opt/frame-cyberdeck/frame-cyberdeck"
+    ln -sf "/opt/frame-cyberdeck/frame-cyberdeck" "${pkgdir}/usr/bin/frame-cyberdeck"
+
+    install -m644 "frame-cyberdeck.desktop" "${pkgdir}/usr/share/applications/frame-cyberdeck.desktop"
+    install -m644 "squashfs-root/usr/share/icons/hicolor/512x512/apps/frame-cyberdeck.png" \
+        "${pkgdir}/usr/share/icons/hicolor/512x512/apps/frame-cyberdeck.png"
+
+    install -m644 "squashfs-root/resources/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    install -m644 "squashfs-root/resources/THIRD_PARTY_NOTICES.md" \
+        "${pkgdir}/usr/share/licenses/${pkgname}/THIRD_PARTY_NOTICES.md"
+    install -m644 "squashfs-root/resources/vendor/frameport/LICENSE" \
+        "${pkgdir}/usr/share/licenses/${pkgname}/FRAMEPORT_LICENSE"
+    install -m644 "squashfs-root/resources/vendor/frameport/THIRD_PARTY_NOTICES.md" \
+        "${pkgdir}/usr/share/licenses/${pkgname}/FRAMEPORT_THIRD_PARTY_NOTICES.md"
+}
