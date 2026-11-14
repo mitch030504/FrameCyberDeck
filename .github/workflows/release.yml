@@ -184,6 +184,8 @@ jobs:
           BUILD_COMMAND: ${{ steps.build_details.outputs.BUILD_COMMAND }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VRSRC_API_KEY: ${{ secrets.VRSRC_API_KEY }}
+          VRSRC_CLIENT_ID: ${{ secrets.VRSRC_CLIENT_ID }}
+          VRSRC_BUILD_SECRET: ${{ secrets.VRSRC_BUILD_SECRET }}
           ELECTRON_BUILDER_DOWNLOAD_TIMEOUT: 120000
           npm_config_fetch_timeout: 120000
           npm_config_fetch_retry_mintimeout: 20000
@@ -317,5 +319,7 @@ jobs:
       version: ${{ needs.create_release.outputs.version }}
     secrets:
       VRSRC_API_KEY: ${{ secrets.VRSRC_API_KEY }}
+      VRSRC_CLIENT_ID: ${{ secrets.VRSRC_CLIENT_ID }}
+      VRSRC_BUILD_SECRET: ${{ secrets.VRSRC_BUILD_SECRET }}
     permissions:
       contents: write

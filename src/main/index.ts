@@ -13,6 +13,7 @@ import adbService from './services/adbService'
 import { installQuestUdevRule } from './services/linuxUsbAccess'
 import dependencyService, { DependencyStatus } from './services/dependencyService'
 import gameService from './services/gameService'
+import { ensureApiKey } from './services/apiKey'
 import { createGameDescriptionService } from './services/gameDescription/gameDescriptionService'
 import downloadService from './services/downloadService'
 import frameDevkitService from './services/frame/frameDevkitService'
@@ -237,6 +238,9 @@ function createWindow(): void {
             // Initialize ADB Service (needs adb path from dependencyService)
             await adbService.initialize()
             console.log('ADB Service initialized.')
+            // Mint the short-lived catalog key before the first sync; a
+            // failure is handled by GameService and leaves local mode working.
+            void ensureApiKey()
             // Initialize Game Service (needs 7z and rclone from dependencyService)
             const gameServiceStatus = await gameService.initialize()
             console.log(`Game Service initialization status: ${gameServiceStatus}`)

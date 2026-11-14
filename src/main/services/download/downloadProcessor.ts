@@ -3,7 +3,7 @@ import { promises as fs, promises as fsPromises } from 'fs'
 import { execa, ExecaError } from 'execa'
 import crypto from 'crypto'
 import { QueueManager } from './queueManager'
-import { getApiKey, redactApiKey as redactKey } from '../apiKey'
+import { ensureApiKey, getApiKey, invalidateApiKey, redactApiKey as redactKey } from '../apiKey'
 import dependencyService from '../dependencyService'
 import mirrorService from '../mirrorService'
 import settingsService from '../settingsService'
@@ -159,7 +159,6 @@ export class DownloadProcessor {
       this.updateItemStatus(item.releaseName, 'Error', 0, 'Rclone dependency not found')
       return { success: false, startExtraction: false }
     }
-
     const downloadPath =
       basename(item.downloadPath) === item.releaseName
         ? item.downloadPath
@@ -244,8 +243,10 @@ export class DownloadProcessor {
     }
 
     // Use public endpoint via rclone copy (no FUSE/macFUSE required).
-    // Fail immediately and clearly when no authorized credential is available,
-    // rather than letting rclone retry a protected endpoint several times.
+    // Mint/refresh the short-lived catalog key first; fail immediately and
+    // clearly when no authorized credential is available, rather than letting
+    // rclone retry a protected endpoint several times.
+    await ensureApiKey()
     if (!getApiKey()) {
       const errorMsg =
         'Catalog API key is not configured. Set FRAME_CYBERDECK_API_KEY for an authorized source, or configure an authenticated mirror.'
@@ -284,6 +285,7 @@ export class DownloadProcessor {
       this.updateItemStatus(item.releaseName, 'Error', 0, 'Rclone dependency not found')
       return { success: false, startExtraction: false }
     }
+    if (!mirrorConfig) await ensureApiKey()
 
     const downloadPath =
       basename(item.downloadPath) === item.releaseName
@@ -698,6 +700,11 @@ export class DownloadProcessor {
         errorMessage = String(error)
       }
       errorMessage = redactKey(errorMessage).substring(0, 500)
+      if (/\b403\b|Forbidden/i.test(errorMessage)) {
+        // The mirror key was retired or revoked mid-run; the next attempt
+        // mints a fresh one instead of reusing the rejected cache entry.
+        invalidateApiKey()
+      }
 
       // A skewed system clock makes every request 403 and the run die with a
       // bare "exit code 1". This is a user-fixable local problem, not a server

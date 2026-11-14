@@ -1,18 +1,44 @@
 import { decodeApiKey } from '@shared/keyObfuscation'
+import catalogKeyService from './catalogKeyService'
 
-let cached: string | null = null
+let legacyKey: string | null = null
 
-/** Decodes the build-time-obfuscated vrSrc API key (see keyObfuscation.ts). */
+/**
+ * The catalog key currently in use. Official builds mint a short-lived key at
+ * runtime; older builds can still carry a static key in VRSRC_API_KEY_ENC.
+ */
 export function getApiKey(): string {
-  if (cached === null) {
-    // Allow an authorized runtime credential in development/custom deployments.
-    // Packaged official builds can still use the build-time obfuscated value.
-    cached =
-      process.env.FRAME_CYBERDECK_API_KEY?.trim() ||
-      process.env.VRSRC_API_KEY?.trim() ||
-      decodeApiKey(process.env.VRSRC_API_KEY_ENC ?? '')
+  const dynamic = catalogKeyService.getCachedKey()
+  if (dynamic) return dynamic
+  if (legacyKey === null) {
+    try {
+      legacyKey = decodeApiKey(process.env.VRSRC_API_KEY_ENC ?? '')
+    } catch (error) {
+      console.error('[Catalog Key] Embedded catalog key could not be decoded:', error)
+      legacyKey = ''
+    }
   }
-  return cached
+  return legacyKey
+}
+
+/**
+ * Mint or refresh the short-lived catalog key when this build has dynamic
+ * credentials. Returns the static key unchanged for older builds.
+ */
+export async function ensureApiKey(force = false): Promise<string> {
+  if (catalogKeyService.hasCredentials()) {
+    try {
+      await catalogKeyService.ensureKey(force)
+    } catch (error) {
+      console.error('[Catalog Key] Could not obtain a catalog key:', error)
+    }
+  }
+  return getApiKey()
+}
+
+/** Drop a rejected key so the next request mints a fresh one. */
+export function invalidateApiKey(): void {
+  catalogKeyService.invalidate()
 }
 
 /** Strips the API key out of arbitrary text before it's logged, uploaded, or displayed. */

@@ -7,7 +7,7 @@ import axios from 'axios'
 import dependencyService from './dependencyService'
 import mirrorService from './mirrorService'
 import settingsService from './settingsService'
-import { getApiKey, redactApiKey as redactKey } from './apiKey'
+import { ensureApiKey, getApiKey, invalidateApiKey, redactApiKey as redactKey } from './apiKey'
 import { GameInfo, ServiceStatus, GamesAPI, BlacklistEntry } from '@shared/types'
 import EventEmitter from 'events'
 import { typedWebContentsSend } from '@shared/ipc-utils'
@@ -118,6 +118,7 @@ class GameService extends EventEmitter implements GamesAPI {
       // is a pure sideloader and must never reach out to (or block on) a remote.
       const hasServer = !!(this.vrpConfig?.baseUri && this.vrpConfig?.password)
       const syncNeeded = hasServer && (await this.needsSync())
+      if (syncNeeded) await ensureApiKey()
       if (syncNeeded && getApiKey()) {
         console.log('[GameService] Stale or missing meta data - starting background sync.')
         void this.backgroundSync()
@@ -477,6 +478,7 @@ class GameService extends EventEmitter implements GamesAPI {
       // Fall back to public endpoint if no mirror or mirror failed.
       // Do not invoke rclone against a protected endpoint without a credential:
       // that only produces repeated 403 retries and obscures the real problem.
+      await ensureApiKey()
       const publicApiKey = getApiKey()
       if (!publicApiKey) {
         throw new Error(
@@ -570,7 +572,9 @@ class GameService extends EventEmitter implements GamesAPI {
         })
       }
     } catch (error) {
-      console.error('Error downloading meta archive:', redactKey(String(error)))
+      const message = redactKey(String(error))
+      if (/\b403\b|Forbidden/i.test(message)) invalidateApiKey()
+      console.error('Error downloading meta archive:', message)
       throw error
     }
   }

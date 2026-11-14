@@ -139,7 +139,7 @@ The application also retains the original VR CyberDeck Android/Quest paths where
 
 ## `// CATALOG_AND_CONTRIBUTIONS`
 
-Catalog access is optional and requires an authorized API key.
+Catalog access is optional. Official builds carry a public client id and a build secret and exchange them for a short-lived mirror key at runtime; the key is refreshed in place and never becomes a long-lived download credential.
 
 When authorized catalog access is configured, Frame CyberDeck can:
 
@@ -213,13 +213,16 @@ To build an installable package:
 | Linux x64   | `npm run build:linux:x64`   |
 | Linux ARM64 | `npm run build:linux:arm64` |
 
-An authorized catalog key can be supplied at runtime during development:
+Catalog credentials for development live in `.env` (or the environment):
 
 ```sh
-FRAME_CYBERDECK_API_KEY=...
+VRSRC_CLIENT_ID=<public client id>
+VRSRC_BUILD_SECRET=<build secret>
 ```
 
-Never commit an API key.
+The app asks `https://vrsrc.fyi/api/mirror/app-key` for a short-lived key and
+uses it for catalog downloads. Never commit the build secret, and never put it
+in a published fork; a fork needs its own developer application.
 
 ---
 
