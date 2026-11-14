@@ -267,7 +267,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for os in Linux macOS Windows; do
+          # Artifact names follow the matrix os labels (build-artifact-<os>-latest).
+          for os in ubuntu macos windows; do
             if ! find artifacts -maxdepth 3 -type f -path "*${os}*" -print -quit | grep -q .; then
               echo "::error::No artifact found for ${os}"
               exit 1
