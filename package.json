@@ -1,6 +1,6 @@
 {
   "name": "frame-cyberdeck",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Steam Frame-focused fork of VR CyberDeck with Quest-to-Frame conversion and SteamOS Devkit deployment",
   "main": "./out/main/index.js",
   "author": "mitch030504",
@@ -21,20 +21,20 @@
     "dev": "electron-vite dev",
     "build": "npm run typecheck && electron-vite build",
     "postinstall": "electron-builder install-app-deps",
-    "build:unpack": "npm run build && electron-builder --dir",
-    "build:win": "electron-vite build && electron-builder --win",
-    "build:win:x64": "electron-vite build && electron-builder --win --x64",
-    "build:win:ia32": "electron-vite build && electron-builder --win --ia32",
-    "build:mac": "electron-vite build && electron-builder --mac",
-    "build:mac:x64": "electron-vite build && electron-builder --mac --x64",
-    "build:mac:arm64": "electron-vite build && electron-builder --mac --arm64",
-    "build:mac:universal": "electron-vite build && electron-builder --mac --universal",
-    "build:linux": "electron-vite build && electron-builder --linux",
-    "build:linux:x64": "electron-vite build && electron-builder --linux --x64",
-    "build:linux:arm64": "electron-vite build && electron-builder --linux --arm64",
-    "build:all": "electron-vite build && electron-builder --win --mac --linux",
-    "build:all:x64": "electron-vite build && electron-builder --win --mac --linux --x64",
-    "publish": "electron-builder --publish always",
+    "build:unpack": "npm run build && electron-builder --publish never --dir",
+    "build:win": "electron-vite build && electron-builder --publish never --win",
+    "build:win:x64": "electron-vite build && electron-builder --publish never --win --x64",
+    "build:win:ia32": "electron-vite build && electron-builder --publish never --win --ia32",
+    "build:mac": "electron-vite build && electron-builder --publish never --mac",
+    "build:mac:x64": "electron-vite build && electron-builder --publish never --mac --x64",
+    "build:mac:arm64": "electron-vite build && electron-builder --publish never --mac --arm64",
+    "build:mac:universal": "electron-vite build && electron-builder --publish never --mac --universal",
+    "build:linux": "electron-vite build && electron-builder --publish never --linux",
+    "build:linux:x64": "electron-vite build && electron-builder --publish never --linux --x64",
+    "build:linux:arm64": "electron-vite build && electron-builder --publish never --linux --arm64",
+    "build:all": "electron-vite build && electron-builder --publish never --win --mac --linux",
+    "build:all:x64": "electron-vite build && electron-builder --publish never --win --mac --linux --x64",
+    "publish": "electron-builder --publish never",
     "tag-version": "VERSION=$(node -p \"require('./package.json').version\") && TAG_NAME=\"v$VERSION\" && (git rev-parse $TAG_NAME >/dev/null 2>&1 || git tag $TAG_NAME) && echo \"Tag $TAG_NAME created or already exists.\""
   },
   "dependencies": {
@@ -88,5 +88,10 @@
   },
   "overrides": {
     "@electron/get": "^5.1.0"
+  },
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mitch030504/FrameCyberDeck.git"
   }
 }
