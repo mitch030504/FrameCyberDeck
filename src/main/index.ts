@@ -1,4 +1,14 @@
-import { app, shell, BrowserWindow, screen, protocol, dialog, net, Notification } from 'electron'
+import {
+  app,
+  shell,
+  BrowserWindow,
+  screen,
+  protocol,
+  dialog,
+  net,
+  Notification,
+  session
+} from 'electron'
 import { promises as fsPromises, existsSync } from 'fs'
 // Side-effect import: must run before any service whose singleton constructor
 // reads app.getPath('userData'). ESM evaluates sibling imports in source
@@ -23,6 +33,7 @@ import ventureService from './services/ventureService'
 import uploadService from './services/uploadService'
 import metaAccountService from './services/metaAccountService'
 import metaSyncService from './services/metaSyncService'
+import metaStoreService from './services/metaStoreService'
 import updateService from './services/updateService'
 import logsService from './services/logsService'
 import mirrorService from './services/mirrorService'
@@ -133,11 +144,73 @@ function createWindow(): void {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: true,
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      webviewTag: true
     }
   })
 
   if (startMaximized) mainWindow.maximize()
+
+  // Dedicated YouTube session for trailer playback. Keep the main window
+  // sandboxed and web security enabled; only the trailer guest uses this
+  // partition, and only YouTube hosts are allowed to attach.
+  const ytUrlFilters = [
+    'https://*.youtube.com/*',
+    'https://*.youtube-nocookie.com/*',
+    'https://*.googlevideo.com/*',
+    'https://*.ytimg.com/*'
+  ]
+  const ytSession = session.fromPartition('persist:youtube')
+  ytSession.setUserAgent(
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+  )
+  ytSession.webRequest.onBeforeSendHeaders({ urls: ytUrlFilters }, (details, callback) => {
+    details.requestHeaders.Referer = 'https://www.youtube.com/'
+    details.requestHeaders.Origin = 'https://www.youtube.com'
+    callback({ requestHeaders: details.requestHeaders })
+  })
+  ytSession.webRequest.onHeadersReceived({ urls: ytUrlFilters }, (details, callback) => {
+    const headers = { ...details.responseHeaders }
+    delete headers['X-Frame-Options']
+    delete headers['x-frame-options']
+    delete headers['Content-Security-Policy']
+    delete headers['content-security-policy']
+    callback({ responseHeaders: headers })
+  })
+
+  mainWindow.webContents.on('will-attach-webview', (event, webPreferences, params) => {
+    delete webPreferences.preload
+    webPreferences.nodeIntegration = false
+    webPreferences.contextIsolation = true
+    webPreferences.sandbox = true
+    webPreferences.webSecurity = true
+    try {
+      const host = new URL(params.src).hostname
+      const allowed = [
+        'youtube.com',
+        'www.youtube.com',
+        'm.youtube.com',
+        'youtube-nocookie.com',
+        'www.youtube-nocookie.com',
+        'youtu.be',
+        'www.youtu.be'
+      ]
+      if (!allowed.includes(host)) event.preventDefault()
+    } catch {
+      event.preventDefault()
+    }
+  })
+
+  mainWindow.webContents.on('did-attach-webview', (_event, contents) => {
+    contents.setWindowOpenHandler(() => ({ action: 'deny' }))
+    contents.on('will-navigate', (event, target) => {
+      try {
+        if (new URL(target).protocol !== 'https:') event.preventDefault()
+      } catch {
+        event.preventDefault()
+      }
+    })
+  })
 
   // Explicitly set minimum size to ensure constraint is enforced.
   // Sized for ~1366x768 laptops (typical small-screen target) with the OS
@@ -408,6 +481,9 @@ app.whenReady().then(async () => {
     }
   }
 
+  // Pull the latest maintainer trailer fixes in the background; never blocks startup.
+  void metaStoreService.refreshRemoteOverrides()
+
   // Set app user model id for windows
   electronApp.setAppUserModelId('com.vrcyberdeck')
 
@@ -643,6 +719,57 @@ app.whenReady().then(async () => {
   })
   typedIpcMain.handle('games:get-note', async (_event, releaseName) => {
     return gameService.getNote(releaseName)
+  })
+  typedIpcMain.handle('games:get-trailer-url', async (_event, gameName, packageName) => {
+    return metaStoreService.getTrailerUrl(gameName, packageName)
+  })
+  let trailerScanCancel = false
+  let trailerScanRunning = false
+  typedIpcMain.handle('games:scan-trailers', async () => {
+    console.log('[TrailerScan] Scan requested')
+    if (trailerScanRunning) {
+      console.log('[TrailerScan] Already running; ignoring request')
+      return { total: 0, checked: 0, found: 0, missing: 0, cancelled: false, reportPath: null }
+    }
+    trailerScanRunning = true
+    trailerScanCancel = false
+    try {
+      const games = await gameService.getGames()
+      console.log(`[TrailerScan] Scanning ${games.length} games`)
+      const summary = await metaStoreService.scanTrailers(
+        games.map((g) => ({ gameName: g.name, packageName: g.packageName })),
+        {
+          shouldCancel: () => trailerScanCancel,
+          onProgress: (progress) => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              typedWebContentsSend.send(mainWindow, 'games:trailer-scan-progress', progress)
+            }
+          }
+        }
+      )
+      const reportPath = await metaStoreService.writeScanReport(summary)
+      return {
+        total: summary.total,
+        checked: summary.checked,
+        found: summary.found,
+        missing: summary.missing,
+        cancelled: summary.cancelled,
+        reportPath
+      }
+    } finally {
+      trailerScanRunning = false
+    }
+  })
+  typedIpcMain.handle('games:cancel-trailer-scan', async () => {
+    trailerScanCancel = true
+  })
+  typedIpcMain.handle('games:reveal-trailer-report', async () => {
+    try {
+      shell.showItemInFolder(metaStoreService.scanReportPath)
+      return true
+    } catch {
+      return false
+    }
   })
   typedIpcMain.handle('games:get-description', async (_event, request) => {
     return gameDescriptionService.getDescription(request)

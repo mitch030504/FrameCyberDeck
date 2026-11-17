@@ -1,0 +1,605 @@
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises'
+import { tmpdir } from 'os'
+import { join } from 'path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+vi.mock('electron', () => ({ app: { getPath: () => join(tmpdir(), 'vrcd-default-test') } }))
+
+import { MetaStoreService } from './metaStoreService'
+import { StoreMetadataProvider } from './gameMetadata/storeMetadataProvider'
+
+const directories: string[] = []
+async function temporaryDataDir(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), 'vrcd-trailer-test-'))
+  directories.push(directory)
+  return directory
+}
+
+afterEach(async () => {
+  await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true })))
+})
+
+const youtubeSearchPage = (title?: string, videoId = 'trailer0001'): string =>
+  `<script>var ytInitialData = ${JSON.stringify({
+    contents: {
+      twoColumnSearchResultsRenderer: {
+        primaryContents: {
+          sectionListRenderer: {
+            contents: [
+              {
+                itemSectionRenderer: {
+                  contents: title
+                    ? [{ videoRenderer: { videoId, title: { simpleText: title } } }]
+                    : []
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  })};</script>`
+
+describe('MetaStoreService', () => {
+  it('does not resolve empty or generic headset names', async () => {
+    let lookups = 0
+    const service = new MetaStoreService({
+      dataDir: await temporaryDataDir(),
+      storeLookup: async () => {
+        lookups += 1
+        return {
+          title: 'Meta Quest',
+          sourceUrl: 'https://www.meta.com/',
+          trailerUrl: 'https://video.oculuscdn.com/generic.mp4'
+        }
+      },
+      get: async () => {
+        lookups += 1
+        return { data: youtubeSearchPage('Meta Quest 3 Official Trailer', 'generic0001') }
+      }
+    })
+
+    await expect(service.getTrailerUrl('', 'com.empty')).resolves.toBeNull()
+    await expect(service.getTrailerUrl('Meta Quest', 'com.generic')).resolves.toBeNull()
+    expect(lookups).toBe(0)
+  })
+
+  it('prefers a verified native store trailer over YouTube search', async () => {
+    const dataDir = await temporaryDataDir()
+    let youtubeRequests = 0
+    const service = new MetaStoreService({
+      dataDir,
+      get: async () => {
+        youtubeRequests += 1
+        throw new Error('YouTube should not be requested')
+      },
+      storeLookup: async () => ({
+        title: 'Breachers',
+        sourceUrl: 'https://www.meta.com/experiences/5740397619319389/',
+        trailerUrl: 'https://video.oculuscdn.com/breachers.mp4?token=signed'
+      })
+    })
+
+    await expect(service.getTrailerUrl('Breachers', 'com.trianglefactory.breachers')).resolves.toBe(
+      'https://video.oculuscdn.com/breachers.mp4?token=signed'
+    )
+    expect(youtubeRequests).toBe(0)
+  })
+
+  it('falls back to a title-verified YouTube result when the store is unavailable', async () => {
+    const service = new MetaStoreService({
+      dataDir: await temporaryDataDir(),
+      storeLookup: async () => {
+        throw new Error('store offline')
+      },
+      get: async () => ({ data: youtubeSearchPage('Med Valley - Official Trailer', 'medvalley01') })
+    })
+
+    await expect(service.getTrailerUrl('Med Valley', 'com.test.medvalley')).resolves.toBe(
+      'https://www.youtube.com/watch?v=medvalley01'
+    )
+  })
+
+  it('rejects native-looking store URLs outside known media CDNs', async () => {
+    const service = new MetaStoreService({
+      dataDir: await temporaryDataDir(),
+      storeLookup: async () => ({
+        title: 'Breachers',
+        sourceUrl: 'https://www.meta.com/experiences/5740397619319389/',
+        trailerUrl: 'https://untrusted.example/breachers.mp4'
+      }),
+      get: async () => ({
+        data: youtubeSearchPage('Breachers - Official Trailer', 'breachers01')
+      })
+    })
+
+    await expect(service.getTrailerUrl('Breachers', 'com.breachers')).resolves.toBe(
+      'https://www.youtube.com/watch?v=breachers01'
+    )
+  })
+
+  it('keeps explicit overrides above cached and automatic results', async () => {
+    const dataDir = await temporaryDataDir()
+    await writeFile(
+      join(dataDir, 'trailer-overrides.json'),
+      JSON.stringify({
+        'com.youtube': 'http://youtu.be/manual00001?t=2',
+        'com.disabled': null,
+        'com.http-native': 'http://media.lan/trailer.mp4',
+        'com.local-native': 'local-video://trailers/manual.mp4'
+      })
+    )
+    let automaticLookups = 0
+    const service = new MetaStoreService({
+      dataDir,
+      storeLookup: async () => {
+        automaticLookups += 1
+        return null
+      },
+      get: async () => {
+        automaticLookups += 1
+        return { data: youtubeSearchPage('Manual - Official Trailer') }
+      }
+    })
+
+    await expect(service.getTrailerUrl('Manual', 'com.youtube')).resolves.toBe(
+      'https://www.youtube.com/watch?v=manual00001'
+    )
+    await expect(service.getTrailerUrl('Disabled', 'com.disabled')).resolves.toBeNull()
+    await expect(service.getTrailerUrl('HTTP Native', 'com.http-native')).resolves.toBe(
+      'http://media.lan/trailer.mp4'
+    )
+    await expect(service.getTrailerUrl('Local Native', 'com.local-native')).resolves.toBe(
+      'local-video://trailers/manual.mp4'
+    )
+    expect(automaticLookups).toBe(0)
+  })
+
+  it('invalidates version 3 cache data and persists version 4 entries with requested titles', async () => {
+    const dataDir = await temporaryDataDir()
+    await writeFile(
+      join(dataDir, 'meta-trailer-cache.json'),
+      JSON.stringify({
+        __version: 3,
+        'com.test': {
+          trailerUrl: 'https://www.youtube.com/watch?v=stale000001',
+          resolvedAt: 1
+        }
+      })
+    )
+    const service = new MetaStoreService({
+      dataDir,
+      storeLookup: async () => null,
+      get: async () => ({ data: youtubeSearchPage('Breachers - Official Trailer', 'breachers01') }),
+      clock: () => 10_000
+    })
+
+    await expect(service.getTrailerUrl('Breachers', 'com.test')).resolves.toBe(
+      'https://www.youtube.com/watch?v=breachers01'
+    )
+    const persisted = JSON.parse(await readFile(join(dataDir, 'meta-trailer-cache.json'), 'utf8'))
+    expect(persisted.__version).toBe(4)
+    expect(Object.values(persisted.entries)).toContainEqual(
+      expect.objectContaining({ requestedTitle: 'breachers', source: 'youtube' })
+    )
+  })
+
+  it('does not reuse a package cache entry for a different requested title', async () => {
+    const dataDir = await temporaryDataDir()
+    let requests = 0
+    const service = new MetaStoreService({
+      dataDir,
+      storeLookup: async () => null,
+      get: async (_url, config) => {
+        requests += 1
+        const query = String(config?.params?.search_query)
+        const title = query.startsWith('RUMBLE 2')
+          ? 'RUMBLE 2 - Official Trailer'
+          : 'RUMBLE - Official Trailer'
+        const id = query.startsWith('RUMBLE 2') ? 'rumble00002' : 'rumble00001'
+        return { data: youtubeSearchPage(title, id) }
+      }
+    })
+
+    await expect(service.getTrailerUrl('RUMBLE', 'com.test')).resolves.toContain('rumble00001')
+    await expect(service.getTrailerUrl('RUMBLE 2', 'com.test')).resolves.toContain('rumble00002')
+    expect(requests).toBe(2)
+  })
+
+  it('expires YouTube successes after 30 days and native URLs after at most 15 minutes', async () => {
+    const dataDir = await temporaryDataDir()
+    let now = 1_800_000_000_000
+    let storeCalls = 0
+    const native = 'https://video.oculuscdn.com/breachers.mp4?token=signed'
+    const storeService = new MetaStoreService({
+      dataDir: join(dataDir, 'store'),
+      clock: () => now,
+      storeLookup: async () => {
+        storeCalls += 1
+        return { title: 'Breachers', sourceUrl: 'https://www.meta.com/', trailerUrl: native }
+      },
+      get: async () => {
+        throw new Error('unexpected YouTube request')
+      }
+    })
+    await storeService.getTrailerUrl('Breachers', 'com.store')
+    now += 15 * 60_000 - 1
+    await storeService.getTrailerUrl('Breachers', 'com.store')
+    expect(storeCalls).toBe(1)
+    now += 2
+    await storeService.getTrailerUrl('Breachers', 'com.store')
+    expect(storeCalls).toBe(2)
+
+    let youtubeCalls = 0
+    const youtubeService = new MetaStoreService({
+      dataDir: join(dataDir, 'youtube'),
+      clock: () => now,
+      storeLookup: async () => null,
+      get: async () => {
+        youtubeCalls += 1
+        return { data: youtubeSearchPage('Breachers - Official Trailer', 'breachers01') }
+      }
+    })
+    await youtubeService.getTrailerUrl('Breachers', 'com.youtube')
+    now += 30 * 24 * 60 * 60_000 - 1
+    await youtubeService.getTrailerUrl('Breachers', 'com.youtube')
+    expect(youtubeCalls).toBe(1)
+    now += 2
+    await youtubeService.getTrailerUrl('Breachers', 'com.youtube')
+    expect(youtubeCalls).toBe(2)
+  })
+
+  it('uses a shorter expiry carried by a signed native URL', async () => {
+    let now = 1_800_000_000_000
+    let storeCalls = 0
+    const service = new MetaStoreService({
+      dataDir: await temporaryDataDir(),
+      clock: () => now,
+      storeLookup: async () => {
+        storeCalls += 1
+        return {
+          title: 'Breachers',
+          sourceUrl: 'https://www.meta.com/',
+          trailerUrl: `https://video.oculuscdn.com/breachers.mp4?Expires=${Math.floor((now + 60_000) / 1000)}`
+        }
+      },
+      get: async () => {
+        throw new Error('unexpected YouTube request')
+      }
+    })
+
+    await service.getTrailerUrl('Breachers', 'com.store')
+    now += 60_001
+    await service.getTrailerUrl('Breachers', 'com.store')
+    expect(storeCalls).toBe(2)
+  })
+
+  it('refreshes signed media after expiry through the shared store provider cache', async () => {
+    let now = 1_800_000_000_000
+    let storeRequests = 0
+    const store = new StoreMetadataProvider({
+      clock: () => now,
+      identities: { 'com.test': { title: 'Breachers', metaIds: ['456'] } },
+      get: async () => {
+        storeRequests += 1
+        const trailer = `https://video.oculuscdn.com/breachers-${storeRequests}.mp4?Expires=${Math.floor((now + 60_000) / 1000)}`
+        return {
+          data: `<script type="application/ld+json">${JSON.stringify({
+            '@graph': [
+              {
+                '@type': 'ItemPage',
+                url: 'https://www.meta.com/experiences/456/',
+                mainEntity: { '@id': 'app-456' },
+                video: { '@id': trailer }
+              },
+              {
+                '@type': 'SoftwareApplication',
+                '@id': 'app-456',
+                name: 'Breachers',
+                sku: '456',
+                url: 'https://www.meta.com/experiences/456/',
+                availableOnDevice: ['Quest 3'],
+                description: 'A tactical virtual reality game for teams of competitive players.'
+              }
+            ]
+          })}</script>`
+        }
+      }
+    })
+    const service = new MetaStoreService({
+      dataDir: await temporaryDataDir(),
+      clock: () => now,
+      storeLookup: (name, language, packageName) => store.lookup(name, language, packageName),
+      get: async () => {
+        throw new Error('unexpected YouTube request')
+      }
+    })
+
+    await expect(service.getTrailerUrl('Breachers', 'com.test')).resolves.toContain(
+      'breachers-1.mp4'
+    )
+    now += 60_001
+    await expect(service.getTrailerUrl('Breachers', 'com.test')).resolves.toContain(
+      'breachers-2.mp4'
+    )
+    expect(storeRequests).toBe(2)
+  })
+
+  it('caches confident misses for 24 hours', async () => {
+    let now = 1_800_000_000_000
+    let requests = 0
+    const service = new MetaStoreService({
+      dataDir: await temporaryDataDir(),
+      clock: () => now,
+      storeLookup: async () => null,
+      get: async () => {
+        requests += 1
+        return { data: youtubeSearchPage() }
+      }
+    })
+
+    await service.getTrailerUrl('Unknown Game', 'com.unknown')
+    await service.getTrailerUrl('Unknown Game', 'com.unknown')
+    expect(requests).toBe(4)
+    now += 24 * 60 * 60_000 + 1
+    await service.getTrailerUrl('Unknown Game', 'com.unknown')
+    expect(requests).toBe(8)
+  })
+
+  it('retries after transport, malformed-response, and incomplete-store failures', async () => {
+    let attempt = 0
+    let storeCalls = 0
+    const service = new MetaStoreService({
+      dataDir: await temporaryDataDir(),
+      storeLookup: async () => {
+        storeCalls += 1
+        return attempt === 0
+          ? { title: 'Puzzleverse', sourceUrl: 'https://www.meta.com/', incomplete: true }
+          : null
+      },
+      get: async () => {
+        if (attempt === 0) return { data: '<html>consent page</html>' }
+        return { data: youtubeSearchPage('Puzzleverse - Official Trailer', 'puzzlevers1') }
+      }
+    })
+
+    await expect(service.getTrailerUrl('Puzzleverse', 'com.puzzleverse')).resolves.toBeNull()
+    attempt += 1
+    await expect(service.getTrailerUrl('Puzzleverse', 'com.puzzleverse')).resolves.toContain(
+      'puzzlevers1'
+    )
+    expect(storeCalls).toBe(2)
+  })
+
+  it('does not negative-cache a miss when the store and one search request fail', async () => {
+    let retry = false
+    let requests = 0
+    let storeCalls = 0
+    const service = new MetaStoreService({
+      dataDir: await temporaryDataDir(),
+      storeLookup: async () => {
+        storeCalls += 1
+        if (!retry) throw new Error('store temporarily unavailable')
+        return null
+      },
+      get: async () => {
+        requests += 1
+        if (!retry && requests === 1) throw new Error('YouTube temporarily unavailable')
+        return {
+          data: retry
+            ? youtubeSearchPage('Puzzleverse - Official Trailer', 'puzzlevers1')
+            : youtubeSearchPage()
+        }
+      }
+    })
+
+    await expect(service.getTrailerUrl('Puzzleverse', 'com.puzzleverse')).resolves.toBeNull()
+    retry = true
+    await expect(service.getTrailerUrl('Puzzleverse', 'com.puzzleverse')).resolves.toContain(
+      'puzzlevers1'
+    )
+    expect(storeCalls).toBe(2)
+    expect(requests).toBe(5)
+  })
+
+  it('deduplicates concurrent lookups and serializes atomic cache persistence', async () => {
+    const dataDir = await temporaryDataDir()
+    let requests = 0
+    const service = new MetaStoreService({
+      dataDir,
+      storeLookup: async () => null,
+      get: async (_url, config) => {
+        requests += 1
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        const game = String(config?.params?.search_query).startsWith('Breachers')
+          ? 'Breachers'
+          : 'RUMBLE'
+        return {
+          data: youtubeSearchPage(
+            `${game} - Official Trailer`,
+            game === 'Breachers' ? 'breachers01' : 'rumble00001'
+          )
+        }
+      }
+    })
+
+    await Promise.all([
+      service.getTrailerUrl('Breachers', 'com.breachers'),
+      service.getTrailerUrl('Breachers', 'com.breachers'),
+      service.getTrailerUrl('RUMBLE', 'com.rumble')
+    ])
+    expect(requests).toBe(2)
+    const persisted = JSON.parse(await readFile(join(dataDir, 'meta-trailer-cache.json'), 'utf8'))
+    expect(Object.values(persisted.entries)).toHaveLength(2)
+    await expect(readFile(join(dataDir, 'meta-trailer-cache.json.tmp'))).rejects.toThrow()
+  })
+  it('scans every game, pausing only after real lookups, and reports the misses', async () => {
+    const dataDir = await temporaryDataDir()
+    const service = new MetaStoreService({
+      dataDir,
+      storeLookup: async () => null,
+      get: async (_url, config) =>
+        String(config?.params?.search_query).startsWith('Breachers')
+          ? { data: youtubeSearchPage('Breachers - Official Trailer', 'breachers01') }
+          : { data: youtubeSearchPage() }
+    })
+    const pauses: number[] = []
+    const progress: number[] = []
+    const targets = [
+      { gameName: 'Breachers', packageName: 'com.breachers' },
+      { gameName: 'Breachers', packageName: 'com.breachers' },
+      { gameName: 'Nothing Here Game', packageName: 'com.nothing' }
+    ]
+    const summary = await service.scanTrailers(targets, {
+      delayMs: 5,
+      sleep: async (ms) => void pauses.push(ms),
+      onProgress: (p) => void progress.push(p.checked)
+    })
+    expect(summary).toMatchObject({ total: 2, checked: 2, found: 1, missing: 1, cancelled: false })
+    expect(summary.missingGames).toEqual([
+      { gameName: 'Nothing Here Game', packageName: 'com.nothing' }
+    ])
+    expect(pauses).toEqual([5, 5])
+    expect(progress).toEqual([1, 2])
+
+    // A second scan answers from the cache: no network, so no pauses.
+    pauses.length = 0
+    await service.scanTrailers(targets, { sleep: async (ms) => void pauses.push(ms) })
+    expect(pauses).toEqual([])
+
+    const reportPath = await service.writeScanReport(summary)
+    const report = JSON.parse(await readFile(reportPath!, 'utf8'))
+    expect(report.noTrailerFound).toEqual({ 'com.nothing': { gameName: 'Nothing Here Game' } })
+  })
+
+  it('stops a scan when cancelled', async () => {
+    const service = new MetaStoreService({
+      dataDir: await temporaryDataDir(),
+      storeLookup: async () => null,
+      get: async () => ({ data: youtubeSearchPage() })
+    })
+    let calls = 0
+    const summary = await service.scanTrailers(
+      [
+        { gameName: 'First Game', packageName: 'com.first' },
+        { gameName: 'Second Game', packageName: 'com.second' }
+      ],
+      { delayMs: 0, shouldCancel: () => calls++ >= 1 }
+    )
+    expect(summary).toMatchObject({ checked: 1, cancelled: true })
+  })
+
+  describe('remote overrides', () => {
+    const remoteService = async (
+      dataDir: string,
+      remote: unknown,
+      onGet?: () => void
+    ): Promise<MetaStoreService> =>
+      new MetaStoreService({
+        dataDir,
+        remoteOverridesUrl: 'https://example.test/trailer-overrides.json',
+        storeLookup: async () => null,
+        get: async (url) => {
+          onGet?.()
+          if (url === 'https://example.test/trailer-overrides.json') {
+            if (remote instanceof Error) throw remote
+            return { data: remote }
+          }
+          return { data: youtubeSearchPage('Auto - Official Trailer', 'auto0000001') }
+        }
+      })
+
+    it('applies downloaded fixes above automatic lookup and keeps them for offline launches', async () => {
+      const dataDir = await temporaryDataDir()
+      const service = await remoteService(dataDir, {
+        'com.fixed': 'https://www.youtube.com/watch?v=fixed000001',
+        'com.hidden': null,
+        'com.byid': { youtubeId: 'byid0000001' }
+      })
+
+      expect(await service.refreshRemoteOverrides()).toBe(true)
+      await expect(service.getTrailerUrl('Fixed', 'com.fixed')).resolves.toBe(
+        'https://www.youtube.com/watch?v=fixed000001'
+      )
+      await expect(service.getTrailerUrl('Hidden', 'com.hidden')).resolves.toBeNull()
+      await expect(service.getTrailerUrl('By Id', 'com.byid')).resolves.toBe(
+        'https://www.youtube.com/watch?v=byid0000001'
+      )
+
+      const offline = await remoteService(dataDir, new Error('offline'))
+      expect(await offline.refreshRemoteOverrides()).toBe(false)
+      await expect(offline.getTrailerUrl('Fixed', 'com.fixed')).resolves.toBe(
+        'https://www.youtube.com/watch?v=fixed000001'
+      )
+    })
+
+    it('drops downloaded entries that are not plain YouTube videos', async () => {
+      const service = await remoteService(await temporaryDataDir(), {
+        'com.http': 'http://media.lan/trailer.mp4',
+        'com.local': 'local-video://trailers/manual.mp4',
+        'com.other': 'https://evil.example/watch?v=fixed000001',
+        '../bad-key': 'https://www.youtube.com/watch?v=fixed000001',
+        'com.good': 'https://youtu.be/good0000001?t=5'
+      })
+
+      await service.refreshRemoteOverrides()
+      await expect(service.getTrailerUrl('Auto', 'com.http')).resolves.toBe(
+        'https://www.youtube.com/watch?v=auto0000001'
+      )
+      await expect(service.getTrailerUrl('Auto', 'com.local')).resolves.toBe(
+        'https://www.youtube.com/watch?v=auto0000001'
+      )
+      await expect(service.getTrailerUrl('Auto', 'com.other')).resolves.toBe(
+        'https://www.youtube.com/watch?v=auto0000001'
+      )
+      await expect(service.getTrailerUrl('Good', 'com.good')).resolves.toBe(
+        'https://www.youtube.com/watch?v=good0000001'
+      )
+    })
+
+    it('lets a local override beat a downloaded fix', async () => {
+      const dataDir = await temporaryDataDir()
+      await writeFile(
+        join(dataDir, 'trailer-overrides.json'),
+        JSON.stringify({ 'com.both': 'https://www.youtube.com/watch?v=local000001' })
+      )
+      const service = await remoteService(dataDir, {
+        'com.both': 'https://www.youtube.com/watch?v=remote00001'
+      })
+
+      await service.refreshRemoteOverrides()
+      await expect(service.getTrailerUrl('Both', 'com.both')).resolves.toBe(
+        'https://www.youtube.com/watch?v=local000001'
+      )
+    })
+
+    it('keeps the previous fixes when the download is not a JSON object', async () => {
+      const dataDir = await temporaryDataDir()
+      await (
+        await remoteService(dataDir, { 'com.fixed': 'https://youtu.be/fixed000001' })
+      ).refreshRemoteOverrides()
+
+      const service = await remoteService(dataDir, ['not', 'an', 'object'])
+      expect(await service.refreshRemoteOverrides()).toBe(false)
+      await expect(service.getTrailerUrl('Fixed', 'com.fixed')).resolves.toBe(
+        'https://www.youtube.com/watch?v=fixed000001'
+      )
+    })
+
+    it('does not download when remote overrides are disabled', async () => {
+      let requests = 0
+      const service = new MetaStoreService({
+        dataDir: await temporaryDataDir(),
+        remoteOverridesUrl: null,
+        storeLookup: async () => null,
+        get: async () => {
+          requests += 1
+          return { data: {} }
+        }
+      })
+
+      expect(await service.refreshRemoteOverrides()).toBe(false)
+      expect(requests).toBe(0)
+    })
+  })
+})

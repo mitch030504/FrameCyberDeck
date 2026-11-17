@@ -36,7 +36,9 @@ import {
   FramePortEngineStatus,
   VentureStatus,
   VentureGame,
-  VentureOpenFolderResult
+  VentureOpenFolderResult,
+  TrailerScanProgress,
+  TrailerScanResult
 } from './index'
 
 // Define types for all IPC channels between renderer and main
@@ -111,6 +113,13 @@ export interface IPCChannels {
   'games:get-last-sync-time': DefineChannel<[], Date | null>
   'games:force-sync-games': DefineChannel<[], GameInfo[]>
   'games:get-note': DefineChannel<[releaseName: string], string>
+  'games:get-trailer-url': DefineChannel<
+    [gameName: string, packageName: string | undefined],
+    string | null
+  >
+  'games:scan-trailers': DefineChannel<[], TrailerScanResult>
+  'games:cancel-trailer-scan': DefineChannel<[], void>
+  'games:reveal-trailer-report': DefineChannel<[], boolean>
   'games:get-description': DefineChannel<[request: GameDescriptionRequest], GameDescriptionResult>
   'games:prime-descriptions': DefineChannel<
     [requests: GameDescriptionRequest[]],
@@ -294,6 +303,7 @@ export interface IPCEvents {
   'games:download-progress': [progress: DownloadProgress]
   'games:background-sync-complete': [games: GameInfo[]]
   'games:background-sync-error': [error: string]
+  'games:trailer-scan-progress': [progress: TrailerScanProgress]
   'download:queue-updated': [queue: DownloadItem[]]
   'download:storage-status-changed': [status: DownloadStorageStatus]
   'upload:progress': [progress: UploadPreparationProgress]

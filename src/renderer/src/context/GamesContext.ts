@@ -23,6 +23,7 @@ export interface GamesContextType {
   refreshGames: () => Promise<void>
   loadGames: () => Promise<void>
   getNote: (releaseName: string) => Promise<string>
+  getTrailerUrl: (gameName: string, packageName: string | undefined) => Promise<string | null>
   isInitialLoadComplete: boolean
   getDescription: (request: GameDescriptionRequest) => Promise<GameDescriptionResult>
   descriptionSnapshot: GameDescriptionSnapshot

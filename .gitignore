@@ -10,6 +10,7 @@ out
 pkg/
 *.tsbuildinfo
 __pycache__/
+scripts/trailer-review-ignored.json
 
 AUR/src/
 AUR/pkg/

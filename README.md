@@ -50,6 +50,7 @@ Local sideloading, conversion, deployment, launch, uninstall, and room capture d
 | Quest-to-Frame conversion | **Validated with one engine-path title** | `auto` is the default. FramePort is used only after it is prepared; the built-in converter is the fallback. Compatibility is per title. |
 | FramePort recipes and shims | **Build-stage only** | 194 actionable recipes from 291 catalog entries. Recipes are configurations, not a guarantee. |
 | Mixed-reality room capture | **Validated** | Capture, status, and stop work. Captured rooms are not copied into MR titles. |
+| Trailer scan and overrides | **Restored from upstream v2.0.0** | **Settings → Find Missing Trailers**; third-party YouTube playback is confined to an allowlisted, sandboxed webview. |
 | Venture PC target | **Experimental** | Requires an external `venture-cli`; configure it in **Other Settings → Venture PC Target**. |
 | Meta owned-title sync and contributions | **Optional** | Requires a configured server and `upload.config`; not required for local use. |
 | Original-source provenance | **Implemented** | Managed installs record the original source; contribution packaging is local-only. |

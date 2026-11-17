@@ -413,9 +413,29 @@ export interface GamesAPI {
   forceSync: () => Promise<GameInfo[]>
   getNote: (releaseName: string) => Promise<string>
   getBlacklistGames: () => Promise<BlacklistEntry[]>
+  getTrailerUrl: (gameName: string, packageName: string | undefined) => Promise<string | null>
   addToBlacklist: (packageName: string, version?: number | 'any') => Promise<boolean>
   removeFromBlacklist: (packageName: string) => Promise<boolean>
   isGameBlacklisted: (packageName: string, version?: number) => boolean
+}
+
+export interface TrailerScanProgress {
+  checked: number
+  total: number
+  found: number
+  missing: number
+  /** Game being looked up right now. */
+  current: string
+}
+
+export interface TrailerScanResult {
+  total: number
+  checked: number
+  found: number
+  missing: number
+  cancelled: boolean
+  /** Where the full report (games with no trailer found) was written; null if writing failed. */
+  reportPath: string | null
 }
 
 export interface GameAPIRenderer extends Modify<
@@ -427,6 +447,11 @@ export interface GameAPIRenderer extends Modify<
   onDownloadProgress: (callback: (progress: DownloadProgress) => void) => () => void
   onBackgroundSyncComplete: (callback: (games: GameInfo[]) => void) => () => void
   onBackgroundSyncError: (callback: (error: string) => void) => () => void
+  /** Maintainer tool: look up a trailer for every game in the library (slow, throttled). */
+  scanTrailers: () => Promise<TrailerScanResult>
+  cancelTrailerScan: () => Promise<void>
+  revealTrailerReport: () => Promise<boolean>
+  onTrailerScanProgress: (callback: (progress: TrailerScanProgress) => void) => () => void
   getDescription: (request: GameDescriptionRequest) => Promise<GameDescriptionResult>
   primeDescriptions: (requests: GameDescriptionRequest[]) => Promise<GameDescriptionSnapshot>
 }

@@ -52,7 +52,9 @@ import type {
   FrameConversionEngine,
   FramePortEngineStatus,
   FrameRefreshRate,
-  VentureStatus
+  VentureStatus,
+  TrailerScanProgress,
+  TrailerScanResult
 } from '@shared/types'
 
 // Supported speed units with conversion factors to KB/s
@@ -454,6 +456,80 @@ const LogUploadSettings: React.FC = () => {
             'The log is uploaded to rentry.co as a public plain-text paste. Credentials and command lines are redacted, but review it before sharing — anyone with the short code (e.g. abc12345) can read rentry.co/abc12345.'
           }
         </Text>
+      </div>
+    </Card>
+  )
+}
+
+// ─── Trailer Scan ─────────────────────────────────────────────────────────────
+const TrailerScanSettings: React.FC = () => {
+  const styles = useStyles()
+  const [running, setRunning] = useState(false)
+  const [progress, setProgress] = useState<TrailerScanProgress | null>(null)
+  const [result, setResult] = useState<TrailerScanResult | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => window.api.games.onTrailerScanProgress(setProgress), [])
+
+  const start = async (): Promise<void> => {
+    setRunning(true)
+    setResult(null)
+    setProgress(null)
+    setError(null)
+    try {
+      setResult(await window.api.games.scanTrailers())
+    } catch (err) {
+      console.error('[TrailerScan] Scan failed:', err)
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  return (
+    <Card className={styles.card}>
+      <CardHeader description={<Subtitle1>{'Find missing trailers'}</Subtitle1>} />
+      <div className={styles.cardContent}>
+        <Text>
+          Looks up a trailer for every game in the library, one at a time (about 1–2 seconds each,
+          so a full scan takes a while). Games with no trailer found are saved to a report you can
+          copy entries from into data/trailer-overrides.json. You can keep using the app, and
+          cancelling keeps everything found so far.
+        </Text>
+        <div className={styles.formRow}>
+          <Button appearance="primary" onClick={start} disabled={running}>
+            {running ? <Spinner size="tiny" /> : 'Scan all games'}
+          </Button>
+          {running && (
+            <Button appearance="subtle" onClick={() => void window.api.games.cancelTrailerScan()}>
+              Cancel
+            </Button>
+          )}
+          {result?.reportPath && (
+            <Button
+              appearance="outline"
+              icon={<FolderOpenRegular />}
+              onClick={() => void window.api.games.revealTrailerReport()}
+            >
+              Show report
+            </Button>
+          )}
+        </div>
+        {running && progress && (
+          <Text>
+            {progress.checked}/{progress.total} checked · {progress.found} found ·{' '}
+            {progress.missing} missing — {progress.current}
+          </Text>
+        )}
+        {result && (
+          <Text>
+            {result.cancelled ? 'Cancelled. ' : 'Done. '}
+            {result.checked}/{result.total} checked, {result.found} with a trailer, {result.missing}{' '}
+            without.
+            {result.reportPath ? '' : ' (The report file could not be written.)'}
+          </Text>
+        )}
+        {error && <Text className={styles.error}>{error}</Text>}
       </div>
     </Card>
   )
@@ -2354,6 +2430,7 @@ const Settings: React.FC<SettingsProps> = ({ initialSection }) => {
     blacklist: false,
     content: false,
     matrixId: false,
+    trailerScan: false,
     resetData: false
   })
   const toggleSection = useCallback(
@@ -3049,6 +3126,16 @@ const Settings: React.FC<SettingsProps> = ({ initialSection }) => {
             onToggle={toggleSection}
           />
           {openSections.matrixId && <MatrixIdentitySettings />}
+        </div>
+
+        <div>
+          <SectionHeader
+            label="// FIND MISSING TRAILERS"
+            sectionKey="trailerScan"
+            openSections={openSections}
+            onToggle={toggleSection}
+          />
+          {openSections.trailerScan && <TrailerScanSettings />}
         </div>
 
         <div>

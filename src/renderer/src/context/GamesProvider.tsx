@@ -456,6 +456,13 @@ export const GamesProvider: React.FC<GamesProviderProps> = ({ children }) => {
     return await window.api.games.getNote(releaseName)
   }, [])
 
+  const getTrailerUrl = useCallback(
+    async (gameName: string, packageName: string | undefined): Promise<string | null> => {
+      return await window.api.games.getTrailerUrl(gameName, packageName)
+    },
+    []
+  )
+
   const value = useMemo(
     () => ({
       games,
@@ -470,6 +477,7 @@ export const GamesProvider: React.FC<GamesProviderProps> = ({ children }) => {
       refreshGames,
       loadGames,
       getNote,
+      getTrailerUrl,
       isInitialLoadComplete,
       outdatedGames,
       missingGames,
@@ -495,6 +503,7 @@ export const GamesProvider: React.FC<GamesProviderProps> = ({ children }) => {
       refreshGames,
       loadGames,
       getNote,
+      getTrailerUrl,
       isInitialLoadComplete,
       outdatedGames,
       missingGames,

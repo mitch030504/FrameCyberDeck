@@ -34,6 +34,8 @@ below.
 | 19. Resume concurrency            | Resume requests use the scheduler and its limits. Active pipelines, duplicate requests, statuses, and late progress from cancelled processes are guarded.                                                                        |
 | 20. Disabled trailers             | Removed the trailer override/report services, exclusive tests, UI, IPC, webview types, and YouTube session overrides. Shared description metadata remains in use. Trailer metadata lookup is separate and was not fully removed. |
 
+> **Update (2026-11-17):** the fork merged upstream v2.0.0, which restores the trailer scan/override services and the third-party trailer player. The player is confined to a dedicated YouTube session and an allowlisted, sandboxed webview; item 20 above is superseded.
+
 At the audit date, the stale pnpm lockfile had been removed; npm and
 `package-lock.json` defined the build, including CI. The README then documented
 the conversion prerequisites and SSH behavior that existed at that time. For
