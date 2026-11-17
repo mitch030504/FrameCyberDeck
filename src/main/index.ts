@@ -726,16 +726,13 @@ app.whenReady().then(async () => {
   let trailerScanCancel = false
   let trailerScanRunning = false
   typedIpcMain.handle('games:scan-trailers', async () => {
-    console.log('[TrailerScan] Scan requested')
     if (trailerScanRunning) {
-      console.log('[TrailerScan] Already running; ignoring request')
       return { total: 0, checked: 0, found: 0, missing: 0, cancelled: false, reportPath: null }
     }
     trailerScanRunning = true
     trailerScanCancel = false
     try {
       const games = await gameService.getGames()
-      console.log(`[TrailerScan] Scanning ${games.length} games`)
       const summary = await metaStoreService.scanTrailers(
         games.map((g) => ({ gameName: g.name, packageName: g.packageName })),
         {
