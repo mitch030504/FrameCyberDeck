@@ -178,6 +178,20 @@ function createWindow(): void {
     callback({ responseHeaders: headers })
   })
 
+  // Trailer playback is embedded as a top-level guest. Restrict both the
+  // initial attach and any in-guest navigation to YouTube-owned hosts.
+  const isAllowedTrailerHost = (hostname: string): boolean => {
+    const host = hostname.toLowerCase()
+    return (
+      host === 'youtube.com' ||
+      host.endsWith('.youtube.com') ||
+      host === 'youtube-nocookie.com' ||
+      host.endsWith('.youtube-nocookie.com') ||
+      host === 'youtu.be' ||
+      host.endsWith('.youtu.be')
+    )
+  }
+
   mainWindow.webContents.on('will-attach-webview', (event, webPreferences, params) => {
     delete webPreferences.preload
     webPreferences.nodeIntegration = false
@@ -185,17 +199,8 @@ function createWindow(): void {
     webPreferences.sandbox = true
     webPreferences.webSecurity = true
     try {
-      const host = new URL(params.src).hostname
-      const allowed = [
-        'youtube.com',
-        'www.youtube.com',
-        'm.youtube.com',
-        'youtube-nocookie.com',
-        'www.youtube-nocookie.com',
-        'youtu.be',
-        'www.youtu.be'
-      ]
-      if (!allowed.includes(host)) event.preventDefault()
+      const src = new URL(params.src)
+      if (src.protocol !== 'https:' || !isAllowedTrailerHost(src.hostname)) event.preventDefault()
     } catch {
       event.preventDefault()
     }
@@ -205,7 +210,8 @@ function createWindow(): void {
     contents.setWindowOpenHandler(() => ({ action: 'deny' }))
     contents.on('will-navigate', (event, target) => {
       try {
-        if (new URL(target).protocol !== 'https:') event.preventDefault()
+        const url = new URL(target)
+        if (url.protocol !== 'https:' || !isAllowedTrailerHost(url.hostname)) event.preventDefault()
       } catch {
         event.preventDefault()
       }

@@ -129,7 +129,9 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
         })
       | null
     if (!wv) return
-    void wv.insertCSS(`
+    void wv
+      .insertCSS(
+        `
       #masthead-container, #top-row, #bottom-row,
       ytd-watch-metadata, #related, #comments,
       #secondary, #below, ytd-masthead,
@@ -163,11 +165,21 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
         max-height: 100vh !important;
       }
       .html5-video-container { width: 100% !important; height: 100% !important; }
-    `)
-    void wv.executeJavaScript(`
-      const v = document.querySelector('video');
-      if (v && v.paused) v.play();
-    `)
+    `
+      )
+      .catch(() => {
+        /* guest navigated away or is not ready yet */
+      })
+    void wv
+      .executeJavaScript(
+        `
+        const v = document.querySelector('video');
+        if (v && v.paused) v.play();
+      `
+      )
+      .catch(() => {
+        /* autoplay is best-effort; the player controls still work */
+      })
   }, [])
 
   useEffect(() => {
