@@ -23,8 +23,8 @@ It is not affiliated with or endorsed by Valve, Meta, FramePort, Venture, or the
 
 | Item | Value |
 | --- | --- |
-| Release | **0.2.0**, first public release (2026-11-14) |
-| Upstream base | VR CyberDeck 1.9.0 |
+| Release | **0.3.0** (2026-11-17); 0.2.0 was the first public release (2026-11-14) |
+| Upstream base | VR CyberDeck 2.0.0 (`8bf949c`) |
 | Conversion engine | Vendored FramePort 1.4.1, pin `72c71fbbd303886992ab62cbc1aea6287100f935` |
 | Validated host | **Linux x64** |
 | Other packages | Windows x64 and macOS x64/arm64 are built but **experimental and unverified** |
@@ -153,7 +153,7 @@ See [docs/CATALOG.md](docs/CATALOG.md) and [docs/security/catalog-credentials.md
 ## Troubleshooting, limitations, and verification
 
 - [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md) — platform, engine, room, Venture, catalog, and packaging limits.
-- [docs/VERIFICATION.md](docs/VERIFICATION.md) — what was tested for 0.2.0, with dates and evidence.
+- [docs/VERIFICATION.md](docs/VERIFICATION.md) — what was tested for 0.3.0, with dates and evidence.
 - Troubleshooting is covered in [docs/INSTALL.md](docs/INSTALL.md) and [docs/CONVERSION.md](docs/CONVERSION.md).
 
 ## Build from source

@@ -1,6 +1,6 @@
 # Known limitations
 
-These are the limits of the 0.2.0 release. They are deliberate scope boundaries,
+These are the limits of the 0.3.0 release. They are deliberate scope boundaries,
 not a promise that a later release will remove them.
 
 ## Platforms
@@ -69,7 +69,21 @@ not a promise that a later release will remove them.
 - **On-device and environmental.** The app does not preview or edit the mesh.
   Lighting, reflective surfaces, and movement can cause an incomplete scan.
 - **One path validated.** Other Frame builds and rooms were not part of the
-  0.2.0 evidence.
+  carried-over 0.2.0 evidence.
+
+## Trailers
+
+- **Network required.** Trailer lookup and playback use YouTube. A fresh trailer
+  session may show Google's consent screen once; the choice is stored in the
+  dedicated YouTube session.
+- **Sandboxed playback only.** Trailer guests are limited to YouTube-owned HTTPS
+  hosts, with no Node integration, no preload, context isolation, and popups
+  denied. The app does not provide a general-purpose web browser.
+- **Metadata can miss.** A title may have no trailer in the store metadata or
+  overrides. The **Find Missing Trailers** scan reports those titles and writes
+  a local report; it does not invent a trailer.
+- **Scan cost.** Scanning the whole library makes one lookup per title and can
+  take several minutes. It can be cancelled, and the partial result is reported.
 
 ## Venture
 

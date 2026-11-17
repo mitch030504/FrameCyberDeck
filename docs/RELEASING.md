@@ -5,11 +5,12 @@ repository, CI, and release workflow are under the project's control.
 
 ## Version policy
 
-- Frame CyberDeck uses its own `0.x` line. **0.2.0** is the first public release.
+- Frame CyberDeck uses its own `0.x` line. **0.3.0** is the current release;
+  **0.2.0** was the first public release.
 - 0.1.0 was a development/AUR build and was never published on GitHub.
-- Do not reuse upstream VR CyberDeck `1.9.x` versions. Those tags belong to the
-  upstream project and are present in this repository's history.
-- Patch releases use `0.2.x`; additive or compatibility-changing releases use a
+- Do not reuse upstream VR CyberDeck `1.9.x` or `2.0.0` versions. Those tags
+  belong to the upstream project and are present in this repository's history.
+- Patch releases use `0.3.x`; additive or compatibility-changing releases use a
   new minor version.
 - The release workflow uses the version input as `v$VERSION`, the app version,
   and the release title.
@@ -46,7 +47,7 @@ npm run build
 Also require:
 
 - CI green on the release commit.
-- `package.json` and `package-lock.json` agree at 0.2.0.
+- `package.json` and `package-lock.json` agree at 0.3.0.
 - No AUR build debris, `vendor/**/__pycache__`, or untracked build output in the
   release commit.
 - `LICENSE` is GPL-3.0-only and matches `package.json`, the README, the AUR
@@ -63,7 +64,7 @@ Also require:
 
 ## Build and draft release
 
-1. Dispatch the **Create Release** workflow with version `0.2.0`.
+1. Dispatch the **Create Release** workflow with version `0.3.0`.
 2. The workflow bumps `package.json`/`package-lock.json` if needed, commits and
    pushes the bump, and builds the matrix.
 3. The matrix builds Linux x64/arm64, macOS x64/arm64 DMGs from the macOS
@@ -75,8 +76,8 @@ Also require:
 6. Inspect the draft before publishing:
    - Every expected asset is present.
    - `SHA256SUMS` matches the uploaded files.
-   - The title is `Release v0.2.0 — BUILT_ON_FRAMEPORT`.
-   - The release body is the 0.2.0 copy, not an older upstream changelog.
+   - The title is `Frame CyberDeck v0.3.0 — TRAILERS_AND_VENTURE`.
+   - The release body is the 0.3.0 copy, not an older upstream changelog.
    - Windows/macOS assets are labeled experimental and unverified.
    - The Linux x64 asset is labeled validated.
 
@@ -101,7 +102,7 @@ publication blocker for the Linux-validated release.
 - Verify the release page assets and `SHA256SUMS` from a clean browser session.
 - Verify the tag points at the built commit.
 - Update the AUR package **after** the GitHub release asset exists:
-  1. Set `pkgver=0.2.0` and the correct AppImage SHA-256.
+  1. Set `pkgver=0.3.0` and the correct AppImage SHA-256.
   2. Regenerate metadata with `makepkg --printsrcinfo > .SRCINFO`.
   3. Build and install the package locally.
   4. Push the PKGBUILD and regenerated `.SRCINFO` to AUR.
@@ -116,7 +117,7 @@ or version changes, update both `PKGBUILD` and `.SRCINFO`; a stale `.SRCINFO` is
 rejected by AUR tooling.
 
 The source tree currently carries the AUR packaging files but not the release
-asset. Verify the `PKGBUILD` checksum against the final 0.2.0 asset and
+asset. Verify the `PKGBUILD` checksum against the final 0.3.0 asset and
 regenerate `.SRCINFO` before publishing.
 
 ## Rollback
@@ -124,7 +125,7 @@ regenerate `.SRCINFO` before publishing.
 - **Draft, not published:** delete the draft release and tag if the build is
   wrong; fix and rebuild.
 - **Published:** do not overwrite the release or move the tag. Publish a patch
-  release (`0.2.1`) with the fix, mark the broken release clearly, and update
+  release (`0.3.1`) with the fix, mark the broken release clearly, and update
   the AUR package with a higher `pkgrel`/`pkgver`.
 - **AUR only:** bump `pkgrel` for a packaging-only fix; bump `pkgver` for a new
   upstream release.
@@ -137,7 +138,7 @@ regenerate `.SRCINFO` before publishing.
 `.github/release-name.txt` contains one line:
 
 ```text
-BUILT_ON_FRAMEPORT
+TRAILERS_AND_VENTURE
 ```
 
 `.github/release-changelog.md` contains the release-specific body. The release

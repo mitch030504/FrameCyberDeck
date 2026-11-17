@@ -4,6 +4,92 @@ All notable changes to Frame CyberDeck are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions use
 semantic versioning for this fork.
 
+## [0.3.0] — 2026-11-17
+
+This release completes the Venture PC target, syncs the fork to upstream VR
+CyberDeck 2.0.0 (`8bf949c`), and restores trailer lookup, playback, scanning, and
+reporting. The main window keeps the fork's hardened Electron settings.
+
+### Added
+
+- First-class Venture PC target: a synthetic `PC · Venture` device with a setup
+  card, persisted CLI path, real `ventureId` propagation, and Play and uninstall
+  actions from details and the context menu.
+- Venture 0.2.5 CLI support, including numeric-string `versionCode` values.
+- Trailer lookup and playback from game details in a collapsible drawer, with a
+  report link that pre-fills the upstream issue form.
+- In-app **Find Missing Trailers** scan for the whole library with live progress,
+  cancel, a written report, and a maintainer review script.
+- Trailer override registry: bundled overrides, background refreshes from the
+  upstream data file, and candidate matching for store metadata.
+- Trailer report workflow for `[Trailer]` issues, with validated package names
+  and YouTube video IDs before anything is written to `data/trailer-reports.json`.
+- Upstream ADB push-error diagnostics in backup restore logs.
+
+### Changed
+
+- Synced to upstream VR CyberDeck 2.0.0 (`8bf949c`): trailer service, metadata
+  candidates, override data, scripts, and Settings UI.
+- Backups now reject all-empty captures and force-stop the game before a restore.
+- Venture import wording, launcher warnings, and hidden ADB/OBB controls now
+  reflect a PC target rather than a headset.
+- The release package remains `frame-cyberdeck` on the fork's `0.x` line;
+  upstream package names and versions are not adopted.
+
+### Fixed
+
+- Venture IDs that contain `:` import and play correctly.
+- Venture CLI 0.2.5 string `versionCode` values no longer break library parsing.
+- Trailer scan failures now surface in Settings instead of failing silently.
+- Restored trailer playback no longer raises unhandled rejections when the guest
+  page is not ready or navigates.
+- `.gitignore` now separates `*.tsbuildinfo` and the trailer review ignore file;
+  generated `tsconfig.node.tsbuildinfo` is not tracked.
+
+### Security
+
+- Trailer playback runs in a dedicated YouTube session as a sandboxed webview:
+  no Node, no preload, context isolation on, and web security on.
+- Guest attach and navigation are restricted to YouTube-owned HTTPS hosts, and
+  popups are denied. The parent window remains `sandbox: true` with context
+  isolation and no Node integration.
+- Renderer `frame-src` allows only the YouTube hosts required for trailers.
+- Upstream's `sandbox: false` and `webSecurity: false` were deliberately not
+  adopted.
+- Trailer reports are parsed, length-limited, and stored as JSON; package names
+  and YouTube IDs are validated before a report is accepted.
+
+### Upgrade
+
+- From 0.2.0: settings, downloads, backups, and converted titles carry over. No
+  migration is required. Set the Venture CLI path in Settings or
+  `VENTURE_CLI_PATH` to enable the PC target.
+- From 0.1.0 or upstream 1.9.x: see the 0.2.0 notes; this remains a separate
+  application and version line.
+
+### Verified
+
+- 183 Vitest tests, 71 Node tests (1 skipped), and 46 Python tests; typecheck,
+  lint, `check:frameport`, and the production build pass.
+- Venture GUI against a real 0.2.5 CLI and library: status, library listing,
+  import wording, and Play wiring. A real launch or uninstall was not performed.
+- Trailer lookup, drawer page load, scan/progress/cancel/report, and webview host
+  enforcement under Xvfb. Actual video decode was not confirmed in that
+  environment.
+- Linux x64 remains the validated host from 0.2.0. Windows and macOS packages
+  are built but unverified. See [docs/VERIFICATION.md](docs/VERIFICATION.md).
+
+### Known limitations
+
+- Trailer playback needs network access. A fresh YouTube session may show
+  Google's consent screen once; the choice is stored in the dedicated session.
+- Venture remains experimental and requires an external CLI. Close the Venture
+  launcher before importing.
+- Windows and macOS packages remain experimental and unverified.
+
+See [docs/VERIFICATION.md](docs/VERIFICATION.md) for the evidence matrix and
+what was not tested.
+
 ## [0.2.0] — 2026-11-14
 
 The first public release. 0.1.0 was a development/AUR build and was never

@@ -44,7 +44,7 @@ Do not commit the credential. A fork needs its own developer application and
 credentials; do not publish a build containing someone else's.
 
 Legacy source builds may still use `VRSRC_API_KEY` for a static key. That path is
-not used by 0.2.0 release builds and is not a fallback for dynamic builds.
+not used by 0.3.0 release builds and is not a fallback for dynamic builds.
 
 ## Key lifecycle
 

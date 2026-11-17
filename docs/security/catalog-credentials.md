@@ -1,6 +1,6 @@
 # Catalog credentials and short-lived keys
 
-Status: implemented in 0.2.0. This document describes the shipped release
+Status: implemented in 0.2.0 and unchanged in 0.3.0. This document describes the shipped release
 behavior and the operator runbook. It does not describe a future proposal.
 
 ## What ships in a release build
@@ -23,7 +23,7 @@ Release builds require the dynamic exchange. They fail if a static
 key after a failed mint.
 
 Legacy source builds can still use a static `VRSRC_API_KEY` for local
-development. That path is not part of 0.2.0 release builds.
+development. That path is not part of 0.3.0 release builds.
 
 ## Key exchange
 

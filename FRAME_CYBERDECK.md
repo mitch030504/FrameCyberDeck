@@ -1,11 +1,13 @@
 # Frame CyberDeck implementation notes
 
-These notes describe how the 0.2.0 Frame path is implemented. They are for
+These notes describe how the 0.3.0 Frame path is implemented. They are for
 contributors and maintainers; user-facing instructions live in
 [docs/INSTALL.md](docs/INSTALL.md) and [docs/CONVERSION.md](docs/CONVERSION.md).
 
 ## Status and scope
 
+- 0.3.0, Venture PC target and restored trailers on top of the upstream 2.0.0
+  sync.
 - 0.2.0, first public release.
 - Linux x64 is the validated host. Windows x64 and macOS x64/arm64 are built but
   unverified.
@@ -214,7 +216,7 @@ Meta sync is optional and depends on a configured server/catalog and
 - `tests/protocol_smoke.cjs` — manual `npx electron tests/protocol_smoke.cjs`
   check for the `local-file` protocol.
 
-The 0.2.0 evidence counts are in [docs/VERIFICATION.md](docs/VERIFICATION.md).
+The 0.3.0 evidence counts are in [docs/VERIFICATION.md](docs/VERIFICATION.md).
 
 ## Development overrides
 

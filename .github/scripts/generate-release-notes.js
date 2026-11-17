@@ -25,7 +25,7 @@ DeliciousMeatPop, focused on Valve's Steam Frame. It is not an official VR
 CyberDeck release and is not affiliated with or endorsed by Valve, Meta,
 FramePort, Venture, or the VR CyberDeck maintainer.
 
-0.2.0 is the first public release. 0.1.0 was a development/AUR build and was
+0.2.0 was the first public release. 0.1.0 was a development/AUR build and was
 never published on GitHub.
 
 ---
@@ -77,17 +77,22 @@ chmod +x frame-cyberdeck-${v}-x86_64.AppImage
 - **Built-in fallback converter:** Python 3, JDK 21+, and Android SDK
   build-tools with \`aapt\`, \`zipalign\` and \`apksigner\`.
 - **Venture PC target (experimental):** an existing \`venture-cli\` install.
-  Frame CyberDeck does not install Venture or sign in to Meta for it.
+  Frame CyberDeck does not install Venture or sign in to Meta for it. If the
+  CLI is not on \`PATH\`, set its path in **Other Settings → Venture PC Target**.
 
 ---
 
 ## \`// UPGRADE NOTES\`
 
+- From a 0.2.0 release: settings, downloads, backups, and converted titles carry
+  over. No migration is required. Set the Venture CLI path if it is not on
+  \`PATH\`.
 - From a 0.1.0 development/AUR install: settings and downloads carry over.
   Existing converted titles are not rebuilt; redeploy from the original source
   to pick up the new per-game launcher.
-- From upstream VR CyberDeck 1.9.x: this is a separate application and version
-  line. It installs side by side; settings and library state do not migrate.
+- From upstream VR CyberDeck 1.9.x or 2.0.0: this is a separate application and
+  version line. It installs side by side; settings and library state do not
+  migrate.
 - Run **Prepare FramePort engine** before the first engine conversion. Until
   then \`auto\` uses the built-in converter.
 
@@ -107,6 +112,9 @@ chmod +x frame-cyberdeck-${v}-x86_64.AppImage
   copied into individual MR titles.
 - Venture support is experimental and requires an external CLI. Close the
   Venture launcher before importing.
+- Trailer playback needs network access. A fresh YouTube session may show
+  Google's consent screen once; the choice is stored in the dedicated session.
+  Actual video decode was not validated in the release test environment.
 - The build credential is obfuscated, not secret: it can be recovered from any
   shipped build. Revocation is server-side. Local sideloading and Frame
   management work without catalog credentials.

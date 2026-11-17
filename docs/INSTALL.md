@@ -1,21 +1,21 @@
 # Install, upgrade, and uninstall
 
-Frame CyberDeck 0.2.0 is the first public release. Linux x64 is the validated
-host. Windows x64 and macOS x64/arm64 packages are built, but experimental and
-unverified in this release.
+Frame CyberDeck 0.3.0 is the current release. 0.2.0 was the first public release.
+Linux x64 is the validated host. Windows x64 and macOS x64/arm64 packages are
+built, but experimental and unverified in this release.
 
 ## Release assets
 
 | Asset | Platform | Status |
 | --- | --- | --- |
-| `frame-cyberdeck-0.2.0-x86_64.AppImage` | Linux x64 | **Validated** |
-| `frame-cyberdeck-0.2.0-amd64.deb` | Debian/Ubuntu x64 | **Validated** |
-| `frame-cyberdeck-0.2.0-arm64.AppImage` | Linux arm64 | Built, unverified |
-| `frame-cyberdeck-0.2.0-arm64.deb` | Debian/Ubuntu arm64 | Built, unverified |
-| `frame-cyberdeck-0.2.0-x64.dmg` | macOS Intel | Experimental, unverified |
-| `frame-cyberdeck-0.2.0-arm64.dmg` | macOS Apple silicon | Experimental, unverified |
-| `frame-cyberdeck-0.2.0-setup-x64.exe` | Windows x64 installer | Experimental, unverified |
-| `frame-cyberdeck-0.2.0-portable-x64.exe` | Windows x64 portable | Experimental, unverified |
+| `frame-cyberdeck-0.3.0-x86_64.AppImage` | Linux x64 | **Validated** |
+| `frame-cyberdeck-0.3.0-amd64.deb` | Debian/Ubuntu x64 | **Validated** |
+| `frame-cyberdeck-0.3.0-arm64.AppImage` | Linux arm64 | Built, unverified |
+| `frame-cyberdeck-0.3.0-arm64.deb` | Debian/Ubuntu arm64 | Built, unverified |
+| `frame-cyberdeck-0.3.0-x64.dmg` | macOS Intel | Experimental, unverified |
+| `frame-cyberdeck-0.3.0-arm64.dmg` | macOS Apple silicon | Experimental, unverified |
+| `frame-cyberdeck-0.3.0-setup-x64.exe` | Windows x64 installer | Experimental, unverified |
+| `frame-cyberdeck-0.3.0-portable-x64.exe` | Windows x64 portable | Experimental, unverified |
 
 `SHA256SUMS` is attached to the release. Verify downloads before running them.
 Windows `ia32` is not shipped; the FramePort engine does not support it.
@@ -69,12 +69,19 @@ The original source APK is never overwritten.
 
 ## Upgrade
 
+### From 0.2.0
+
+Settings, downloads, save backups, and converted titles carry over; no migration
+is required. Set the Venture CLI path in **Other Settings → Venture PC Target**
+or with `VENTURE_CLI_PATH` to enable the PC target. Trailer playback and the
+**Find Missing Trailers** scan are available immediately.
+
 ### From the 0.1.0 development/AUR build
 
 0.1.0 was never published on GitHub. If you installed it from AUR or built it
 locally:
 
-1. Install the 0.2.0 package after the AUR package is updated.
+1. Install the 0.3.0 package after the AUR package is updated.
 2. Your settings, downloads, save backups, and logs remain in `userData`.
 3. Existing converted titles are **not** rebuilt. Redeploy from the original
    source if you want the new per-game launcher and current conversion output.
@@ -89,7 +96,7 @@ Frame CyberDeck is a separate application and version line. It installs side by
 side with upstream VR CyberDeck; settings, downloads, and library state do not
 migrate. Keep the upstream installation if you still need it.
 
-### From a 0.2.0 development build
+### From a pre-release 0.2.0 build
 
 If you built 0.2.0 locally before the public release, reinstall the final
 package. Settings are compatible. Re-run **Prepare FramePort engine** only if
@@ -176,14 +183,14 @@ Security → Open Anyway**. macOS 12 Monterey or newer is required.
 AppImage:
 
 ```sh
-chmod +x frame-cyberdeck-0.2.0-x86_64.AppImage
-./frame-cyberdeck-0.2.0-x86_64.AppImage
+chmod +x frame-cyberdeck-0.3.0-x86_64.AppImage
+./frame-cyberdeck-0.3.0-x86_64.AppImage
 ```
 
 Debian/Ubuntu:
 
 ```sh
-sudo apt install ./frame-cyberdeck-0.2.0-amd64.deb
+sudo apt install ./frame-cyberdeck-0.3.0-amd64.deb
 ```
 
 AppImage sandboxing and missing FUSE are distribution-specific; use the `.deb`

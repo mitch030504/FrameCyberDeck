@@ -105,8 +105,8 @@ provide.
 
 ## Limitations
 
-- **Experimental.** Venture paths were not part of the validated 0.2.0 host
-  matrix; Linux x64 is the only validated host overall.
+- **Experimental.** Venture paths were not part of the validated host matrix;
+  Linux x64 is the only validated host overall.
 - **External dependency.** A missing or incompatible `venture-cli` disables the
   target. The target list keeps a setup card visible so the CLI can be
   configured in Settings; check the path and the CLI's own status output.
