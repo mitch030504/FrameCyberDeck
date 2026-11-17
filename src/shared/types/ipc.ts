@@ -35,7 +35,8 @@ import {
   FrameConversionSettings,
   FramePortEngineStatus,
   VentureStatus,
-  VentureGame
+  VentureGame,
+  VentureOpenFolderResult
 } from './index'
 
 // Define types for all IPC channels between renderer and main
@@ -91,12 +92,15 @@ export interface IPCChannels {
   'frame:agent-info': DefineChannel<[host?: string], Record<string, unknown>>
 
   // PC target backed by Venture (a Meta Quest emulator for PC VR)
-  'venture:status': DefineChannel<[], VentureStatus>
+  'venture:status': DefineChannel<[force?: boolean], VentureStatus>
   'venture:list-games': DefineChannel<[], VentureGame[]>
   'venture:list-installed': DefineChannel<[], PackageInfo[]>
   'venture:import': DefineChannel<[folder: string], string[]>
   'venture:play': DefineChannel<[gameId: string], boolean>
   'venture:uninstall': DefineChannel<[gameId: string], boolean>
+  'venture:get-cli-path': DefineChannel<[], string>
+  'venture:set-cli-path': DefineChannel<[path: string | null], VentureStatus>
+  'venture:open-library-folder': DefineChannel<[], VentureOpenFolderResult>
 
   // Game related channels
   'games:get-games': DefineChannel<[], GameInfo[]>
@@ -219,6 +223,7 @@ export interface IPCChannels {
     [options?: { filters?: { name: string; extensions: string[] }[] }],
     string | null
   >
+  'dialog:show-venture-cli-picker': DefineChannel<[], string | null>
   'dialog:show-manual-install-picker': DefineChannel<[], string | null>
   'dialog:show-apk-file-picker': DefineChannel<[], string | null>
   'dialog:show-folder-picker': DefineChannel<[], string | null>

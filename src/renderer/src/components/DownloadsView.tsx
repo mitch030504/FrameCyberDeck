@@ -38,6 +38,7 @@ import {
   getSkipUninstallWarning,
   setSkipUninstallWarning
 } from '../hooks/useExtrasSettings'
+import { getTargetCapabilities, getTargetGameId } from '../utils/targetCapabilities'
 import ErrorDetailDialog, { ErrorPhase } from './ErrorDetailDialog'
 import UninstallWarningDialog from './UninstallWarningDialog'
 import { localFileUrl } from '../utils/localFileUrl'
@@ -126,8 +127,9 @@ const DownloadsView: React.FC<DownloadsViewProps> = ({ onClose }) => {
     pauseDownload,
     resumeDownload
   } = useDownload()
-  const { selectedDevice, isConnected, loadPackages } = useAdb()
+  const { selectedDevice, selectedDeviceDetails, isConnected, loadPackages } = useAdb()
   const { games } = useGames()
+  const targetCaps = getTargetCapabilities(selectedDeviceDetails)
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [_, setDialogGame] = useGameDialog()
   const [confirmPending, setConfirmPending] = useState<string | null>(null)
@@ -151,11 +153,30 @@ const DownloadsView: React.FC<DownloadsViewProps> = ({ onClose }) => {
     }
   }
 
-  const handleInstallFromCompleted = (releaseName: string): void => {
+  const handleInstallFromCompleted = async (releaseName: string): Promise<void> => {
     if (!releaseName || !selectedDevice) {
       console.error('Missing releaseName or selectedDevice for install from completed action')
       window.alert('Cannot start installation: Missing required information.')
       return
+    }
+    if (targetCaps.isVenture) {
+      try {
+        const status = await window.api.venture.status(true)
+        if (!status.available) {
+          window.alert(
+            status.error || 'Venture CLI is not available. Check the PC target settings.'
+          )
+          return
+        }
+        if (status.launcherOpen) {
+          window.alert('Close the Venture launcher before importing a game, then try again.')
+          return
+        }
+      } catch (err) {
+        console.error('Venture readiness check failed:', err)
+        window.alert('Could not reach the Venture CLI. Check the PC target settings.')
+        return
+      }
     }
     console.log(`Requesting install from completed for ${releaseName} on ${selectedDevice}`)
     window.api.downloads.installFromCompleted(releaseName, selectedDevice).catch((err) => {
@@ -171,9 +192,10 @@ const DownloadsView: React.FC<DownloadsViewProps> = ({ onClose }) => {
       return
     }
 
-    console.log(`Uninstalling ${game.packageName} from ${selectedDevice}`)
+    const uninstallId = getTargetGameId(game)
+    console.log(`Uninstalling ${uninstallId} from ${selectedDevice}`)
     try {
-      const success = await window.api.adb.uninstallPackage(selectedDevice, game.packageName)
+      const success = await window.api.adb.uninstallPackage(selectedDevice, uninstallId)
       if (success) {
         console.log('Uninstall successful')
         await loadPackages()
@@ -438,7 +460,11 @@ const DownloadsView: React.FC<DownloadsViewProps> = ({ onClose }) => {
                       />
                     )}
                     <Text className={styles.statusText}>
-                      {(item.progress || 0) < 50 ? 'Installing APK...' : 'Copying OBB...'}
+                      {targetCaps.isVenture
+                        ? 'Importing into Venture...'
+                        : (item.progress || 0) < 50
+                          ? 'Installing APK...'
+                          : 'Copying OBB...'}
                     </Text>
                   </>
                 )}
@@ -530,16 +556,18 @@ const DownloadsView: React.FC<DownloadsViewProps> = ({ onClose }) => {
                   !sideloadingDisabled && (
                     <Button
                       icon={<DownloadInstallIcon />}
-                      aria-label="Install game"
+                      aria-label={targetCaps.isVenture ? 'Import into Venture' : 'Install game'}
                       size="small"
                       appearance="primary"
-                      onClick={() => handleInstallFromCompleted(item.releaseName)}
+                      onClick={() => void handleInstallFromCompleted(item.releaseName)}
                       disabled={!isConnected || !selectedDevice}
                       title={
-                        !isConnected || !selectedDevice ? 'Connect a device to install' : 'Install'
+                        !isConnected || !selectedDevice
+                          ? `Connect a device to ${targetCaps.installVerb.toLowerCase()}`
+                          : targetCaps.installVerb
                       }
                     >
-                      Install
+                      {targetCaps.installVerb}
                     </Button>
                   )}
 
@@ -548,7 +576,7 @@ const DownloadsView: React.FC<DownloadsViewProps> = ({ onClose }) => {
                   !sideloadingDisabled && (
                     <Button
                       icon={<UninstallIcon />}
-                      aria-label="Uninstall game"
+                      aria-label={targetCaps.isVenture ? 'Remove from PC' : 'Uninstall game'}
                       size="small"
                       appearance="outline"
                       onClick={() => handleUninstall(item)}
@@ -556,10 +584,12 @@ const DownloadsView: React.FC<DownloadsViewProps> = ({ onClose }) => {
                       title={
                         !isConnected || !selectedDevice
                           ? 'Connect a device to uninstall'
-                          : 'Uninstall'
+                          : targetCaps.isVenture
+                            ? 'Remove from PC'
+                            : 'Uninstall'
                       }
                     >
-                      Uninstall
+                      {targetCaps.isVenture ? 'Remove from PC' : 'Uninstall'}
                     </Button>
                   )}
               </div>

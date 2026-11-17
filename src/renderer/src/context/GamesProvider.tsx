@@ -261,14 +261,16 @@ export const GamesProvider: React.FC<GamesProviderProps> = ({ children }) => {
   // enrich the games with the installed packages and the device version codes
   const games = useMemo((): GameInfo[] => {
     // Build a Map for O(1) lookups instead of O(n) .find() per game
-    const installedMap = new Map(installedPackages.map((pkg) => [pkg.packageName, pkg.versionCode]))
+    const installedMap = new Map(installedPackages.map((pkg) => [pkg.packageName, pkg]))
 
     const catalogGames = rawGames.map((game) => {
-      const deviceVersionCode = game.packageName ? installedMap.get(game.packageName) : undefined
-      const isInstalled = deviceVersionCode !== undefined
+      const installed = game.packageName ? installedMap.get(game.packageName) : undefined
+      const deviceVersionCode = installed?.versionCode
+      const isInstalled = installed !== undefined
       let hasUpdate = false
 
-      if (isInstalled && deviceVersionCode !== undefined) {
+      // A missing PC versionCode (0) is unknown, not older than the catalog.
+      if (isInstalled && deviceVersionCode !== undefined && deviceVersionCode > 0) {
         const listVersionNumeric = parseVersion(game.version)
         if (listVersionNumeric !== null) {
           hasUpdate = listVersionNumeric > deviceVersionCode
@@ -279,6 +281,7 @@ export const GamesProvider: React.FC<GamesProviderProps> = ({ children }) => {
         ...game,
         isInstalled,
         deviceVersionCode,
+        ventureId: installed?.ventureId,
         hasUpdate
       }
     })
@@ -296,7 +299,7 @@ export const GamesProvider: React.FC<GamesProviderProps> = ({ children }) => {
         id: pkg.packageName,
         name: pkg.applicationLabel || pkg.packageName,
         packageName: pkg.packageName,
-        version: String(pkg.versionCode),
+        version: pkg.versionCode > 0 ? String(pkg.versionCode) : '',
         size: '0',
         lastUpdated: new Date().toISOString(),
         releaseName: pkg.packageName,
@@ -305,6 +308,7 @@ export const GamesProvider: React.FC<GamesProviderProps> = ({ children }) => {
         notePath: '',
         isInstalled: true,
         deviceVersionCode: pkg.versionCode,
+        ventureId: pkg.ventureId,
         hasUpdate: false,
         notOnServer: true
       }))
@@ -317,13 +321,14 @@ export const GamesProvider: React.FC<GamesProviderProps> = ({ children }) => {
       id: game.packageName,
       packageName: game.packageName,
       name: game.packageName,
-      version: String(game.versionCode),
+      version: game.versionCode > 0 ? String(game.versionCode) : '',
       size: '0',
       lastUpdated: new Date().toISOString(),
       releaseName: game.packageName,
       downloads: 0,
       downloadsUpdated: new Date().toISOString(),
       isInstalled: true,
+      ventureId: game.ventureId,
       thumbnailPath: '',
       notePath: ''
     }))

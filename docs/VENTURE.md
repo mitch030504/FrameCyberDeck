@@ -17,36 +17,70 @@ under GPL-3.0-or-later (https://github.com/Villagers654/Venture); see
 
 Frame CyberDeck does not install Venture, update it, or manage its account.
 
+Some Linux Venture packages — including the 0.2.5 AppImage — ship the launcher
+but not `venture-cli`. If your install has no CLI, build it from the matching
+Venture source and select the result in Settings (or put it on `PATH`):
+
+```sh
+cmake --preset linux-release
+cmake --build --preset linux-release --target venture-cli
+# build/linux-release/bin/venture-cli
+```
+
+## GUI configuration
+
+Open **Settings → Venture PC Target**. The panel reports whether the CLI is
+available, its path and version, whether the Venture launcher is open, and the
+library folder Venture reports.
+
+- **Browse for venture-cli…** saves an explicit CLI path and re-checks it.
+- **Clear Path** removes the saved path and returns to automatic discovery.
+- **Re-check** forces a fresh status query.
+- **Open Library Folder** opens the folder Venture reports, when available.
+
+The saved setting survives restarts. If no CLI is found, the Target Acquisition
+screen keeps a **PC · Venture — CLI NOT FOUND** card visible; its **SET UP**
+button opens the Venture settings section directly.
+
 ## CLI discovery
 
 Frame CyberDeck checks these candidates, in order:
 
-1. `VENTURE_CLI_PATH`
-2. `venture-cli` on `PATH`
-3. `venture-cli.exe` on `PATH`
-4. `/usr/bin/venture-cli`
-5. `/usr/local/bin/venture-cli`
-6. `/opt/Venture/venture-cli`
-7. `%ProgramFiles%\Venture\venture-cli.exe`
-8. `%LOCALAPPDATA%\Programs\Venture\venture-cli.exe`
+1. The path saved in Settings
+2. `VENTURE_CLI_PATH`
+3. `venture-cli` on `PATH`
+4. `venture-cli.exe` on `PATH`
+5. `/usr/bin/venture-cli`
+6. `/usr/local/bin/venture-cli`
+7. `/opt/Venture/venture-cli`
+8. `%ProgramFiles%\Venture\venture-cli.exe`
+9. `%LOCALAPPDATA%\Programs\Venture\venture-cli.exe`
 
-The result is cached briefly, so installing Venture while Frame CyberDeck is
-running can be picked up after a refresh or restart. When found, Frame CyberDeck
-adds a synthetic **PC · Venture** target to the device list, including the
-reported Venture version when available.
+When an explicit path is saved, Frame CyberDeck uses it exclusively; if it is
+wrong, clear it to resume auto-discovery. The discovery result is cached
+briefly, so installing Venture while Frame CyberDeck is running can be picked
+up after a refresh or restart. When found, Frame CyberDeck adds a synthetic
+**PC · Venture** target to the device list, including the reported Venture
+version and launcher state.
 
 ## Import, play, and uninstall
 
 1. Select the **PC · Venture** target.
-2. Use the normal install/drop flow with a supported release folder or APK
-   payload. Frame CyberDeck calls `venture-cli import <folder> --yes`.
-3. Wait for the import to complete. A large release can take a long time.
-4. Refresh or reopen the target to see the imported titles.
-5. Choose **Play** to launch a title through Venture, or **Uninstall** to remove
-   it from the Venture library.
+2. Use **Import into Venture…** (or drag an APK, ZIP, or release folder onto the
+   deck) with a supported release. Frame CyberDeck calls
+   `venture-cli import <path> --yes`.
+3. If the Venture launcher is open, the import is refused before it starts.
+   Close the launcher and use **Re-check**.
+4. Wait for the import to complete. A large release can take a long time; the
+   GUI shows an indeterminate import state rather than a fake percentage.
+5. Refresh the PC library to see the imported titles.
+6. Choose **Play on PC** in the details dialog or context menu to launch a
+   title, or **Remove from PC** to remove it from the Venture library.
 
 Venture IDs are treated as opaque strings. IDs containing `:` are passed as a
-single argument and are not split or shell-interpreted.
+single argument and are not split or shell-interpreted. Launch and removal use
+the library ID rather than the Android package name, because the two can
+differ.
 
 If the launcher is open, import is refused rather than risking a partial
 library update. Close the Venture launcher and retry.
@@ -74,9 +108,10 @@ provide.
 - **Experimental.** Venture paths were not part of the validated 0.2.0 host
   matrix; Linux x64 is the only validated host overall.
 - **External dependency.** A missing or incompatible `venture-cli` disables the
-  target. Check the path and the CLI's own status output.
+  target. The target list keeps a setup card visible so the CLI can be
+  configured in Settings; check the path and the CLI's own status output.
 - **Launcher must be closed.** Import is blocked while Venture reports its
-  launcher open.
+  launcher open; the GUI shows that state in Settings and on the target card.
 - **Separate library.** Imported titles are not Frame installs and do not appear
   in the Frame's installed-title list.
 - **Colon IDs.** Current code handles IDs containing `:`, but other tools in the

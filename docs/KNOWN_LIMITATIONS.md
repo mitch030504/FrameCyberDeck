@@ -75,9 +75,10 @@ not a promise that a later release will remove them.
 
 - **Experimental.** Venture support is outside the validated host matrix.
 - **External dependency.** A missing or incompatible `venture-cli` disables the
-  target.
+  target. The target list shows a setup card that opens the Venture section in
+  Settings; a saved CLI path can be cleared to resume auto-discovery.
 - **Launcher must be closed.** Import is refused while Venture reports its
-  launcher open.
+  launcher open; the target card and Settings surface that state.
 - **No Meta integration.** Frame CyberDeck does not sign in to Meta, download
   content, or convert APKs for Venture.
 - **Account and terms risk.** Using Venture may affect your Meta account and is

@@ -23,6 +23,8 @@ export interface DeviceInfo {
   isSteamFrame?: boolean
   /** True for the synthetic PC target backed by Venture's CLI. */
   isVenture?: boolean
+  /** Full CLI status for the synthetic Venture target. */
+  ventureStatus?: VentureStatus
   batteryLevel: number | null
   storageTotal: string | null
   storageFree: string | null
@@ -69,6 +71,11 @@ export interface PackageInfo {
   packageName: string
   versionCode: number
   applicationLabel?: string
+  /**
+   * Venture library ID. Only set for titles in the PC target's library;
+   * Venture accepts this opaque ID (which may contain ':') for play/uninstall.
+   */
+  ventureId?: string
   // More metadata fields will be added in the future
 }
 
@@ -87,6 +94,8 @@ export interface GameInfo {
   thumbnailPath: string
   notePath: string
   isInstalled: boolean
+  /** Venture library ID for a title installed in the PC target's library. */
+  ventureId?: string
   /** Optional first-party synopsis supplied by the configured library. */
   libraryDescription?: string
   libraryDescriptionSourceLabel?: string
@@ -616,13 +625,21 @@ export interface VentureGame {
   complete: boolean
 }
 
+export interface VentureOpenFolderResult {
+  success: boolean
+  error?: string
+}
+
 export interface VentureAPIRenderer {
-  status: () => Promise<VentureStatus>
+  status: (force?: boolean) => Promise<VentureStatus>
   listGames: () => Promise<VentureGame[]>
   listInstalled: () => Promise<PackageInfo[]>
   importFolder: (folder: string) => Promise<string[]>
   play: (gameId: string) => Promise<boolean>
   uninstall: (gameId: string) => Promise<boolean>
+  getCliPath: () => Promise<string>
+  setCliPath: (path: string | null) => Promise<VentureStatus>
+  openLibraryFolder: () => Promise<VentureOpenFolderResult>
 }
 
 export interface FrameConversionSettings {
@@ -644,6 +661,8 @@ export interface Settings {
   existingDownloadAction?: ExistingDownloadAction
   downloadProxy: DownloadProxySettings
   frameConversion: FrameConversionSettings
+  /** Explicit path to the external Venture CLI. Empty = auto-discover. */
+  ventureCliPath?: string
   windowBounds?: WindowBounds
 }
 

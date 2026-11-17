@@ -185,6 +185,15 @@ class SettingsService extends EventEmitter implements SettingsAPI {
     return { ...normalized }
   }
 
+  getVentureCliPath(): string {
+    return this.settings.ventureCliPath?.trim() ?? ''
+  }
+
+  setVentureCliPath(path: string | null): void {
+    this.settings.ventureCliPath = path?.trim() || undefined
+    this.saveSettings()
+  }
+
   getWindowBounds(): WindowBounds | undefined {
     return this.settings.windowBounds
   }

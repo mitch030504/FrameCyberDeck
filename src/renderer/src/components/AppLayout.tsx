@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AdbProvider } from '../context/AdbProvider'
 import { GamesProvider } from '../context/GamesProvider'
 import DeviceList from './DeviceList'
@@ -259,7 +259,8 @@ interface MainContentProps {
   onSkipConnection: () => void
   onBackToDeviceList: () => void
   onTransfers: () => void
-  onSettings: () => void
+  onSettings: (section?: string) => void
+  onOpenVentureSettings: () => void
 }
 
 const MainContent: React.FC<MainContentProps> = ({
@@ -268,7 +269,8 @@ const MainContent: React.FC<MainContentProps> = ({
   onSkipConnection,
   onBackToDeviceList,
   onTransfers,
-  onSettings
+  onSettings,
+  onOpenVentureSettings
 }) => {
   const styles = useStyles()
   const {
@@ -280,7 +282,13 @@ const MainContent: React.FC<MainContentProps> = ({
 
   const renderCurrentView = (): React.ReactNode => {
     if (currentView === AppView.DEVICE_LIST) {
-      return <DeviceList onConnected={onDeviceConnected} onSkip={onSkipConnection} />
+      return (
+        <DeviceList
+          onConnected={onDeviceConnected}
+          onSkip={onSkipConnection}
+          onOpenVentureSettings={onOpenVentureSettings}
+        />
+      )
     }
     return (
       <GamesView
@@ -547,6 +555,9 @@ const AppLayout: React.FC = () => {
     }
   })
   const [isSettingsOpen, setIsSettingsOpen] = useState(false)
+  const [settingsInitialSection, setSettingsInitialSection] = useState<string | undefined>(
+    undefined
+  )
   const [isCreditsOpen, setIsCreditsOpen] = useState(false)
   const [isDarkModeJokeOpen, setIsDarkModeJokeOpen] = useState(false)
   const [isCloseConfirmOpen, setIsCloseConfirmOpen] = useState(false)
@@ -622,6 +633,11 @@ const AppLayout: React.FC = () => {
   const handleBackToDeviceList = (): void => {
     setCurrentView(AppView.DEVICE_LIST)
   }
+
+  const openSettings = useCallback((section?: string): void => {
+    setSettingsInitialSection(section)
+    setIsSettingsOpen(true)
+  }, [])
 
   useEffect(() => {
     const darkModeMediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
@@ -966,7 +982,8 @@ const AppLayout: React.FC = () => {
                   onSkipConnection={handleSkipConnection}
                   onBackToDeviceList={handleBackToDeviceList}
                   onTransfers={() => setIsTransfersOpen(true)}
-                  onSettings={() => setIsSettingsOpen(true)}
+                  onSettings={openSettings}
+                  onOpenVentureSettings={() => openSettings('venture')}
                 />
               </div>
 
@@ -1240,7 +1257,7 @@ const AppLayout: React.FC = () => {
                         color: 'var(--vrcd-neon)'
                       }}
                     />
-                    <Settings />
+                    <Settings initialSection={settingsInitialSection} />
                   </div>
                 </div>
               )}

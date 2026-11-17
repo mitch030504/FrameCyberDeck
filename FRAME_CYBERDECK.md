@@ -146,10 +146,13 @@ individual MR titles; that provisioning step is not implemented.
 ## Venture
 
 An installed external `venture-cli` adds a synthetic `PC · Venture` target.
-Frame CyberDeck imports release folders through the CLI, lists installed titles,
-launches them, and uninstalls them. Import is refused while the Venture launcher
-is reported open. Venture IDs are opaque strings and may contain `:`; they are
-passed as single arguments.
+The CLI path can be set, cleared, and re-checked in Settings → Venture PC
+Target; when it is missing, a setup card keeps the target discoverable. Frame
+CyberDeck imports APKs, archives, and release folders through the CLI, lists
+installed titles, launches them with `Play on PC`, and removes them. Import is
+refused while the Venture launcher is reported open. Venture IDs are opaque
+strings and may contain `:`; the library ID is used for play/uninstall and is
+passed as a single argument.
 
 Frame CyberDeck does not install Venture, sign in to Meta for it, download Meta
 content for it, or convert APKs for it. Venture remains experimental and

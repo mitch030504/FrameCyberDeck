@@ -74,6 +74,7 @@ interface GameDetailsDialogProps {
   onUninstallAndUpdate: (game: GameInfo) => Promise<void>
   onDismissUpdateError: (game: GameInfo) => void
   onLaunchFrame: (game: GameInfo) => Promise<void>
+  onLaunchVenture: (game: GameInfo) => Promise<void>
   getNote: (releaseName: string) => Promise<string | null>
   isConnected: boolean
   isBusy: boolean
@@ -97,6 +98,7 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
   onUninstallAndUpdate,
   onDismissUpdateError,
   onLaunchFrame,
+  onLaunchVenture,
   getNote,
   isConnected,
   isBusy,
@@ -286,6 +288,16 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
                 Launch on Frame
               </Button>
             )}
+            {selectedDeviceDetails?.isVenture && (
+              <Button
+                appearance="primary"
+                icon={<PlayRegular />}
+                onClick={() => onLaunchVenture(g)}
+                disabled={!isConnected || isBusy}
+              >
+                Play on PC
+              </Button>
+            )}
             {!noSideload && (
               <Button
                 appearance="primary"
@@ -329,6 +341,16 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
               Launch on Frame
             </Button>
           )}
+          {selectedDeviceDetails?.isVenture && (
+            <Button
+              appearance="primary"
+              icon={<PlayRegular />}
+              onClick={() => onLaunchVenture(g)}
+              disabled={!isConnected || isBusy}
+            >
+              Play on PC
+            </Button>
+          )}
           {!noSideload && !g.notOnServer && (
             <Button
               appearance="secondary"
@@ -336,7 +358,7 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
               onClick={() => onReinstall(g)}
               disabled={!isConnected || isBusy}
             >
-              Reinstall
+              {selectedDeviceDetails?.isVenture ? 'Re-import' : 'Reinstall'}
             </Button>
           )}
           {!noSideload && (
@@ -415,9 +437,13 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
   const statusLabel = game.isInstalled
     ? game.hasUpdate
       ? 'Update Available'
-      : 'Installed'
+      : selectedDeviceDetails?.isVenture
+        ? 'Imported to PC'
+        : 'Installed'
     : dlStatus === 'Completed'
-      ? 'Downloaded'
+      ? selectedDeviceDetails?.isVenture
+        ? 'Ready to Import'
+        : 'Downloaded'
       : dlStatus === 'InstallError'
         ? isSignatureMismatchError(statusEntry?.error)
           ? 'Signature Mismatch'
@@ -425,7 +451,9 @@ const GameDetailsDialog: React.FC<GameDetailsDialogProps> = ({
         : dlStatus === 'Error'
           ? 'Download Error'
           : dlStatus === 'Installing'
-            ? 'Installing...'
+            ? selectedDeviceDetails?.isVenture
+              ? 'Importing...'
+              : 'Installing...'
             : 'Not Installed'
 
   return (

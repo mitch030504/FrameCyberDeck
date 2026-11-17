@@ -131,12 +131,15 @@ const api = {
     agentInfo: (host?: string) => typedIpcRenderer.invoke('frame:agent-info', host)
   } satisfies FrameAPIRenderer,
   venture: {
-    status: () => typedIpcRenderer.invoke('venture:status'),
+    status: (force?: boolean) => typedIpcRenderer.invoke('venture:status', force),
     listGames: () => typedIpcRenderer.invoke('venture:list-games'),
     listInstalled: () => typedIpcRenderer.invoke('venture:list-installed'),
     importFolder: (folder: string) => typedIpcRenderer.invoke('venture:import', folder),
     play: (gameId: string) => typedIpcRenderer.invoke('venture:play', gameId),
-    uninstall: (gameId: string) => typedIpcRenderer.invoke('venture:uninstall', gameId)
+    uninstall: (gameId: string) => typedIpcRenderer.invoke('venture:uninstall', gameId),
+    getCliPath: () => typedIpcRenderer.invoke('venture:get-cli-path'),
+    setCliPath: (path: string | null) => typedIpcRenderer.invoke('venture:set-cli-path', path),
+    openLibraryFolder: () => typedIpcRenderer.invoke('venture:open-library-folder')
   } satisfies VentureAPIRenderer,
   games: {
     getGames: (): Promise<GameInfo[]> => typedIpcRenderer.invoke('games:get-games'),
@@ -427,6 +430,8 @@ const api = {
     showFilePicker: (options?: {
       filters?: { name: string; extensions: string[] }[]
     }): Promise<string | null> => typedIpcRenderer.invoke('dialog:show-file-picker', options),
+    showVentureCliPicker: (): Promise<string | null> =>
+      typedIpcRenderer.invoke('dialog:show-venture-cli-picker'),
     showManualInstallPicker: (): Promise<string | null> =>
       typedIpcRenderer.invoke('dialog:show-manual-install-picker'),
     showApkFilePicker: (): Promise<string | null> =>

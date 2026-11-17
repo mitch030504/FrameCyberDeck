@@ -3,10 +3,30 @@ import { execa } from 'execa'
 import type { PackageInfo, VentureGame, VentureStatus } from '@shared/types'
 import { VENTURE_DEVICE_ID } from '@shared/types'
 
+/** Venture 0.2.5 reports versionCode as a string; older builds used a number. */
+function parseVersionCode(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && /^\d+$/.test(value.trim())) {
+    return Number.parseInt(value, 10)
+  }
+  return null
+}
+
 export class VentureService {
   private resolved: { path: string | null; checked: number } | null = null
+  private override: string | null = null
+
+  /**
+   * Set the user-configured CLI path. Clears the discovery cache so the next
+   * status check uses the new value immediately.
+   */
+  setCliOverride(path: string | null): void {
+    this.override = path?.trim() || null
+    this.resolved = null
+  }
 
   private candidates(): string[] {
+    if (this.override) return [this.override]
     const list = [
       process.env.VENTURE_CLI_PATH?.trim(),
       'venture-cli',
@@ -54,7 +74,8 @@ export class VentureService {
     }
   }
 
-  async status(): Promise<VentureStatus> {
+  async status(force = false): Promise<VentureStatus> {
+    if (force) this.resolved = null
     const cli = await this.resolveCli()
     if (!cli) {
       return {
@@ -102,7 +123,7 @@ export class VentureService {
           packageName: entry.package ? String(entry.package) : null,
           status: String(entry.status ?? ''),
           version: install.version ? String(install.version) : null,
-          versionCode: typeof install.versionCode === 'number' ? install.versionCode : null,
+          versionCode: parseVersionCode(install.versionCode),
           directory: install.directory ? String(install.directory) : null,
           complete: Boolean(install.complete)
         }
@@ -114,7 +135,8 @@ export class VentureService {
     return (await this.listGames()).map((game) => ({
       packageName: game.packageName ?? game.id,
       versionCode: game.versionCode ?? 0,
-      applicationLabel: game.name
+      applicationLabel: game.name,
+      ventureId: game.id
     }))
   }
 

@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { useAdb } from '../hooks/useAdb'
+import VentureSetupCard from './VentureSetupCard'
+import { getTargetCapabilities } from '../utils/targetCapabilities'
 import { ExtendedDeviceInfo, hasBookmarkData, isWiFiBookmark } from '@shared/types'
 import { AdbShellDialog } from './AdbShellDialog'
 import { shouldShowBreach } from '../hooks/useExtrasSettings'
@@ -8,6 +10,7 @@ import '../assets/device-list-breach.css'
 interface DeviceListProps {
   onSkip?: () => void
   onConnected?: () => void
+  onOpenVentureSettings?: () => void
 }
 
 // ─── Radar SVG background ─────────────────────────────────────────────────────
@@ -314,10 +317,11 @@ interface TargetCardProps {
   onBookmark: () => void
   onDeleteBookmark: () => void
   onOpenShell: () => void
+  onOpenLibrary: () => void
   isAlreadyBookmarked: boolean
 }
 
-const TargetCard: React.FC<TargetCardProps> = ({
+export const TargetCard: React.FC<TargetCardProps> = ({
   device,
   isConnected,
   isConnecting,
@@ -327,8 +331,10 @@ const TargetCard: React.FC<TargetCardProps> = ({
   onBookmark,
   onDeleteBookmark,
   onOpenShell,
+  onOpenLibrary,
   isAlreadyBookmarked
 }) => {
+  const caps = getTargetCapabilities(device)
   const isWifiBook = isWiFiBookmark(device)
   const hasBook = hasBookmarkData(device)
   const isTcp = device.id.includes(':')
@@ -423,7 +429,7 @@ const TargetCard: React.FC<TargetCardProps> = ({
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: '12px', flex: 1, minWidth: 0 }}>
         {/* Icon block */}
         <div style={{ fontSize: '24px', flexShrink: 0, lineHeight: 1, paddingTop: '2px' }}>
-          {isWifi ? '📡' : '🥽'}
+          {device.isVenture ? '💻' : isWifi ? '📡' : '🥽'}
         </div>
 
         {/* Text */}
@@ -472,7 +478,13 @@ const TargetCard: React.FC<TargetCardProps> = ({
                 letterSpacing: '0.08em'
               }}
             >
-              {isWifiBook ? '◈ WiFi Bookmark' : isWifi ? '◈ WiFi Device' : '◈ USB'}
+              {device.isVenture
+                ? '◈ PC Library'
+                : isWifiBook
+                  ? '◈ WiFi Bookmark'
+                  : isWifi
+                    ? '◈ WiFi Device'
+                    : '◈ USB'}
               {!isConnectable && ` · ${device.type.toUpperCase()}`}
             </span>
 
@@ -527,6 +539,12 @@ const TargetCard: React.FC<TargetCardProps> = ({
 
             {isConnectable && device.isVenture && !isWifi && (
               <span style={{ ...S, fontSize: '10px', color: '#c792ea' }}>PC · VENTURE</span>
+            )}
+
+            {isConnectable && device.isVenture && device.ventureStatus?.launcherOpen && (
+              <span style={{ ...S, fontSize: '10px', color: '#f5a623' }}>
+                ⚠ LAUNCHER OPEN — IMPORT BLOCKED
+              </span>
             )}
 
             {/* Non-Quest warning */}
@@ -631,10 +649,10 @@ const TargetCard: React.FC<TargetCardProps> = ({
           <>
             <button
               className="breach-btn breach-btn-primary"
-              onClick={onOpenShell}
+              onClick={caps.supportsAdbShell ? onOpenShell : onOpenLibrary}
               style={{ fontSize: '10px', padding: '5px 12px' }}
             >
-              ⌨ SHELL
+              {caps.supportsAdbShell ? '⌨ SHELL' : '▣ OPEN LIBRARY'}
             </button>
             <button
               className="breach-btn breach-btn-purple"
@@ -858,13 +876,14 @@ const AddTargetForm: React.FC<{
 }
 
 // ─── Main DeviceList component ─────────────────────────────────────────────────
-const DeviceList: React.FC<DeviceListProps> = ({ onSkip, onConnected }) => {
+const DeviceList: React.FC<DeviceListProps> = ({ onSkip, onConnected, onOpenVentureSettings }) => {
   const {
     devices,
     selectedDevice,
     isConnected,
     isLoading,
     error,
+    ventureStatus,
     connectToDevice,
     connectTcpDevice,
     disconnectTcpDevice,
@@ -1214,6 +1233,8 @@ const DeviceList: React.FC<DeviceListProps> = ({ onSkip, onConnected }) => {
                     Connect device via USB or save a WiFi target above.
                     <br />
                     Ensure ADB debugging is enabled on the headset.
+                    <br />
+                    No headset? Configure the PC · Venture target below.
                   </div>
                 </div>
               )}
@@ -1241,12 +1262,23 @@ const DeviceList: React.FC<DeviceListProps> = ({ onSkip, onConnected }) => {
                     onBookmark={() => handleBookmark(device)}
                     onDeleteBookmark={() => handleDeleteBookmark(device)}
                     onOpenShell={() => setShellDialogDeviceId(device.id)}
+                    onOpenLibrary={() => onConnected?.()}
                     isAlreadyBookmarked={
                       !!device.ipAddress && bookmarkedIps.includes(device.ipAddress)
                     }
                   />
                 )
               })}
+
+              {ventureStatus && !ventureStatus.available && !isLoading && (
+                <VentureSetupCard
+                  status={ventureStatus}
+                  onSetup={() => onOpenVentureSettings?.()}
+                  onRescan={() => {
+                    void refreshDevices()
+                  }}
+                />
+              )}
             </div>
 
             {/* Footer: connected status */}

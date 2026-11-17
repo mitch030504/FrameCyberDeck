@@ -355,6 +355,10 @@ function createWindow(): void {
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(async () => {
+  // Settings are loaded with the service singleton; hand the saved CLI path
+  // to Venture discovery before any renderer status request can arrive.
+  ventureService.setCliOverride(settingsService.getVentureCliPath())
+
   // If the user triggered Reset App Data last session, clean up now while
   // nothing is locked. Runs before createWindow so no files are in use yet.
   const userData = app.getPath('userData')
@@ -599,12 +603,26 @@ app.whenReady().then(async () => {
   typedIpcMain.handle('frame:agent-info', (_event, host) => frameAgentService.info(host))
 
   // --- Venture (PC target) ---
-  typedIpcMain.handle('venture:status', () => ventureService.status())
+  typedIpcMain.handle('venture:status', (_event, force) => ventureService.status(force))
   typedIpcMain.handle('venture:list-games', () => ventureService.listGames())
   typedIpcMain.handle('venture:list-installed', () => ventureService.listInstalled())
   typedIpcMain.handle('venture:import', (_event, folder) => ventureService.importFolder(folder))
   typedIpcMain.handle('venture:play', (_event, gameId) => ventureService.play(gameId))
   typedIpcMain.handle('venture:uninstall', (_event, gameId) => ventureService.uninstall(gameId))
+  typedIpcMain.handle('venture:get-cli-path', () => settingsService.getVentureCliPath())
+  typedIpcMain.handle('venture:set-cli-path', async (_event, path) => {
+    settingsService.setVentureCliPath(path)
+    ventureService.setCliOverride(settingsService.getVentureCliPath())
+    return await ventureService.status(true)
+  })
+  typedIpcMain.handle('venture:open-library-folder', async () => {
+    const status = await ventureService.status()
+    if (!status.gamesFolder) {
+      return { success: false, error: 'Venture did not report a library folder.' }
+    }
+    const error = await shell.openPath(status.gamesFolder)
+    return error ? { success: false, error } : { success: true }
+  })
 
   // --- Game Handlers ---
   typedIpcMain.handle('games:get-games', async () => gameService.getGames())
@@ -1057,6 +1075,22 @@ app.whenReady().then(async () => {
       return null
     }
 
+    return filePaths[0]
+  })
+
+  typedIpcMain.handle('dialog:show-venture-cli-picker', async () => {
+    if (!mainWindow) return null
+
+    const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
+      properties: ['openFile'],
+      title: 'Select venture-cli',
+      filters: [
+        { name: 'Venture CLI', extensions: ['exe', 'bin', '*'] },
+        { name: 'All Files', extensions: ['*'] }
+      ]
+    })
+
+    if (canceled || filePaths.length === 0) return null
     return filePaths[0]
   })
 

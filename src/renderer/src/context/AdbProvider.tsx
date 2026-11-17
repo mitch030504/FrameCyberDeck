@@ -6,6 +6,7 @@ import {
   DeviceWithBookmark,
   hasBookmarkData,
   isTcpDevice,
+  VentureStatus,
   VENTURE_DEVICE_ID
 } from '@shared/types'
 import { AdbContext, AdbContextType } from './AdbContext'
@@ -15,6 +16,23 @@ interface AdbProviderProps {
   children: ReactNode
 }
 
+/** Synthetic target for the external Venture PC library. */
+function toVentureDevice(status: VentureStatus): ExtendedDeviceInfo {
+  return {
+    id: VENTURE_DEVICE_ID,
+    type: 'device',
+    model: 'Venture',
+    isQuestDevice: false,
+    isVenture: true,
+    ventureStatus: status,
+    batteryLevel: null,
+    storageTotal: null,
+    storageFree: null,
+    friendlyModelName: status.version ? `PC · Venture ${status.version}` : 'PC · Venture',
+    ipAddress: null
+  }
+}
+
 export const AdbProvider: React.FC<AdbProviderProps> = ({ children }) => {
   const [devices, setDevices] = useState<ExtendedDeviceInfo[]>([])
   const [selectedDevice, setSelectedDevice] = useState<string | null>(null)
@@ -22,6 +40,7 @@ export const AdbProvider: React.FC<AdbProviderProps> = ({ children }) => {
   const [error, setError] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState<boolean>(true)
   const [packages, setPackages] = useState<PackageInfo[]>([])
+  const [ventureStatus, setVentureStatus] = useState<VentureStatus | null>(null)
   const [loadingPackages, setLoadingPackages] = useState<boolean>(false)
   const [userName, setUserNameState] = useState<string>('')
   const [loadingUserName, setLoadingUserName] = useState<boolean>(false)
@@ -390,10 +409,58 @@ export const AdbProvider: React.FC<AdbProviderProps> = ({ children }) => {
     []
   )
 
+  const applyVentureStatus = useCallback((status: VentureStatus): void => {
+    setVentureStatus(status)
+    setDevices((prev) =>
+      prev.map((device) =>
+        device.id === VENTURE_DEVICE_ID
+          ? {
+              ...device,
+              ventureStatus: status,
+              friendlyModelName: status.version ? `PC · Venture ${status.version}` : 'PC · Venture'
+            }
+          : device
+      )
+    )
+    if (!status.available && selectedDeviceRef.current === VENTURE_DEVICE_ID) {
+      setSelectedDevice(null)
+      setIsConnected(false)
+      setPackages([])
+      setUserNameState('')
+      window.api.downloads.setAppConnectionState(null, false)
+    }
+  }, [])
+
+  const refreshVentureStatus = useCallback(
+    async (force = false): Promise<VentureStatus> => {
+      try {
+        const status = await window.api.venture.status(force)
+        applyVentureStatus(status)
+        return status
+      } catch (error) {
+        console.warn('[AdbProvider] Venture status failed:', error)
+        const status: VentureStatus = {
+          available: false,
+          cliPath: null,
+          version: null,
+          gamesFolder: null,
+          launcherOpen: false,
+          error: error instanceof Error ? error.message : String(error)
+        }
+        applyVentureStatus(status)
+        return status
+      }
+    },
+    [applyVentureStatus]
+  )
+
   const refreshDevices = async (): Promise<void> => {
+    setIsLoading(true)
+    setError(null)
+    // Venture is independent of ADB. Check it first so a headset/ADB failure
+    // cannot hide the PC target.
+    const venture = await refreshVentureStatus()
     try {
-      setIsLoading(true)
-      setError(null)
       const [deviceList, bookmarks] = await Promise.all([
         window.api.adb.listDevices(),
         window.api.wifiBookmarks.getAll()
@@ -461,24 +528,8 @@ export const AdbProvider: React.FC<AdbProviderProps> = ({ children }) => {
         ...disconnectedBookmarkDevices
       ]
 
-      try {
-        const venture = await window.api.venture.status()
-        if (venture.available) {
-          allDevices.push({
-            id: VENTURE_DEVICE_ID,
-            type: 'device',
-            model: 'Venture',
-            isQuestDevice: false,
-            isVenture: true,
-            batteryLevel: null,
-            storageTotal: null,
-            storageFree: null,
-            friendlyModelName: venture.version ? `PC · Venture ${venture.version}` : 'PC · Venture',
-            ipAddress: null
-          })
-        }
-      } catch (error) {
-        console.warn('[AdbProvider] Venture status failed:', error)
+      if (venture.available) {
+        allDevices.push(toVentureDevice(venture))
       }
 
       setDevices(allDevices)
@@ -487,8 +538,10 @@ export const AdbProvider: React.FC<AdbProviderProps> = ({ children }) => {
       // Don't await this to avoid blocking the UI
       pingWifiDevices(allDevices)
     } catch (err) {
-      setError('Failed to load devices')
+      setError('Failed to load headset devices')
       console.error('Error loading devices:', err)
+      // Keep the PC target usable even when ADB is unavailable.
+      setDevices(venture.available ? [toVentureDevice(venture)] : [])
     } finally {
       setIsLoading(false)
     }
@@ -499,6 +552,11 @@ export const AdbProvider: React.FC<AdbProviderProps> = ({ children }) => {
       setError(null)
 
       if (serial === VENTURE_DEVICE_ID) {
+        const status = await refreshVentureStatus(true)
+        if (!status.available) {
+          setError(status.error || 'Venture CLI is not available')
+          return false
+        }
         setSelectedDevice(serial)
         setIsConnected(true)
         window.api.downloads.setAppConnectionState(serial, true)
@@ -730,6 +788,7 @@ export const AdbProvider: React.FC<AdbProviderProps> = ({ children }) => {
       isLoading,
       error,
       packages,
+      ventureStatus,
       loadingPackages,
       userName,
       loadingUserName,
@@ -737,6 +796,7 @@ export const AdbProvider: React.FC<AdbProviderProps> = ({ children }) => {
       connectTcpDevice,
       disconnectTcpDevice,
       refreshDevices,
+      refreshVentureStatus,
       disconnectDevice,
       loadPackages,
       selectedDeviceDetails,
@@ -752,6 +812,7 @@ export const AdbProvider: React.FC<AdbProviderProps> = ({ children }) => {
       isLoading,
       error,
       packages,
+      ventureStatus,
       loadingPackages,
       userName,
       loadingUserName,
@@ -759,7 +820,8 @@ export const AdbProvider: React.FC<AdbProviderProps> = ({ children }) => {
       loadPackages,
       getUserName,
       setUserName,
-      pingDevice
+      pingDevice,
+      refreshVentureStatus
     ]
   )
 

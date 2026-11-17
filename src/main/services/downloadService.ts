@@ -788,6 +788,11 @@ class DownloadService extends EventEmitter implements DownloadAPI {
         throw new Error(`No extracted path is available for ${item.releaseName}`)
       }
       const tracked = Boolean(this.queueManager.findItem(item.releaseName))
+      if (tracked) {
+        // The CLI does not stream progress; 0 keeps the queue's bar
+        // indeterminate instead of showing a stale 100% from extraction.
+        this.updateItemStatus(item.releaseName, 'Installing', 0)
+      }
       onProgress?.('Importing into Venture…', 10)
       try {
         const imported = await ventureService.importFolder(item.downloadPath)
@@ -798,10 +803,13 @@ class DownloadService extends EventEmitter implements DownloadAPI {
         return imported.length > 0
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
+        console.error(`[Service] Venture import failed for ${item.releaseName}:`, message)
         if (tracked) {
           this.updateItemStatus(item.releaseName, 'InstallError', 100, message.substring(0, 250))
         }
-        throw error
+        // Return instead of throwing so the queue keeps the specific
+        // InstallError message rather than replacing it with a generic one.
+        return false
       }
     }
 
@@ -1806,6 +1814,13 @@ class DownloadService extends EventEmitter implements DownloadAPI {
 
   public async copyObbFolder(folderPath: string, deviceId: string): Promise<boolean> {
     console.log(`[Service] OBB folder copy requested for ${folderPath} on device ${deviceId}`)
+
+    if (ventureService.isVentureTarget(deviceId)) {
+      console.error(
+        '[Service copyObbFolder] OBB copying is not supported for the Venture PC target.'
+      )
+      return false
+    }
 
     // Check if the app is connected to the target device
     const targetDeviceForInstall = this.getTargetDeviceForInstallation()

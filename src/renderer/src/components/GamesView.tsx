@@ -85,6 +85,7 @@ import { useMirrors } from '../hooks/useMirrors'
 import { useStarredGames } from '../hooks/useStarredGames'
 import { playSound } from '../hooks/useSoundEffects'
 import { localFileUrl } from '../utils/localFileUrl'
+import { getTargetCapabilities, getTargetGameId } from '../utils/targetCapabilities'
 
 // Column width constants
 const COLUMN_WIDTHS = {
@@ -448,7 +449,7 @@ const useStyles = makeStyles({
 interface GamesViewProps {
   onBackToDevices: () => void
   onTransfers: () => void
-  onSettings: () => void
+  onSettings: (section?: string) => void
 }
 
 function parseStorageGB(s: string | null | undefined): number {
@@ -472,8 +473,7 @@ const CARD_COLS_MAX = 12
  * width cannot prevent that (`1fr` still stretches) and only costs slider
  * travel, so the column floor is the lever that actually works.
  */
-const LOGS_WIKI_URL =
-  'https://github.com/mitch030504/FrameCyberDeck/issues/new'
+const LOGS_WIKI_URL = 'https://github.com/mitch030504/FrameCyberDeck/issues/new'
 
 /** Small inline link to the "how to send your logs" wiki guide. Opens in the
  *  system browser via the main window's window-open handler. */
@@ -519,7 +519,9 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
     isConnected,
     disconnectDevice,
     isLoading: adbLoading,
-    loadPackages
+    loadPackages,
+    ventureStatus,
+    refreshVentureStatus
   } = useAdb()
   const {
     games,
@@ -544,6 +546,7 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
   } = useDownload()
 
   const styles = useStyles()
+  const targetCaps = getTargetCapabilities(selectedDeviceDetails)
   const { serverConfig } = useSettings()
   const { activeMirror } = useMirrors()
   // A server (public server JSON or an rclone config) has been configured.
@@ -709,10 +712,14 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
     const unsubscribe = window.api.adb.onInstallationCompleted((deviceId) => {
       console.log(`[GamesView] Received installation-completed event for device: ${deviceId}`)
       if (selectedDevice && deviceId === selectedDevice) {
-        console.log(`[GamesView] Refreshing installed titles for current device ${selectedDevice}...`)
+        console.log(
+          `[GamesView] Refreshing installed titles for current device ${selectedDevice}...`
+        )
         loadPackages()
           .then(() => console.log('[GamesView] Installed-title refresh triggered successfully.'))
-          .catch((err) => console.error('[GamesView] Error triggering installed-title refresh:', err))
+          .catch((err) =>
+            console.error('[GamesView] Error triggering installed-title refresh:', err)
+          )
       } else {
         console.log(
           `[GamesView] Installation completed event for non-selected device (${deviceId}), ignoring.`
@@ -1242,8 +1249,33 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
     }, 300)
   }, [setDialogGame])
 
-  const handleInstall = (game: GameInfo): void => {
+  /**
+   * Venture reports launcher-open through the CLI. Catch it before starting an
+   * import so the user gets an actionable message instead of a raw CLI error.
+   */
+  const ensureVentureReady = useCallback(async (): Promise<boolean> => {
+    if (!selectedDeviceDetails?.isVenture) return true
+    try {
+      const status = await window.api.venture.status(true)
+      if (!status.available) {
+        window.alert(status.error || 'Venture CLI is not available. Check the PC target settings.')
+        return false
+      }
+      if (status.launcherOpen) {
+        window.alert('Close the Venture launcher before importing a game, then try again.')
+        return false
+      }
+      return true
+    } catch (error) {
+      console.error('Venture readiness check failed:', error)
+      window.alert('Could not reach the Venture CLI. Check the PC target settings.')
+      return false
+    }
+  }, [selectedDeviceDetails?.isVenture])
+
+  const handleInstall = async (game: GameInfo): Promise<void> => {
     if (!game) return
+    if (!(await ensureVentureReady())) return
     console.log('Install action triggered for:', game.packageName)
     addDownloadToQueue(game)
       .then((success) => {
@@ -1273,9 +1305,10 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
   }
 
   const handleLaunchVenture = async (game: GameInfo): Promise<void> => {
-    if (!selectedDeviceDetails?.isVenture || !game?.packageName) return
+    const ventureId = getTargetGameId(game)
+    if (!selectedDeviceDetails?.isVenture || !ventureId) return
     try {
-      const launched = await window.api.venture.play(game.packageName)
+      const launched = await window.api.venture.play(ventureId)
       if (!launched) window.alert(`Could not launch ${game.name} in Venture.`)
     } catch (error) {
       console.error(`Venture launch failed for ${game.name}:`, error)
@@ -1296,11 +1329,12 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
       return
     }
 
-    console.log(`Uninstall: Starting for ${game.name} (${game.packageName}) on ${selectedDevice}.`)
+    const uninstallId = getTargetGameId(game)
+    console.log(`Uninstall: Starting for ${game.name} (${uninstallId}) on ${selectedDevice}.`)
     setIsLoading(true)
 
     try {
-      const success = await window.api.adb.uninstallPackage(selectedDevice, game.packageName)
+      const success = await window.api.adb.uninstallPackage(selectedDevice, uninstallId)
       if (success) {
         console.log(`Uninstall: Successfully uninstalled ${game.packageName}.`)
         if (deleteFiles && game.releaseName) {
@@ -1351,6 +1385,7 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
       return
     }
 
+    if (!(await ensureVentureReady())) return
     console.log(`Reinstall: Starting for ${game.name} (${game.packageName}) on ${selectedDevice}.`)
     setIsLoading(true)
 
@@ -1386,7 +1421,7 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
       )
       const uninstallSuccess = await window.api.adb.uninstallPackage(
         selectedDevice,
-        game.packageName
+        getTargetGameId(game)
       )
 
       if (!uninstallSuccess) {
@@ -1426,6 +1461,8 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
       handleCloseDialog()
       return
     }
+
+    if (!(await ensureVentureReady())) return
 
     console.log(
       `Update action triggered for: ${game.name} (${game.packageName}) on ${selectedDevice}`
@@ -1478,12 +1515,13 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
     cancelDownload(game.releaseName)
   }
 
-  const handleInstallFromCompleted = (game: GameInfo): void => {
+  const handleInstallFromCompleted = async (game: GameInfo): Promise<void> => {
     if (!game || !game.releaseName || !selectedDevice) {
       console.error('Missing game, releaseName, or deviceId for install from completed action')
       window.alert('Cannot start installation: Missing required information.')
       return
     }
+    if (!(await ensureVentureReady())) return
     console.log(`Requesting install from completed for ${game.releaseName} on ${selectedDevice}`)
     window.api.downloads.installFromCompleted(game.releaseName, selectedDevice).catch((err) => {
       console.error('Error triggering install from completed:', err)
@@ -1512,7 +1550,7 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
     try {
       const uninstallSuccess = await window.api.adb.uninstallPackage(
         selectedDevice,
-        game.packageName
+        getTargetGameId(game)
       )
       if (!uninstallSuccess) {
         window.alert(`Failed to uninstall ${game.name}. Update aborted.`)
@@ -1570,6 +1608,7 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
         window.alert('Please connect to a device first.')
         return
       }
+      if (!(await ensureVentureReady())) return
       try {
         const fileName = filePath.split(/[/\\]/).pop() || filePath
         console.log(`${itemName} install requested for: ${filePath}`)
@@ -1577,7 +1616,11 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
         // Show the installation dialog
         setShowInstallDialog(true)
         setIsManualInstalling(true)
-        setInstallStatusMessage(`Installing ${itemName}: ${fileName}...`)
+        setInstallStatusMessage(
+          targetCaps.isVenture
+            ? `Importing ${itemName}: ${fileName}...`
+            : `Installing ${itemName}: ${fileName}...`
+        )
         setInstallProgress(null)
         setInstallSuccess(null)
 
@@ -1587,14 +1630,20 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
 
         if (success) {
           console.log(`${itemName} installation successful for: ${filePath}`)
-          setInstallStatusMessage(`✅ "${fileName}" installed successfully!`)
+          setInstallStatusMessage(
+            targetCaps.isVenture
+              ? `✅ "${fileName}" imported into Venture!`
+              : `✅ "${fileName}" installed successfully!`
+          )
           // Manual installs don't go through the download queue, so the
           // queue-completion notification never fires for them — notify here.
           playSound('click')
           try {
             window.api.app.showNotification(
-              'Install Complete',
-              `${fileName} installed successfully.`
+              targetCaps.isVenture ? 'Import Complete' : 'Install Complete',
+              targetCaps.isVenture
+                ? `${fileName} imported into Venture.`
+                : `${fileName} installed successfully.`
             )
           } catch {
             /* ignore */
@@ -1603,9 +1652,18 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
           // that event performs the single installed-title refresh.
         } else {
           console.error(`${itemName} installation failed for: ${filePath}`)
-          setInstallStatusMessage(`❌ Failed to install "${fileName}"`)
+          setInstallStatusMessage(
+            targetCaps.isVenture
+              ? `❌ Failed to import "${fileName}"`
+              : `❌ Failed to install "${fileName}"`
+          )
           try {
-            window.api.app.showNotification('Install Failed', `${fileName} could not be installed.`)
+            window.api.app.showNotification(
+              targetCaps.isVenture ? 'Import Failed' : 'Install Failed',
+              targetCaps.isVenture
+                ? `${fileName} could not be imported into Venture.`
+                : `${fileName} could not be installed.`
+            )
           } catch {
             /* ignore */
           }
@@ -1619,11 +1677,11 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
         setInstallProgress(null)
       }
     },
-    [isConnected, selectedDevice]
+    [isConnected, selectedDevice, ensureVentureReady, targetCaps.isVenture]
   )
 
   const handleManualInstall = useCallback(
-    async (type: 'apk' | 'folder') => {
+    async (type: 'apk' | 'folder' | 'any') => {
       if (!isConnected || !selectedDevice) {
         window.alert('Please connect to a device first.')
         return
@@ -1632,13 +1690,18 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
       const filePath =
         type === 'apk'
           ? await window.api.dialog.showApkFilePicker()
-          : await window.api.dialog.showFolderPicker()
+          : type === 'folder'
+            ? await window.api.dialog.showFolderPicker()
+            : await window.api.dialog.showManualInstallPicker()
 
       if (!filePath) {
         return // User cancelled the dialog
       }
 
-      await installFileManually(filePath, type === 'apk' ? 'APK file' : 'folder')
+      await installFileManually(
+        filePath,
+        type === 'apk' ? 'APK file' : type === 'folder' ? 'folder' : 'file or folder'
+      )
     },
     [isConnected, selectedDevice, installFileManually]
   )
@@ -1649,6 +1712,10 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
     async (folderPath: string) => {
       if (!isConnected || !selectedDevice) {
         window.alert('Please connect to a device first.')
+        return
+      }
+      if (targetCaps.isVenture) {
+        window.alert('OBB folders only apply to headset installs, not the Venture PC target.')
         return
       }
 
@@ -1682,12 +1749,16 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
     },
     // performObbCopy is defined below; it is stable via useCallback.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [isConnected, selectedDevice]
+    [isConnected, selectedDevice, targetCaps.isVenture]
   )
 
   const handleCopyObbFolder = useCallback(async () => {
     if (!isConnected || !selectedDevice) {
       window.alert('Please connect to a device first.')
+      return
+    }
+    if (targetCaps.isVenture) {
+      window.alert('OBB folders only apply to headset installs, not the Venture PC target.')
       return
     }
 
@@ -1736,11 +1807,15 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
       setShowInstallDialog(true)
       setIsManualInstalling(false)
     }
-  }, [isConnected, selectedDevice])
+  }, [isConnected, selectedDevice, targetCaps.isVenture])
 
   const performObbCopy = useCallback(
     async (folderPath: string) => {
       if (!selectedDevice) return
+      if (targetCaps.isVenture) {
+        window.alert('OBB folders only apply to headset installs, not the Venture PC target.')
+        return
+      }
 
       const folderName = folderPath.split(/[/\\]/).pop() || folderPath
 
@@ -1770,7 +1845,7 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
         setIsManualInstalling(false)
       }
     },
-    [selectedDevice]
+    [selectedDevice, targetCaps.isVenture]
   )
 
   const handleObbConfirmCopy = useCallback(async () => {
@@ -2015,7 +2090,9 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
           }}
         >
           <DialogBody>
-            <DialogTitle>{'Manual Operation'}</DialogTitle>
+            <DialogTitle>
+              {targetCaps.isVenture ? 'Venture Import' : 'Manual Operation'}
+            </DialogTitle>
             <DialogContent>
               <div style={{ marginBottom: tokens.spacingVerticalM }}>
                 <Text>{installStatusMessage}</Text>
@@ -2078,7 +2155,13 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
                   }}
                 >
                   <Text weight="semibold">
-                    {installSuccess ? '✅ Operation Successful!' : '❌ Operation Failed'}
+                    {installSuccess
+                      ? targetCaps.isVenture
+                        ? '✅ Import Successful!'
+                        : '✅ Operation Successful!'
+                      : targetCaps.isVenture
+                        ? '❌ Import Failed'
+                        : '❌ Operation Failed'}
                   </Text>
                   {!installSuccess && (
                     <div style={{ marginTop: tokens.spacingVerticalXS }}>
@@ -2325,42 +2408,79 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
                 />
               </svg>
               <div className="dz-title">
-                {isManualInstalling ? 'Installing...' : 'DROP TO SIDELOAD'}
+                {isManualInstalling
+                  ? targetCaps.isVenture
+                    ? 'Importing...'
+                    : 'Installing...'
+                  : targetCaps.isVenture
+                    ? 'DROP TO IMPORT'
+                    : 'DROP TO SIDELOAD'}
               </div>
               <div className="dz-sub">
-                Drag an <b>APK</b>, a <b>.zip</b>, a game <b>folder</b> (APK + OBB + install.txt),
-                <br />
-                or an <b>OBB folder</b> named after its package — dropped here to deploy.
+                {targetCaps.isVenture ? (
+                  <>
+                    Drag an <b>APK</b>, a <b>.zip</b>, or a release <b>folder</b> here to import it
+                    into your Venture PC library.
+                  </>
+                ) : (
+                  <>
+                    Drag an <b>APK</b>, a <b>.zip</b>, a game <b>folder</b> (APK + OBB +
+                    install.txt),
+                    <br />
+                    or an <b>OBB folder</b> named after its package — dropped here to deploy.
+                  </>
+                )}
               </div>
-              {!isConnected && <div className="dz-warn">{'// CONNECT A DEVICE TO SIDELOAD'}</div>}
+              {!isConnected && (
+                <div className="dz-warn">
+                  {targetCaps.isVenture
+                    ? '// CONNECT THE PC TARGET TO IMPORT'
+                    : '// CONNECT A DEVICE TO SIDELOAD'}
+                </div>
+              )}
             </div>
 
             {/* Primary install actions */}
             <div className="sideloader-actions">
-              <button
-                className="cyber-deck-btn"
-                disabled={!isConnected || isManualInstalling}
-                onClick={() => handleManualInstall('apk')}
-              >
-                <DocumentRegular />
-                <span>{'Install APK File'}</span>
-              </button>
-              <button
-                className="cyber-deck-btn"
-                disabled={!isConnected || isManualInstalling}
-                onClick={() => handleManualInstall('folder')}
-              >
-                <FolderAddRegular />
-                <span>{'Install Folder'}</span>
-              </button>
-              <button
-                className="cyber-deck-btn"
-                disabled={!isConnected || isManualInstalling}
-                onClick={handleCopyObbFolder}
-              >
-                <CopyRegular />
-                <span>{'Copy OBB Folder'}</span>
-              </button>
+              {targetCaps.isVenture ? (
+                <button
+                  className="cyber-deck-btn"
+                  disabled={!isConnected || isManualInstalling}
+                  onClick={() => handleManualInstall('any')}
+                >
+                  <FolderAddRegular />
+                  <span>{'Import into Venture…'}</span>
+                </button>
+              ) : (
+                <>
+                  <button
+                    className="cyber-deck-btn"
+                    disabled={!isConnected || isManualInstalling}
+                    onClick={() => handleManualInstall('apk')}
+                  >
+                    <DocumentRegular />
+                    <span>{'Install APK File'}</span>
+                  </button>
+                  <button
+                    className="cyber-deck-btn"
+                    disabled={!isConnected || isManualInstalling}
+                    onClick={() => handleManualInstall('folder')}
+                  >
+                    <FolderAddRegular />
+                    <span>{'Install Folder'}</span>
+                  </button>
+                </>
+              )}
+              {targetCaps.supportsObbCopy && (
+                <button
+                  className="cyber-deck-btn"
+                  disabled={!isConnected || isManualInstalling}
+                  onClick={handleCopyObbFolder}
+                >
+                  <CopyRegular />
+                  <span>{'Copy OBB Folder'}</span>
+                </button>
+              )}
             </div>
 
             {/* Secondary deck controls */}
@@ -2369,14 +2489,25 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
                 <CloudIcon />
                 <span>Manage Remotes</span>
               </button>
-              <button
-                className="cyber-deck-btn"
-                disabled={!isConnected}
-                onClick={() => setShellDialogOpen(true)}
-              >
-                <WindowConsoleRegular />
-                <span>ADB Shell</span>
-              </button>
+              {targetCaps.supportsAdbShell ? (
+                <button
+                  className="cyber-deck-btn"
+                  disabled={!isConnected}
+                  onClick={() => setShellDialogOpen(true)}
+                >
+                  <WindowConsoleRegular />
+                  <span>ADB Shell</span>
+                </button>
+              ) : (
+                <button
+                  className="cyber-deck-btn"
+                  disabled={!isConnected}
+                  onClick={() => onSettings('venture')}
+                >
+                  <SettingsRegular />
+                  <span>PC Target Settings</span>
+                </button>
+              )}
               <button className="cyber-deck-btn purple" onClick={onTransfers}>
                 <ArrowSyncRegular />
                 <span>Installs</span>
@@ -2386,7 +2517,7 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
                   </Badge>
                 )}
               </button>
-              <button className="cyber-deck-btn" onClick={onSettings}>
+              <button className="cyber-deck-btn" onClick={() => onSettings()}>
                 <SettingsRegular />
                 <span>Other Settings</span>
               </button>
@@ -2645,17 +2776,33 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
                     </>
                   )}
 
-                  {/* Refresh Quest */}
+                  {selectedDeviceDetails.isVenture && ventureStatus?.launcherOpen && (
+                    <Text
+                      size={100}
+                      style={{
+                        color: '#f5a623',
+                        textAlign: 'center',
+                        fontFamily: 'monospace'
+                      }}
+                    >
+                      ⚠ Venture launcher is open — imports are blocked.
+                    </Text>
+                  )}
+
+                  {/* Refresh installed titles for the current target */}
                   {isConnected && (
                     <Button
                       appearance="subtle"
                       size="small"
                       icon={<ArrowClockwiseRegular />}
-                      onClick={() => loadPackages()}
+                      onClick={() => {
+                        if (targetCaps.isVenture) void refreshVentureStatus(true)
+                        void loadPackages()
+                      }}
                       disabled={isBusy}
                       style={CB}
                     >
-                      {isBusy ? 'Working...' : 'Refresh Quest'}
+                      {isBusy ? 'Working...' : targetCaps.refreshLabel}
                     </Button>
                   )}
                 </div>
@@ -2719,21 +2866,33 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
               >
                 {isBusy ? 'Working...' : 'Refresh Games'}
               </Button>
-              <Button
-                appearance="subtle"
-                size="small"
-                icon={<WindowConsoleRegular />}
-                onClick={() => setShellDialogOpen(true)}
-                disabled={!isConnected}
-                style={isConnected ? CB : { ...CB, opacity: 0.4 }}
-              >
-                ADB Shell
-              </Button>
+              {targetCaps.supportsAdbShell ? (
+                <Button
+                  appearance="subtle"
+                  size="small"
+                  icon={<WindowConsoleRegular />}
+                  onClick={() => setShellDialogOpen(true)}
+                  disabled={!isConnected}
+                  style={isConnected ? CB : { ...CB, opacity: 0.4 }}
+                >
+                  ADB Shell
+                </Button>
+              ) : (
+                <Button
+                  appearance="subtle"
+                  size="small"
+                  icon={<SettingsRegular />}
+                  onClick={() => onSettings('venture')}
+                  style={CB}
+                >
+                  PC Target Settings
+                </Button>
+              )}
               <Button
                 appearance="subtle"
                 size="small"
                 icon={<SettingsRegular />}
-                onClick={onSettings}
+                onClick={() => onSettings()}
                 style={CB}
               >
                 Other Settings
@@ -2782,7 +2941,13 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
                     disabled={isBusy || !isConnected}
                     style={CB}
                   >
-                    {isManualInstalling ? 'Installing...' : 'Manual Install'}
+                    {isManualInstalling
+                      ? targetCaps.isVenture
+                        ? 'Importing...'
+                        : 'Installing...'
+                      : targetCaps.isVenture
+                        ? 'Import into Venture'
+                        : 'Manual Install'}
                   </Button>
                 </MenuTrigger>
                 <MenuPopover
@@ -2798,27 +2963,41 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
                   }
                 >
                   <MenuList>
-                    <MenuItem
-                      icon={<DocumentRegular />}
-                      onClick={() => handleManualInstall('apk')}
-                      disabled={isManualInstalling}
-                    >
-                      {'Install APK File'}
-                    </MenuItem>
-                    <MenuItem
-                      icon={<FolderAddRegular />}
-                      onClick={() => handleManualInstall('folder')}
-                      disabled={isManualInstalling}
-                    >
-                      {'Install Folder'}
-                    </MenuItem>
-                    <MenuItem
-                      icon={<CopyRegular />}
-                      onClick={handleCopyObbFolder}
-                      disabled={isManualInstalling}
-                    >
-                      {'Copy OBB Folder'}
-                    </MenuItem>
+                    {targetCaps.isVenture ? (
+                      <MenuItem
+                        icon={<FolderAddRegular />}
+                        onClick={() => handleManualInstall('any')}
+                        disabled={isManualInstalling}
+                      >
+                        {'Import into Venture…'}
+                      </MenuItem>
+                    ) : (
+                      <>
+                        <MenuItem
+                          icon={<DocumentRegular />}
+                          onClick={() => handleManualInstall('apk')}
+                          disabled={isManualInstalling}
+                        >
+                          {'Install APK File'}
+                        </MenuItem>
+                        <MenuItem
+                          icon={<FolderAddRegular />}
+                          onClick={() => handleManualInstall('folder')}
+                          disabled={isManualInstalling}
+                        >
+                          {'Install Folder'}
+                        </MenuItem>
+                        {targetCaps.supportsObbCopy && (
+                          <MenuItem
+                            icon={<CopyRegular />}
+                            onClick={handleCopyObbFolder}
+                            disabled={isManualInstalling}
+                          >
+                            {'Copy OBB Folder'}
+                          </MenuItem>
+                        )}
+                      </>
+                    )}
                   </MenuList>
                 </MenuPopover>
               </Menu>
@@ -3603,6 +3782,7 @@ const GamesView: React.FC<GamesViewProps> = ({ onBackToDevices, onTransfers, onS
           onUninstallAndUpdate={handleUninstallAndUpdate}
           onDismissUpdateError={handleDismissUpdateError}
           onLaunchFrame={handleLaunchFrame}
+          onLaunchVenture={handleLaunchVenture}
           getNote={getNote}
           isConnected={isConnected}
           isBusy={isBusy}

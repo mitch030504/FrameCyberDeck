@@ -51,7 +51,8 @@ import type {
   FrameConversionSettings,
   FrameConversionEngine,
   FramePortEngineStatus,
-  FrameRefreshRate
+  FrameRefreshRate,
+  VentureStatus
 } from '@shared/types'
 
 // Supported speed units with conversion factors to KB/s
@@ -2126,7 +2127,191 @@ const RoomScanPanel: React.FC = () => {
   )
 }
 
-const Settings: React.FC = () => {
+const VentureSettingsPanel: React.FC = () => {
+  const styles = useStyles()
+  const { refreshDevices } = useAdb()
+  const [status, setStatus] = useState<VentureStatus | null>(null)
+  const [cliPath, setCliPathState] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+
+  const loadStatus = useCallback(async (force: boolean): Promise<void> => {
+    setBusy(true)
+    setError(null)
+    try {
+      const [savedPath, next] = await Promise.all([
+        window.api.venture.getCliPath(),
+        window.api.venture.status(force)
+      ])
+      setCliPathState(savedPath)
+      setStatus(next)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadStatus(true)
+  }, [loadStatus])
+
+  const saveCliPath = async (path: string | null): Promise<void> => {
+    setBusy(true)
+    setError(null)
+    setNotice(null)
+    try {
+      const next = await window.api.venture.setCliPath(path)
+      setStatus(next)
+      setCliPathState(path?.trim() ?? '')
+      setNotice(
+        next.available
+          ? 'Venture CLI updated.'
+          : 'Saved, but the CLI did not answer. Check the path and try Re-check.'
+      )
+      await refreshDevices()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const browseForCli = async (): Promise<void> => {
+    const selected = await window.api.dialog.showVentureCliPicker()
+    if (!selected) return
+    await saveCliPath(selected)
+  }
+
+  const recheck = async (): Promise<void> => {
+    setBusy(true)
+    setError(null)
+    setNotice(null)
+    try {
+      const next = await window.api.venture.status(true)
+      setStatus(next)
+      setNotice(next.available ? 'Venture CLI is responding.' : null)
+      await refreshDevices()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const openLibraryFolder = async (): Promise<void> => {
+    setError(null)
+    try {
+      const result = await window.api.venture.openLibraryFolder()
+      if (!result.success) setError(result.error || 'Could not open the Venture library folder.')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  const statusColor = status?.available ? 'var(--vrcd-neon)' : '#ffaa00'
+  const statusLabel =
+    status === null
+      ? 'Checking…'
+      : status.available
+        ? 'Ready'
+        : status.cliPath
+          ? 'CLI error'
+          : 'Not available'
+
+  return (
+    <Card className={styles.card}>
+      <CardHeader description={<Subtitle1>{'Venture PC Target'}</Subtitle1>} />
+      <div className={styles.cardContent}>
+        <Text className={styles.hint}>
+          <InfoRegular />
+          Venture is an external PC library. Frame CyberDeck does not install it, sign in to Meta
+          for it, or download content for it. The target is experimental.
+        </Text>
+
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: '140px 1fr',
+            gap: '6px 12px',
+            marginTop: tokens.spacingVerticalM,
+            maxWidth: '900px',
+            fontFamily: 'monospace',
+            fontSize: '12px',
+            alignItems: 'baseline'
+          }}
+        >
+          <Text style={{ color: 'rgba(var(--vrcd-neon-raw),0.5)' }}>Status</Text>
+          <Text style={{ color: statusColor }}>{statusLabel}</Text>
+
+          <Text style={{ color: 'rgba(var(--vrcd-neon-raw),0.5)' }}>CLI</Text>
+          <Text style={{ wordBreak: 'break-all' }}>
+            {status?.cliPath || cliPath || 'Not detected'}
+          </Text>
+
+          <Text style={{ color: 'rgba(var(--vrcd-neon-raw),0.5)' }}>Version</Text>
+          <Text>{status?.version || '—'}</Text>
+
+          <Text style={{ color: 'rgba(var(--vrcd-neon-raw),0.5)' }}>Launcher</Text>
+          <Text style={{ color: status?.launcherOpen ? '#f5a623' : undefined }}>
+            {status?.launcherOpen ? 'Open — imports are blocked' : 'Closed / not reported'}
+          </Text>
+
+          <Text style={{ color: 'rgba(var(--vrcd-neon-raw),0.5)' }}>Library</Text>
+          <Text style={{ wordBreak: 'break-all' }}>{status?.gamesFolder || '—'}</Text>
+        </div>
+
+        <div
+          style={{ display: 'flex', gap: 8, marginTop: tokens.spacingVerticalM, flexWrap: 'wrap' }}
+        >
+          <Button appearance="secondary" onClick={() => void browseForCli()} disabled={busy}>
+            Browse for venture-cli…
+          </Button>
+          <Button appearance="secondary" onClick={() => void recheck()} disabled={busy}>
+            {busy ? 'Checking…' : 'Re-check'}
+          </Button>
+          <Button
+            appearance="secondary"
+            onClick={() => void openLibraryFolder()}
+            disabled={busy || !status?.gamesFolder}
+          >
+            Open Library Folder
+          </Button>
+          <Button
+            appearance="secondary"
+            onClick={() => void saveCliPath(null)}
+            disabled={busy || !cliPath}
+          >
+            Clear Path
+          </Button>
+        </div>
+
+        <Text
+          style={{
+            display: 'block',
+            marginTop: tokens.spacingVerticalS,
+            color: tokens.colorNeutralForeground2,
+            lineHeight: 1.6
+          }}
+        >
+          Path precedence: this saved path, then <code>VENTURE_CLI_PATH</code>, then PATH and known
+          install locations. Close the Venture launcher before importing a game.
+        </Text>
+
+        {(error || status?.error) && <Text className={styles.error}>{error || status?.error}</Text>}
+        {notice && <Text className={styles.success}>{notice}</Text>}
+      </div>
+    </Card>
+  )
+}
+
+interface SettingsProps {
+  /** Section key to expand when the modal opens (e.g. from the Venture setup card). */
+  initialSection?: string
+}
+
+const Settings: React.FC<SettingsProps> = ({ initialSection }) => {
   const styles = useStyles()
   const {
     downloadPath,
@@ -2150,6 +2335,14 @@ const Settings: React.FC = () => {
       return true
     }
   })
+  useEffect(() => {
+    if (initialSection !== 'venture') return
+    const timer = setTimeout(() => {
+      document.getElementById('settings-venture')?.scrollIntoView({ block: 'start' })
+    }, 50)
+    return () => clearTimeout(timer)
+  }, [initialSection])
+
   const [openSections, setOpenSections] = useState<Record<string, boolean>>({
     intro: true,
     username: false,
@@ -2157,6 +2350,7 @@ const Settings: React.FC = () => {
     backups: false,
     download: false,
     frameConversion: false,
+    venture: initialSection === 'venture',
     blacklist: false,
     content: false,
     matrixId: false,
@@ -2769,6 +2963,16 @@ const Settings: React.FC = () => {
           />
           {openSections.frameConversion && <FrameConversionSettingsPanel />}
           {openSections.frameConversion && <RoomScanPanel />}
+        </div>
+
+        <div id="settings-venture">
+          <SectionHeader
+            label="// VENTURE PC TARGET [EXPERIMENTAL]"
+            sectionKey="venture"
+            openSections={openSections}
+            onToggle={toggleSection}
+          />
+          {openSections.venture && <VentureSettingsPanel />}
         </div>
 
         <div>
