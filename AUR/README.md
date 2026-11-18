@@ -12,7 +12,7 @@ affiliated with Valve, Meta, FramePort, Venture, or upstream VR CyberDeck.
 | Item | Value |
 | --- | --- |
 | Package | `frame-cyberdeck-bin` |
-| Version | `0.2.0` |
+| Version | `0.3.0` |
 | Architecture | `x86_64` only |
 | Source | `frame-cyberdeck-<version>-x86_64.AppImage` from the GitHub release |
 | License | GPL-3.0-only |
@@ -68,9 +68,10 @@ Settings, downloads, save backups, and logs stay in the Electron `userData`
 folder. Existing converted titles are not rebuilt; redeploy from the original
 source to pick up the new launcher.
 
-From the 0.1.0 development package: install the 0.2.0 package, then run
-**Prepare FramePort engine** before using the FramePort engine. See
-[docs/INSTALL.md](../docs/INSTALL.md) for the full upgrade notes.
+From 0.2.0 the upgrade needs no migration. From the 0.1.0 development package,
+install the 0.3.0 package, then run **Prepare FramePort engine** before using
+the FramePort engine. See [docs/INSTALL.md](../docs/INSTALL.md) for the full
+upgrade notes.
 
 ## Uninstall
 
@@ -86,7 +87,7 @@ This removes the application files. It does not remove `userData`; delete
 The release asset must exist before the AUR package is updated. The ordering is
 deliberate: the package downloads the AppImage by URL and checksum.
 
-1. Publish the GitHub release and confirm the v0.2.0 AppImage URL and SHA-256.
+1. Publish the GitHub release and confirm the v0.3.0 AppImage URL and SHA-256.
 2. Set `pkgver` in `PKGBUILD` to the release version.
 3. Refresh the AppImage checksum, for example with `updpkgsums`.
 4. Regenerate metadata:
@@ -105,7 +106,7 @@ deliberate: the package downloads the AppImage by URL and checksum.
 7. Commit `PKGBUILD` and the regenerated `.SRCINFO`, then push to AUR.
 
 The `.SRCINFO` in the repository may still describe an earlier package until
-it is regenerated. Verify the `PKGBUILD` checksum against the v0.2.0 asset and
+it is regenerated. Verify the `PKGBUILD` checksum against the v0.3.0 asset and
 regenerate `.SRCINFO` before publishing. Do not publish the package while those
 values point at a different asset. A stale `.SRCINFO` or a checksum for a
 nonexistent `v0.1.0` asset will fail for users.

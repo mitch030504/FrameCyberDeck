@@ -1,7 +1,7 @@
 # Maintainer: mitch030504 <https://github.com/mitch030504>
 
 pkgname=frame-cyberdeck-bin
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="Steam Frame-focused fork of VR CyberDeck with Quest-to-Frame conversion and SteamOS Devkit deployment"
 arch=('x86_64')
@@ -42,7 +42,7 @@ source=(
     "frame-cyberdeck.desktop"
 )
 sha256sums=(
-    '19a6316334344c311d2cae7427a97e310f3871402eadbeff800c05e39a8aaab3'
+    'cd93b9759e21a2f59bf14610adc0ff63f5f6b0c9676c87684e4469f63bfd378f'
     'e522cee4480be932f21dfd5a6b49dc4c10095bc07304fa5f4e2fe188a913c0ee'
 )
 

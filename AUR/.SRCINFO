@@ -1,6 +1,6 @@
 pkgbase = frame-cyberdeck-bin
 	pkgdesc = Steam Frame-focused fork of VR CyberDeck with Quest-to-Frame conversion and SteamOS Devkit deployment
-	pkgver = 0.2.0
+	pkgver = 0.3.0
 	pkgrel = 1
 	url = https://github.com/mitch030504/FrameCyberDeck
 	arch = x86_64
@@ -32,9 +32,9 @@ pkgbase = frame-cyberdeck-bin
 	provides = frame-cyberdeck
 	conflicts = frame-cyberdeck
 	options = !strip
-	source = frame-cyberdeck-0.2.0-x86_64.AppImage::https://github.com/mitch030504/FrameCyberDeck/releases/download/v0.2.0/frame-cyberdeck-0.2.0-x86_64.AppImage
+	source = frame-cyberdeck-0.3.0-x86_64.AppImage::https://github.com/mitch030504/FrameCyberDeck/releases/download/v0.3.0/frame-cyberdeck-0.3.0-x86_64.AppImage
 	source = frame-cyberdeck.desktop
-	sha256sums = 19a6316334344c311d2cae7427a97e310f3871402eadbeff800c05e39a8aaab3
+	sha256sums = cd93b9759e21a2f59bf14610adc0ff63f5f6b0c9676c87684e4469f63bfd378f
 	sha256sums = e522cee4480be932f21dfd5a6b49dc4c10095bc07304fa5f4e2fe188a913c0ee
 
 pkgname = frame-cyberdeck-bin
